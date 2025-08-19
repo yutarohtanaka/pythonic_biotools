@@ -14,3 +14,5 @@ Pythonic Implementations of R/Other Language Bioinformatics Libraries
 - CIBERSORTx (Newman et al., Nature Biotechnology 2019)
     - https://www.nature.com/articles/s41587-019-0114-2 
 - inferCNV
+
+- Numbat ([Gao et al., Nature Biotechnology 2022](https://www.nature.com/articles/s41587-022-01468-y))
