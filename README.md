@@ -5,6 +5,7 @@ Pythonic Implementations of R/Other Language Bioinformatics Libraries
 ### Tools Currently Implemented
 
 - XenofilterR (Kluin et al., BMC Bioinformatics 2018)
+- MuSiC (Wang et al., Nature Comms. 2019; Fan et al., Briefings in Bioinformatics 2022)
 
 ### Tools Coming Soon
 
