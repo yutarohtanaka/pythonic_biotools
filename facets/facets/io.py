@@ -5,11 +5,23 @@ Input validation, column alias normalization, and configuration container for `f
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from .reference import canonical_chrom, chrom_sort_key, get_genome_reference
+
+SettingsType = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsType:
+    """Validate `settings` mode strictly ('default' or 'R_default')."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"`settings` must be 'default' or 'R_default', got {settings!r}."
+        )
+    return settings  # type: ignore[return-value]
 
 _COLUMN_ALIASES: dict[str, str] = {
     "chrom": "chrom",
@@ -67,10 +79,11 @@ class FacetsConfig:
     delta_cn: float = 0.5
     max_cn: int = 10
     unmatched: bool = False
-    lowess_frac: float = 0.25
+    lowess_frac: float | None = None
     lowess_iter: int = 3
     keep_low_nhet_lcn: bool = False
     seed: int | None = None
+    settings: SettingsType = "default"
 
     @property
     def effective_het_thresh(self) -> float:
@@ -79,7 +92,15 @@ class FacetsConfig:
             return float(self.het_thresh)
         return 0.10 if self.unmatched else 0.25
 
+    @property
+    def effective_lowess_frac(self) -> float:
+        """Return configured `lowess_frac`, or mode default (`0.20` R_default, `0.25` default)."""
+        if self.lowess_frac is not None:
+            return float(self.lowess_frac)
+        return 0.20 if self.settings == "R_default" else 0.25
+
     def __post_init__(self) -> None:
+        validate_settings(self.settings)
         get_genome_reference(self.genome, include_chr_x=True, include_chr_y=True)
         if self.ndepth < 1:
             raise ValueError(f"`ndepth` must be >= 1, got {self.ndepth}.")
@@ -111,7 +132,7 @@ class FacetsConfig:
             raise ValueError(f"`delta_cn` must be > 0, got {self.delta_cn}.")
         if self.max_cn < 2:
             raise ValueError(f"`max_cn` must be >= 2, got {self.max_cn}.")
-        if not (0.0 < self.lowess_frac <= 1.0):
+        if self.lowess_frac is not None and not (0.0 < self.lowess_frac <= 1.0):
             raise ValueError(
                 f"`lowess_frac` must be in (0.0, 1.0], got {self.lowess_frac}."
             )

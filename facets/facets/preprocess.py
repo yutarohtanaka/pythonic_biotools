@@ -6,11 +6,12 @@ pure-NumPy GC LOWESS logR normalization, and Haldane-Anscombe allelic logOR.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from .io import FacetsConfig, validate_and_normalize_pileup
+from .io import FacetsConfig, SettingsType, validate_and_normalize_pileup, validate_settings
 
 _MAD_NORMAL_CONST: float = 0.6744897501960817
 
@@ -205,13 +206,19 @@ def compute_cnlr(
     nor_dp: np.ndarray,
     gc: np.ndarray | None = None,
     *,
-    lowess_frac: float = 0.5,
+    lowess_frac: float | None = None,
     lowess_iter: int = 3,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute library-size- and GC-LOWESS-normalized total copy log2 ratio (`cnlr`),
     raw library-centered `cnlr_raw`, and theoretical per-locus variance `cnlr_var`.
+
+    When `settings="R_default"`, matches `mskcc/facets` `procreads.R`:
+      `cnlr_raw = log2(1 + tum_dp * tscl) - log2(1 + nor_dp)` with `tscl = sum(nor_dp) / sum(tum_dp)`
+      and default `lowess_frac = 0.2`.
     """
+    validate_settings(settings)
     t_dp = np.asarray(tum_dp, dtype=np.float64)
     n_dp = np.asarray(nor_dp, dtype=np.float64)
     if t_dp.shape != n_dp.shape or t_dp.ndim != 1 or t_dp.size == 0:
@@ -219,8 +226,29 @@ def compute_cnlr(
     if np.any(t_dp < 0.0) or np.any(n_dp < 0.0):
         raise ValueError("Depth arrays must be non-negative.")
 
-    l_ratio = np.log2(np.sum(t_dp + 0.5) / np.sum(n_dp + 0.5))
-    cnlr_raw = np.log2((t_dp + 0.5) / (n_dp + 0.5)) - l_ratio
+    eff_frac = (
+        float(lowess_frac)
+        if lowess_frac is not None
+        else (0.20 if settings == "R_default" else 0.5)
+    )
+
+    ln2_sq = np.log(2.0) ** 2
+    if settings == "R_default":
+        sum_t = float(np.sum(t_dp))
+        sum_n = float(np.sum(n_dp))
+        tscl = (sum_n / sum_t) if sum_t > 0.0 else 1.0
+        cnlr_raw = np.log2(1.0 + t_dp * tscl) - np.log2(1.0 + n_dp)
+        cnlr_var = np.maximum(
+            (1.0 / ln2_sq) * (1.0 / (1.0 + t_dp * tscl) + 1.0 / (1.0 + n_dp)),
+            1e-6,
+        )
+    else:
+        l_ratio = np.log2(np.sum(t_dp + 0.5) / np.sum(n_dp + 0.5))
+        cnlr_raw = np.log2((t_dp + 0.5) / (n_dp + 0.5)) - l_ratio
+        cnlr_var = np.maximum(
+            (1.0 / ln2_sq) * (1.0 / (t_dp + 0.5) + 1.0 / (n_dp + 0.5)),
+            1e-6,
+        )
 
     cnlr = cnlr_raw.copy()
     if gc is not None:
@@ -232,16 +260,11 @@ def compute_cnlr(
             trend = lowess_1d(
                 gc_arr[finite_gc],
                 cnlr_raw[finite_gc],
-                frac=lowess_frac,
+                frac=eff_frac,
                 n_iter=lowess_iter,
             )
             cnlr[finite_gc] = cnlr_raw[finite_gc] - trend
 
-    ln2_sq = np.log(2.0) ** 2
-    cnlr_var = np.maximum(
-        (1.0 / ln2_sq) * (1.0 / (t_dp + 0.5) + 1.0 / (n_dp + 0.5)),
-        1e-6,
-    )
     return cnlr, cnlr_raw, cnlr_var
 
 
@@ -253,13 +276,16 @@ def compute_valor(
     *,
     het: np.ndarray | None = None,
     unmatched: bool = False,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute Haldane-Anscombe (+0.5) allelic log-odds ratio (`valor`) and
-    delta-method variance (`lorvar`).
+    Compute allelic log-odds ratio (`valor`) and delta-method variance (`lorvar`).
 
+    Uses Haldane-Anscombe (+0.5) by default; when `settings="R_default"` and
+    `unmatched=True`, uses Tukey's (+1/6) count offset matching `procreads.R`.
     Non-heterozygous loci (when `het` is supplied) receive `np.nan`.
     """
+    validate_settings(settings)
     ta = np.asarray(tum_alt, dtype=np.float64)
     tr = np.asarray(tum_ref, dtype=np.float64)
     if ta.shape != tr.shape or ta.ndim != 1 or ta.size == 0:
@@ -280,8 +306,9 @@ def compute_valor(
             + 1.0 / (nr + 0.5)
         )
     else:
-        valor = np.log((ta + 0.5) / (tr + 0.5))
-        lorvar = 1.0 / (ta + 0.5) + 1.0 / (tr + 0.5)
+        offset = (1.0 / 6.0) if settings == "R_default" else 0.5
+        valor = np.log((ta + offset) / (tr + offset))
+        lorvar = 1.0 / (ta + offset) + 1.0 / (tr + offset)
 
     if het is not None:
         het_mask = np.asarray(het, dtype=bool)
@@ -329,25 +356,36 @@ def _thin_snps_by_nbhd(
     return keep
 
 
-def _resolve_config(config: FacetsConfig | None, kwargs: dict) -> FacetsConfig:
-    """Merge optional FacetsConfig and keyword overrides cleanly."""
+def _resolve_config(
+    config: FacetsConfig | None,
+    settings: SettingsType,
+    kwargs: dict,
+) -> FacetsConfig:
+    """Merge optional FacetsConfig, `settings`, and keyword overrides cleanly."""
+    validate_settings(settings)
+    merged = dict(kwargs)
     if config is None:
-        return FacetsConfig(**kwargs)
-    if kwargs:
-        return replace(config, **kwargs)
-    return config
+        merged["settings"] = settings
+        return FacetsConfig(**merged)
+    eff_settings: SettingsType = (
+        config.settings if settings == "default" and config.settings != "default" else settings
+    )
+    merged["settings"] = eff_settings
+    return replace(config, **merged)
 
 
 def pre_proc_sample(
     pileup: pd.DataFrame,
     *,
     config: FacetsConfig | None = None,
+    settings: Literal["default", "R_default"] = "default",
     **kwargs,
 ) -> PreProcResult:
     """
     Validate, filter, thin, and normalize a tumor-normal SNP pileup DataFrame.
     """
-    cfg = _resolve_config(config, kwargs)
+    cfg = _resolve_config(config, settings, kwargs)
+    eff_settings = cfg.settings
     df = validate_and_normalize_pileup(pileup, genome=cfg.genome)
     n_raw = len(df)
 
@@ -371,10 +409,13 @@ def pre_proc_sample(
         )
         het_mask = (nor_vaf >= eff_thresh) & (nor_vaf <= 1.0 - eff_thresh)
     else:
+        tum_dp_arr = df["tum_dp"].to_numpy(dtype=np.float64)
         tum_vaf = df["tum_alt"].to_numpy(dtype=np.float64) / np.maximum(
-            df["tum_dp"].to_numpy(dtype=np.float64), 1.0
+            tum_dp_arr, 1.0
         )
         het_mask = (tum_vaf >= eff_thresh) & (tum_vaf <= 1.0 - eff_thresh)
+        if eff_settings == "R_default":
+            het_mask = het_mask & (tum_dp_arr >= 50.0)
 
     df["het"] = het_mask
 
@@ -397,8 +438,9 @@ def pre_proc_sample(
         df["tum_dp"].to_numpy(dtype=np.float64),
         df["nor_dp"].to_numpy(dtype=np.float64),
         gc=gc_arr,
-        lowess_frac=cfg.lowess_frac,
+        lowess_frac=cfg.effective_lowess_frac,
         lowess_iter=cfg.lowess_iter,
+        settings=eff_settings,
     )
     sigma_logr = estimate_logr_sigma(cnlr, arm=df["arm"].to_numpy())
 
@@ -409,6 +451,7 @@ def pre_proc_sample(
         df["nor_ref"].to_numpy(dtype=np.float64),
         het=het_arr,
         unmatched=cfg.unmatched,
+        settings=eff_settings,
     )
 
     logor2_stat = np.where(het_arr, (valor * valor) / lorvar, np.nan)
@@ -430,3 +473,6 @@ def pre_proc_sample(
         gc_corrected=gc_corrected,
         config=cfg,
     )
+
+
+preprocess_sample = pre_proc_sample

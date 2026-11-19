@@ -13,11 +13,19 @@ from .ascat import (
     ascat_logr,
     compare_facets_ascat,
     fit_ascat,
+    run_ascat,
 )
 from .core import run_facets
 from .em import FacetsResult, em_cncf
 from .io import FacetsConfig, validate_and_normalize_pileup
-from .preprocess import PreProcResult, compute_cnlr, compute_valor, lowess_1d, pre_proc_sample
+from .preprocess import (
+    PreProcResult,
+    compute_cnlr,
+    compute_valor,
+    lowess_1d,
+    pre_proc_sample,
+    preprocess_sample,
+)
 from .reference import (
     GRCH37_REFERENCE,
     GRCH38_REFERENCE,
@@ -49,6 +57,7 @@ __all__ = [
     "AscatResult",
     # Pipeline Functions
     "pre_proc_sample",
+    "preprocess_sample",
     "proc_sample",
     "em_cncf",
     "run_facets",
@@ -64,6 +73,7 @@ __all__ = [
     "ascat_baf",
     "ascat_invert_cn",
     "fit_ascat",
+    "run_ascat",
     "compare_facets_ascat",
 ]
 

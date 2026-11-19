@@ -24,12 +24,15 @@ from facets import (
     ascat_logr,
     canonical_chrom,
     compare_facets_ascat,
+    compute_cnlr,
     compute_valor,
     em_cncf,
     fit_ascat,
     hotelling_t2_cbs,
     pre_proc_sample,
+    preprocess_sample,
     proc_sample,
+    run_ascat,
     run_facets,
 )
 
@@ -878,5 +881,175 @@ def test_wgd_3_2_at_alpha_055_under_nb_depth_dispersion() -> None:
         )
     )
     assert seg_asym.sigma_logor2 == pytest.approx(np.sqrt(2.0), abs=1e-6)
+
+
+def test_settings_validation_and_r_default_procreads_equations() -> None:
+    """
+    Verify strict `settings` validation and `mskcc/facets` `procreads.R` equations
+    under `settings="R_default"`:
+      - `lowess_frac` defaults to 0.20 (vs 0.25 in default)
+      - depth ratio `log2(1 + rCountT * tscl) - log2(1 + rCountN) - gcbias`
+      - unmatched mode Tukey +1/6 offset in `valor`/`lorvar` + `rCountT >= 50` het gate
+    """
+    specs = [("chr1", 1_000_000, 40_000_000, 120, 1, 1, 0.0)]
+    pileup = _simulate_pileup(specs, seed=930)
+    pre_def = preprocess_sample(pileup, settings="default")
+    seg_def = proc_sample(pre_def, settings="default")
+
+    with pytest.raises(ValueError, match="settings"):
+        FacetsConfig(settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        preprocess_sample(pileup, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        proc_sample(pre_def, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        em_cncf(seg_def, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        run_facets(pileup, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        run_ascat(seg_def, settings="bad_mode")  # type: ignore[arg-type]
+
+    assert FacetsConfig(settings="default").effective_lowess_frac == pytest.approx(0.25)
+    assert FacetsConfig(settings="R_default").effective_lowess_frac == pytest.approx(0.20)
+
+    # Exact procreads.R depth ratio check without GC bias
+    t_dp = np.array([0.0, 50.0, 120.0, 230.0], dtype=np.float64)
+    n_dp = np.array([40.0, 60.0, 100.0, 200.0], dtype=np.float64)
+    cnlr_r, cnlr_raw_r, _ = compute_cnlr(t_dp, n_dp, gc=None, settings="R_default")
+    tscl = float(np.sum(n_dp) / np.sum(t_dp))
+    expected_cnlr_r = np.log2(1.0 + t_dp * tscl) - np.log2(1.0 + n_dp)
+    np.testing.assert_allclose(cnlr_r, expected_cnlr_r, atol=1e-12)
+    np.testing.assert_allclose(cnlr_raw_r, expected_cnlr_r, atol=1e-12)
+
+    # Exact Tukey +1/6 unmatched valor/lorvar vs Haldane +0.5 default
+    ta = np.array([30.0, 0.0, 18.0], dtype=np.float64)
+    tr = np.array([25.0, 55.0, 42.0], dtype=np.float64)
+    val_r, lv_r = compute_valor(ta, tr, unmatched=True, settings="R_default")
+    np.testing.assert_allclose(
+        val_r, np.log((ta + 1.0 / 6.0) / (tr + 1.0 / 6.0)), atol=1e-12
+    )
+    np.testing.assert_allclose(
+        lv_r, 1.0 / (ta + 1.0 / 6.0) + 1.0 / (tr + 1.0 / 6.0), atol=1e-12
+    )
+
+    # Unmatched rCountT >= 50 heterozygous SNP gate
+    unm_df = pd.DataFrame(
+        {
+            "chrom": ["chr1"] * 20,
+            "pos": np.arange(1_000_000, 1_000_000 + 20 * 10_000, 10_000, dtype=np.int64),
+            "nor_dp": np.full(20, 80, dtype=np.int64),
+            "tum_dp": np.array([45] * 10 + [60] * 10, dtype=np.int64),
+            "nor_alt": np.full(20, 40, dtype=np.int64),
+            "tum_alt": np.array([22] * 10 + [30] * 10, dtype=np.int64),
+        }
+    )
+    pre_unm_def = preprocess_sample(unm_df, unmatched=True, settings="default")
+    pre_unm_r = preprocess_sample(unm_df, unmatched=True, settings="R_default")
+    assert pre_unm_def.n_het == 20
+    assert pre_unm_r.n_het == 10
+    assert (pre_unm_r.snps.loc[pre_unm_r.snps["tum_dp"] < 50, "het"] == False).all()  # noqa: E712
+    assert (pre_unm_r.snps.loc[pre_unm_r.snps["tum_dp"] >= 50, "het"] == True).all()  # noqa: E712
+
+
+def test_r_default_cbs2rank_clustering_and_emcncf_end_to_end() -> None:
+    """
+    Verify `settings="R_default"` rank-based bivariate CBS (`cbs2rank`),
+    OCN (<0.04) + Mann-Whitney (p > 0.001) segment clustering, and `emcncf`
+    surrogate moment EM end-to-end on planted ASCN + outlier-contaminated data.
+    """
+    alpha = 0.65
+    specs = [
+        ("chr1", 1_000_000, 50_000_000, 500, 1, 1, alpha),
+        ("chr1", 50_500_000, 95_000_000, 450, 1, 0, alpha),   # LOH
+        ("chr2", 1_000_000, 50_000_000, 500, 2, 0, alpha),   # cnLOH
+        ("chr2", 50_500_000, 95_000_000, 450, 2, 1, alpha),  # gain
+        ("chr3", 1_000_000, 50_000_000, 500, 1, 1, alpha),
+        ("chr3", 50_500_000, 85_000_000, 400, 3, 1, alpha),  # amp
+        ("chr4", 1_000_000, 50_000_000, 500, 1, 1, alpha),
+    ]
+    pileup = _simulate_pileup(
+        specs, seed=940, nor_mean_dp=90.0, tum_mean_dp=100.0, het_prob=0.48, gc_amplitude=0.30
+    )
+    # Inject extreme somatic/genotyping allelic outliers in diploid chr1
+    het_chr1 = np.flatnonzero(
+        (pileup["chrom"] == "chr1")
+        & (pileup["pos"] < 40_000_000)
+        & (np.abs(pileup["nor_alt"] / pileup["nor_dp"] - 0.5) < 0.15)
+    )
+    for out_idx in het_chr1[:3]:
+        pileup.loc[out_idx, "tum_alt"] = pileup.loc[out_idx, "tum_dp"]
+
+    res_r = run_facets(pileup, settings="R_default")
+    assert res_r.is_diploid_null is False
+    assert res_r.purity is not None
+    assert abs(res_r.purity - alpha) < 0.06
+
+    segs_r = res_r.to_dataframe()
+    # Flanking/replicate diploid (1,1) segments on chr1, chr3, chr4 should share one cluster
+    dip_clusts = set(
+        segs_r.loc[(segs_r["c_major"] == 1) & (segs_r["c_minor"] == 1), "segclust"].tolist()
+    )
+    assert len(dip_clusts) == 1
+    # cnLOH on chr2 must NOT merge with diploid (1,1) despite matching OCN ~ 1.0
+    cnloh_rows = segs_r[(segs_r["chrom"] == "chr2") & (segs_r["end"] <= 51_000_000)]
+    assert len(cnloh_rows) >= 1
+    assert (cnloh_rows["c_major"] == 2).all() and (cnloh_rows["c_minor"] == 0).all()
+    assert not set(cnloh_rows["segclust"].tolist()).intersection(dip_clusts)
+
+
+def test_r_default_run_ascat_gamma055_rho105_and_cascading_tiers() -> None:
+    """
+    Verify `run_ascat(..., settings="R_default")` uses default `gamma=0.55`,
+    `rho` grid `[0.10, 1.05]`, `0.05` balanced-segment weight, and 4-tier cascading.
+    """
+    true_rho = 0.60
+    seg_states = [
+        ("chr1", 1, 60_000_000, 1, 1),
+        ("chr2", 1, 30_000_000, 2, 1),
+        ("chr3", 1, 25_000_000, 1, 0),
+        ("chr4", 1, 20_000_000, 2, 0),
+        ("chr5", 1, 20_000_000, 3, 1),
+    ]
+    lengths = np.array([e - s + 1 for _, s, e, *_ in seg_states], dtype=np.float64)
+    true_ploidy = float(
+        np.sum(lengths * np.array([ma + mi for *_, ma, mi in seg_states])) / np.sum(lengths)
+    )
+    rows_055 = [
+        {
+            "chrom": ch,
+            "start": s,
+            "end": e,
+            "logr": ascat_logr(ma, mi, true_rho, true_ploidy, gamma_ascat=0.55),
+            "baf": ascat_baf(ma, mi, true_rho, minor_allele=True),
+            "nhet": 120,
+        }
+        for ch, s, e, ma, mi in seg_states
+    ]
+    seg_df = pd.DataFrame(rows_055)
+
+    # Without specifying gamma_ascat, settings="R_default" defaults to gamma=0.55
+    ares_r = run_ascat(seg_df, settings="R_default")
+    assert ares_r.gamma_ascat == pytest.approx(0.55)
+    assert abs(ares_r.purity - true_rho) < 0.03
+    assert abs(ares_r.ploidy - true_ploidy) < 0.10
+    assert list(ares_r.to_dataframe()["n_major"]) == [r[3] for r in seg_states]
+    assert list(ares_r.to_dataframe()["n_minor"]) == [r[4] for r in seg_states]
+
+    # Pure tumor (rho=1.0) with slight over-compressed BAF/logR where continuous optimum sits near ~1.02
+    rows_pure = [
+        {
+            "chrom": ch,
+            "start": s,
+            "end": e,
+            "logr": ascat_logr(ma, mi, 1.0, true_ploidy, gamma_ascat=0.55) * 1.015,
+            "baf": max(1e-4, ascat_baf(ma, mi, 1.0, minor_allele=True) * 0.99),
+            "nhet": 120,
+        }
+        for ch, s, e, ma, mi in seg_states
+    ]
+    ares_pure = run_ascat(pd.DataFrame(rows_pure), settings="R_default")
+    assert ares_pure.purity == pytest.approx(1.0, abs=0.03)
+    assert abs(ares_pure.ploidy - true_ploidy) < 0.15
+
 
 

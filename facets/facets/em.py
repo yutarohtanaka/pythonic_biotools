@@ -8,11 +8,13 @@ fractions (`cf_em`), with WGD disambiguation and pure-diploid null guarding.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 
+from .io import validate_settings
 from .segment import SegmentedResult
 
 _LN2: float = float(np.log(2.0))
@@ -149,6 +151,8 @@ class _ClusterSuffStats:
     ss_r: float
     n_h: int
     v_het: np.ndarray
+    lv_het: np.ndarray
+    x2_het: np.ndarray
     inv_lv: np.ndarray
     sum_inv_lv: float
     v_over_lv: np.ndarray
@@ -177,6 +181,7 @@ def _extract_cluster_stats(snps: pd.DataFrame) -> list[_ClusterSuffStats]:
         lv = lorvar[h_mask]
         n_h = int(v.size)
         if n_h > 0:
+            x2_het = v * v - lv
             inv_lv = 1.0 / lv
             sum_inv_lv = float(np.sum(inv_lv))
             v_over_lv = v * inv_lv
@@ -184,6 +189,7 @@ def _extract_cluster_stats(snps: pd.DataFrame) -> list[_ClusterSuffStats]:
                 np.sum(-0.5 * (_LOG2PI + np.log(lv)) - 0.5 * (v * v) * inv_lv)
             )
         else:
+            x2_het = np.empty(0, dtype=np.float64)
             inv_lv = np.empty(0, dtype=np.float64)
             sum_inv_lv = 0.0
             v_over_lv = np.empty(0, dtype=np.float64)
@@ -197,6 +203,8 @@ def _extract_cluster_stats(snps: pd.DataFrame) -> list[_ClusterSuffStats]:
                 ss_r=ss_r,
                 n_h=n_h,
                 v_het=v,
+                lv_het=lv,
+                x2_het=x2_het,
                 inv_lv=inv_lv,
                 sum_inv_lv=sum_inv_lv,
                 v_over_lv=v_over_lv,
@@ -214,8 +222,10 @@ def _cluster_state_loglik(
     phi: float,
     gamma: float,
     sigma_r_sq: float,
+    *,
+    use_surrogate: bool = False,
 ) -> np.ndarray:
-    """Evaluate joint (Gaussian logR + Folded-Normal logOR) log-likelihood across all states."""
+    """Evaluate joint (logR + logOR) log-likelihood across all states."""
     mu_r = _expected_mu_r(t_arr, phi, gamma)
     ll_r = -0.5 * st.n_r * (_LOG2PI + np.log(sigma_r_sq)) - (
         st.ss_r + st.n_r * (st.y_r_bar - mu_r) ** 2
@@ -225,6 +235,22 @@ def _cluster_state_loglik(
         return ll_r
 
     mu_o = _expected_mu_o(c_major, c_minor, phi)
+    if use_surrogate:
+        lambda_k = mu_o * mu_o
+        diff_mat = st.x2_het[:, None] - lambda_k[None, :]
+        surr_w = 1.0 / (np.abs(diff_mat) + 1e-6)
+        b_mat = np.sqrt(
+            np.maximum(
+                st.lv_het[:, None] * (st.lv_het[:, None] + 2.0 * lambda_k[None, :]),
+                1e-12,
+            )
+        )
+        ll_o = np.sum(
+            -np.log(2.0 * b_mat) - (surr_w * (diff_mat * diff_mat)) / b_mat,
+            axis=0,
+        )
+        return ll_r + ll_o
+
     ll_o = np.full(c_major.shape, st.const_o, dtype=np.float64)
     nz = mu_o > 1e-12
     if np.any(nz):
@@ -248,6 +274,8 @@ def _optimize_alpha_1d(
     gamma: float,
     sigma_r_sq: float,
     current_alpha: float,
+    *,
+    use_surrogate: bool = False,
 ) -> float:
     """Maximize expected complete-data log-likelihood over clonal purity alpha in [0.05, 1.0]."""
     active_items: list[tuple[_ClusterSuffStats, np.ndarray, np.ndarray]] = []
@@ -263,11 +291,69 @@ def _optimize_alpha_1d(
     if not active_items:
         return current_alpha
 
+    if use_surrogate:
+        # IRLS moment update holding surrogate weights 1 / (|x2_ij - lambda_k| + 1e-6) fixed
+        moment_items: list[
+            tuple[_ClusterSuffStats, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = []
+        for st, nz, w_nz in active_items:
+            if st.n_h > 0:
+                mu_cur = _expected_mu_o(c_major[nz], c_minor[nz], current_alpha)
+                lam_cur = mu_cur * mu_cur
+                diff_c = st.x2_het[:, None] - lam_cur[None, :]
+                surr_w = 1.0 / (np.abs(diff_c) + 1e-6)
+                b_cur = np.sqrt(
+                    np.maximum(
+                        st.lv_het[:, None] * (st.lv_het[:, None] + 2.0 * lam_cur[None, :]),
+                        1e-12,
+                    )
+                )
+                eff_w = surr_w / b_cur
+                w_sum = np.sum(eff_w, axis=0)
+                x2_bar = np.sum(eff_w * st.x2_het[:, None], axis=0) / np.maximum(
+                    w_sum, 1e-12
+                )
+            else:
+                w_sum = np.zeros(nz.size, dtype=np.float64)
+                x2_bar = np.zeros(nz.size, dtype=np.float64)
+            moment_items.append((st, nz, w_nz, w_sum, x2_bar))
+
+        def _moment_obj(alpha_val: float) -> float:
+            loss = 0.0
+            for st, nz, w_nz, w_sum, x2_bar in moment_items:
+                mu_r = _expected_mu_r(t_arr[nz], alpha_val, gamma)
+                l_r = 0.5 * st.n_r * ((st.y_r_bar - mu_r) ** 2) / sigma_r_sq
+                if st.n_h > 0:
+                    mu_o = _expected_mu_o(c_major[nz], c_minor[nz], alpha_val)
+                    lam_a = mu_o * mu_o
+                    l_o = w_sum * ((x2_bar - lam_a) ** 2)
+                else:
+                    l_o = 0.0
+                loss += float(np.dot(w_nz, l_r + l_o))
+            return loss
+
+        grid_m = np.linspace(0.05, 1.0, 15)
+        vals_m = [_moment_obj(float(a)) for a in grid_m]
+        b_idx = int(np.argmin(vals_m))
+        lo_m = float(max(0.05, grid_m[max(0, b_idx - 1)]))
+        hi_m = float(min(1.0, grid_m[min(len(grid_m) - 1, b_idx + 1)]))
+        res_m = minimize_scalar(
+            _moment_obj, bounds=(lo_m, hi_m), method="bounded", options={"xatol": 2e-4}
+        )
+        return float(np.clip(res_m.x, 0.05, 1.0))
+
     def _neg_obj(alpha_val: float) -> float:
         tot = 0.0
         for st, nz, w_nz in active_items:
             ll_vec = _cluster_state_loglik(
-                st, c_major[nz], c_minor[nz], t_arr[nz], alpha_val, gamma, sigma_r_sq
+                st,
+                c_major[nz],
+                c_minor[nz],
+                t_arr[nz],
+                alpha_val,
+                gamma,
+                sigma_r_sq,
+                use_surrogate=use_surrogate,
             )
             tot += float(np.dot(w_nz, ll_vec))
         return -tot
@@ -292,13 +378,24 @@ def _optimize_cluster_subclonal(
     alpha: float,
     gamma: float,
     sigma_r_sq: float,
+    *,
+    use_surrogate: bool = False,
 ) -> tuple[int, float, float]:
     """
     Search over non-(1,1) states and phi_k in [0.15, alpha] for a cluster.
     Returns (best_state_idx, best_phi, best_ll).
     """
     if alpha <= 0.19:
-        ll_c = _cluster_state_loglik(st, c_major, c_minor, t_arr, alpha, gamma, sigma_r_sq)
+        ll_c = _cluster_state_loglik(
+            st,
+            c_major,
+            c_minor,
+            t_arr,
+            alpha,
+            gamma,
+            sigma_r_sq,
+            use_surrogate=use_surrogate,
+        )
         idx = int(np.argmax(ll_c))
         return idx, alpha, float(ll_c[idx])
 
@@ -342,7 +439,14 @@ def _optimize_cluster_subclonal(
 
     for phi_val in phi_grid:
         ll_vec = _cluster_state_loglik(
-            st, cM_sub, cm_sub, ct_sub, float(phi_val), gamma, sigma_r_sq
+            st,
+            cM_sub,
+            cm_sub,
+            ct_sub,
+            float(phi_val),
+            gamma,
+            sigma_r_sq,
+            use_surrogate=use_surrogate,
         )
         score_vec = ll_vec - pen_sub
         s_local = int(np.argmax(score_vec))
@@ -358,7 +462,11 @@ def _optimize_cluster_subclonal(
     ct = np.array([t_arr[best_s]], dtype=np.int64)
 
     def _neg_phi(p: float) -> float:
-        return -float(_cluster_state_loglik(st, cM, cm, ct, p, gamma, sigma_r_sq)[0])
+        return -float(
+            _cluster_state_loglik(
+                st, cM, cm, ct, p, gamma, sigma_r_sq, use_surrogate=use_surrogate
+            )[0]
+        )
 
     lo = max(0.15, best_phi - 0.08)
     hi = min(alpha, best_phi + 0.08)
@@ -394,6 +502,9 @@ def _run_phase_b(
     pi_start: np.ndarray,
     sigma_r_floor: float,
     gamma_locked: bool,
+    *,
+    use_surrogate: bool = False,
+    max_cycles: int = 15,
 ) -> dict:
     """Run subclonal CCF refinement + EM updates from a starting (alpha, gamma)."""
     k_clust = len(stats)
@@ -412,7 +523,7 @@ def _run_phase_b(
     is_clonal = np.ones(k_clust, dtype=bool)
     weights = np.full((k_clust, n_states), 1.0 / n_states, dtype=np.float64)
 
-    n_cycles = 15 if k_clust >= 2 else 1
+    n_cycles = max_cycles if k_clust >= 2 else 1
     for _ in range(n_cycles):
         prev_alpha_b = alpha
         prev_gamma_b = gamma
@@ -425,11 +536,26 @@ def _run_phase_b(
                     continue
 
                 ll_clonal_vec = _cluster_state_loglik(
-                    st, c_major, c_minor, t_arr, alpha, gamma, sigma_r_sq
+                    st,
+                    c_major,
+                    c_minor,
+                    t_arr,
+                    alpha,
+                    gamma,
+                    sigma_r_sq,
+                    use_surrogate=use_surrogate,
                 )
                 ll_clonal_best = float(np.max(ll_clonal_vec))
                 s_sub, phi_sub, ll_sub = _optimize_cluster_subclonal(
-                    st, c_major, c_minor, t_arr, diploid_idx, alpha, gamma, sigma_r_sq
+                    st,
+                    c_major,
+                    c_minor,
+                    t_arr,
+                    diploid_idx,
+                    alpha,
+                    gamma,
+                    sigma_r_sq,
+                    use_surrogate=use_surrogate,
                 )
                 sub_thresh = max(12.0, 2.0 * np.log(st.n_r + st.n_h + 1.0))
                 if (phi_sub < alpha - 0.04) and ((ll_sub - ll_clonal_best) > sub_thresh):
@@ -442,7 +568,14 @@ def _run_phase_b(
         log_pi = np.log(np.maximum(pi, 1e-12))
         for k, st in enumerate(stats):
             ll_s = _cluster_state_loglik(
-                st, c_major, c_minor, t_arr, float(phi_vec[k]), gamma, sigma_r_sq
+                st,
+                c_major,
+                c_minor,
+                t_arr,
+                float(phi_vec[k]),
+                gamma,
+                sigma_r_sq,
+                use_surrogate=use_surrogate,
             )
             lw = log_pi + ll_s + tie_breaker
             m_lw = float(np.max(lw))
@@ -488,6 +621,7 @@ def _run_phase_b(
             gamma,
             sigma_r_sq,
             alpha,
+            use_surrogate=use_surrogate,
         )
         phi_vec[is_clonal] = alpha
         phi_vec = np.minimum(phi_vec, alpha)
@@ -501,7 +635,14 @@ def _run_phase_b(
     map_ll = 0.0
     for k, st in enumerate(stats):
         ll_s = _cluster_state_loglik(
-            st, c_major, c_minor, t_arr, float(phi_vec[k]), gamma, sigma_r_sq
+            st,
+            c_major,
+            c_minor,
+            t_arr,
+            float(phi_vec[k]),
+            gamma,
+            sigma_r_sq,
+            use_surrogate=use_surrogate,
         )
         lw = log_pi + ll_s + tie_breaker
         m_lw = float(np.max(lw))
@@ -541,6 +682,8 @@ def _run_em_from_seed(
     gamma_locked: bool,
     max_iter: int,
     tol: float,
+    *,
+    use_surrogate: bool = False,
 ) -> dict:
     """Run clonal EM followed by subclonal CCF refinement from one (alpha, gamma) seed."""
     k_clust = len(stats)
@@ -565,7 +708,14 @@ def _run_em_from_seed(
         total_ll = 0.0
         for k, st in enumerate(stats):
             ll_s = _cluster_state_loglik(
-                st, c_major, c_minor, t_arr, alpha, gamma, sigma_r_sq
+                st,
+                c_major,
+                c_minor,
+                t_arr,
+                alpha,
+                gamma,
+                sigma_r_sq,
+                use_surrogate=use_surrogate,
             )
             lw = log_pi + ll_s + tie_breaker
             m_lw = float(np.max(lw))
@@ -602,6 +752,7 @@ def _run_em_from_seed(
             gamma,
             sigma_r_sq,
             alpha,
+            use_surrogate=use_surrogate,
         )
 
         if abs(total_ll - prev_ll) < tol and abs(new_alpha - alpha) < 1e-4:
@@ -609,6 +760,8 @@ def _run_em_from_seed(
             break
         alpha = new_alpha
         prev_ll = total_ll
+
+    eff_cycles = min(max_iter, 10) if use_surrogate else 15
 
     # Phase B from converged Phase A, and also directly from initial seed to guard against subclonal pull
     cand_a = _run_phase_b(
@@ -624,6 +777,8 @@ def _run_em_from_seed(
         pi,
         sigma_r_floor,
         gamma_locked,
+        use_surrogate=use_surrogate,
+        max_cycles=eff_cycles,
     )
     if k_clust >= 2:
         uniform_pi = np.full(n_states, 1.0 / n_states, dtype=np.float64)
@@ -640,6 +795,8 @@ def _run_em_from_seed(
             uniform_pi,
             sigma_r_floor,
             gamma_locked,
+            use_surrogate=use_surrogate,
+            max_cycles=eff_cycles,
         )
         pen_a = cand_a["log_lik"] - 5.0 * float(np.sum(cand_a["is_subclonal"]))
         pen_i = cand_init["log_lik"] - 5.0 * float(np.sum(cand_init["is_subclonal"]))
@@ -655,14 +812,23 @@ def em_cncf(
     min_nhet: int | None = None,
     diploid_logr: float | None = None,
     keep_low_nhet_lcn: bool = False,
-    max_iter: int = 100,
+    max_iter: int | None = None,
     tol: float = 1e-5,
+    settings: Literal["default", "R_default"] = "default",
 ) -> FacetsResult:
     """
-    Fit Gaussian (logR) + Folded-Normal (logOR) mixture EM over segmented
-    clusters to estimate tumor purity, ploidy, dipLogR, integer (C_major, C_minor),
-    LOH, and clonal cellular fractions (`cf_em`).
+    Fit mixture EM over segmented clusters to estimate tumor purity, ploidy,
+    dipLogR, integer (C_major, C_minor), LOH, and clonal cellular fractions (`cf_em`).
+
+    - `settings="default"`: Gaussian (logR) + exact Folded-Normal (logOR) EM (`max_iter=100`).
+    - `settings="R_default"`: `emcncf` allele log-likelihood surrogate weight
+      `1 / (abs(x2_ij - lambda_k) + 1e-6)` with `max_iter=10` moment updates.
     """
+    validate_settings(settings)
+    use_surrogate = settings == "R_default"
+    eff_max_iter = (
+        int(max_iter) if max_iter is not None else (10 if use_surrogate else 100)
+    )
     eff_min_nhet = int(min_nhet if min_nhet is not None else segmented.min_nhet)
     segs = segmented.segments.copy()
     snps = segmented.jointseg.copy()
@@ -702,6 +868,7 @@ def em_cncf(
                 0.0,
                 gamma_null,
                 sigma_null_sq,
+                use_surrogate=use_surrogate,
             )[0]
         )
         for st in stats
@@ -734,7 +901,14 @@ def em_cncf(
         t_weighted = 0.0
         for st in stats:
             ll_vec = _cluster_state_loglik(
-                st, c_major, c_minor, t_arr, a0, g0, sigma_r_init
+                st,
+                c_major,
+                c_minor,
+                t_arr,
+                a0,
+                g0,
+                sigma_r_init,
+                use_surrogate=use_surrogate,
             )
             best_s = int(np.argmax(ll_vec + tie_breaker))
             ll_seed += float(ll_vec[best_s])
@@ -790,8 +964,9 @@ def em_cncf(
             sigma_r_init,
             sigma_r_floor,
             gamma_locked,
-            max_iter,
+            eff_max_iter,
             tol,
+            use_surrogate=use_surrogate,
         )
         seg_t = t_arr[fit["map_states"][seg_clust_pos]].astype(np.float64)
         ploidy_cand = float(np.sum(seg_lengths * seg_t) / max(total_bp, 1.0))

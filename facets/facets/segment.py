@@ -6,10 +6,13 @@ post-segmentation clustering, and diploid baseline (`dipLogR`) estimation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
+from scipy.stats import mannwhitneyu, rankdata
 
+from .io import validate_settings
 from .preprocess import PreProcResult, estimate_logr_sigma
 
 _MAD_NORMAL_CONST: float = 0.6744897501960817
@@ -342,30 +345,104 @@ def _find_best_arc(
     return best_t2, best_i, best_j
 
 
+def _centered_uniform_ranks(vals: np.ndarray) -> np.ndarray:
+    """
+    Transform 1D array `vals` into centered uniform ranks matching `cbs2rank.f`:
+        (rank - (n + 1)/2) / sqrt(n * (n + 1) / 12)
+    """
+    n = vals.size
+    if n <= 1:
+        return np.zeros(n, dtype=np.float64)
+    ranks = rankdata(vals, method="average")
+    denom = np.sqrt(n * (n + 1.0) / 12.0)
+    return (ranks - 0.5 * (n + 1.0)) / max(float(denom), 1e-12)
+
+
 def hotelling_t2_cbs(
     cnlr: np.ndarray,
     logor2_stat: np.ndarray | None = None,
     het: np.ndarray | None = None,
     *,
+    valor: np.ndarray | None = None,
     cval: float = 150.0,
     min_seg_snps: int = 5,
     sigma_logr: float | None = None,
     sigma_logor2: float | None = None,
     r12: float | None = None,
     winsor_z2: float = 25.0,
+    settings: Literal["default", "R_default"] = "default",
 ) -> list[tuple[int, int]]:
     """
-    Segment a single chromosome arm via bivariate Hotelling-T2 Circular Binary
-    Segmentation (CBS) over `cnlr` (all SNPs) and `logor2_stat` (het SNPs).
+    Segment a single chromosome arm via bivariate Circular Binary Segmentation (CBS).
+
+    - `settings="default"`: Parametric Hotelling-T2 CBS over `cnlr` and Winsorized `logor2_stat`.
+    - `settings="R_default"`: Rank-based bivariate CBS (`cbs2rank.f`) over centered uniform
+      ranks of `(cnlr, |valor|)`.
 
     Returns a sorted list of half-open index slices `[(start, end), ...]` partitioning `[0, n)`.
     """
+    validate_settings(settings)
     x1 = np.asarray(cnlr, dtype=np.float64)
     n = x1.size
     if n == 0:
         return []
     if n < 2 * min_seg_snps:
         return [(0, n)]
+
+    if settings == "R_default":
+        if valor is not None and het is not None:
+            raw_val = np.abs(np.asarray(valor, dtype=np.float64))
+            het_mask = np.asarray(het, dtype=bool) & np.isfinite(raw_val)
+            abs_val = np.where(het_mask, raw_val, 0.0)
+        elif logor2_stat is not None and het is not None:
+            raw_z2 = np.asarray(logor2_stat, dtype=np.float64)
+            het_mask = np.asarray(het, dtype=bool) & np.isfinite(raw_z2)
+            abs_val = np.where(het_mask, np.sqrt(np.maximum(raw_z2, 0.0)), 0.0)
+        else:
+            het_mask = np.zeros(n, dtype=bool)
+            abs_val = np.zeros(n, dtype=np.float64)
+
+        stack_r: list[tuple[int, int]] = [(0, n)]
+        segs_r: list[tuple[int, int]] = []
+        while stack_r:
+            lo, hi = stack_r.pop()
+            if hi - lo < 2 * min_seg_snps:
+                segs_r.append((lo, hi))
+                continue
+            u1 = _centered_uniform_ranks(x1[lo:hi])
+            h_sub = het_mask[lo:hi]
+            u2 = np.zeros(hi - lo, dtype=np.float64)
+            if int(np.sum(h_sub)) >= 2:
+                u2[h_sub] = _centered_uniform_ranks(abs_val[lo:hi][h_sub])
+            res = _find_best_arc(
+                u1,
+                u2,
+                h_sub,
+                1.0,
+                1.0,
+                0.0,
+                min_seg_snps,
+            )
+            if res is None or res[0] <= cval:
+                segs_r.append((lo, hi))
+                continue
+            _, rel_i, rel_j = res
+            abs_i = lo + rel_i
+            abs_j = lo + rel_j
+            children_r: list[tuple[int, int]] = []
+            if abs_i > lo:
+                children_r.append((lo, abs_i))
+            children_r.append((abs_i, abs_j))
+            if abs_j < hi:
+                children_r.append((abs_j, hi))
+            if len(children_r) <= 1:
+                segs_r.append((lo, hi))
+            else:
+                for ch in reversed(children_r):
+                    stack_r.append(ch)
+
+        segs_r.sort(key=lambda pair: pair[0])
+        return segs_r
 
     if logor2_stat is None or het is None:
         het_mask = np.zeros(n, dtype=bool)
@@ -484,11 +561,17 @@ def cluster_segments(
     sigma_logr: float = 0.2,
     sigma_logor2: float = float(np.sqrt(2.0)),
     r12: float = 0.0,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Hierarchically cluster segmented genomic intervals sharing statistically
-    indistinguishable (cnlr, logOR^2) profiles using bivariate Hotelling-T2.
+    indistinguishable copy-number and allelic imbalance profiles.
+
+    - `settings="default"`: Bivariate Hotelling-T2 agglomerative clustering.
+    - `settings="R_default"`: Merge segments via OCN median difference `< 0.04`
+      and Mann-Whitney U test (`p > 0.001`) on heterozygous `|valor|`.
     """
+    validate_settings(settings)
     segs = segments_df.copy()
     snps = snps_df.copy()
     n_segs = len(segs)
@@ -500,6 +583,131 @@ def cluster_segments(
     seg_ids = segs["seg_idx"].to_numpy(dtype=np.int64)
     snp_seg_idx = snps["seg_idx"].to_numpy(dtype=np.int64)
     x1 = snps["cnlr"].to_numpy(dtype=np.float64)
+
+    if settings == "R_default":
+        ocn_all = np.power(2.0, x1 - float(np.median(x1)))
+        if "valor" in snps.columns:
+            raw_val = np.abs(snps["valor"].to_numpy(dtype=np.float64))
+            het_v = snps["het"].to_numpy(dtype=bool) & np.isfinite(raw_val)
+        else:
+            raw_z2 = snps["logor2_stat"].to_numpy(dtype=np.float64)
+            het_v = snps["het"].to_numpy(dtype=bool) & np.isfinite(raw_z2)
+            raw_val = np.sqrt(np.maximum(np.where(het_v, raw_z2, 0.0), 0.0))
+
+        seg_data: dict[int, dict[str, np.ndarray]] = {}
+        for s_id in seg_ids:
+            mask = snp_seg_idx == s_id
+            h_mask = mask & het_v
+            seg_data[int(s_id)] = {
+                "ocn": ocn_all[mask],
+                "val": raw_val[h_mask],
+            }
+
+        high_ids = [
+            int(s_id) for s_id in seg_ids if seg_data[int(s_id)]["val"].size >= min_nhet
+        ]
+        low_ids = [
+            int(s_id) for s_id in seg_ids if seg_data[int(s_id)]["val"].size < min_nhet
+        ]
+
+        r_clusters: list[dict] = [
+            {
+                "segs": [s_id],
+                "ocn": seg_data[s_id]["ocn"],
+                "ocn_med": float(np.median(seg_data[s_id]["ocn"])),
+                "val": seg_data[s_id]["val"],
+            }
+            for s_id in high_ids
+        ]
+
+        while len(r_clusters) > 1:
+            best_ocn_diff = np.inf
+            best_pval = -1.0
+            best_pair_r = (-1, -1)
+            for a in range(len(r_clusters)):
+                ca = r_clusters[a]
+                for b in range(a + 1, len(r_clusters)):
+                    cb = r_clusters[b]
+                    ocn_diff = abs(ca["ocn_med"] - cb["ocn_med"])
+                    if ocn_diff >= 0.04:
+                        continue
+                    pval = float(
+                        mannwhitneyu(
+                            ca["val"], cb["val"], alternative="two-sided"
+                        ).pvalue
+                    )
+                    if pval > 0.001 and (
+                        ocn_diff < best_ocn_diff
+                        or (ocn_diff == best_ocn_diff and pval > best_pval)
+                    ):
+                        best_ocn_diff = ocn_diff
+                        best_pval = pval
+                        best_pair_r = (a, b)
+
+            if best_pair_r[0] < 0:
+                break
+            a, b = best_pair_r
+            ca = r_clusters[a]
+            cb = r_clusters[b]
+            merged_ocn = np.concatenate([ca["ocn"], cb["ocn"]])
+            r_clusters[a] = {
+                "segs": ca["segs"] + cb["segs"],
+                "ocn": merged_ocn,
+                "ocn_med": float(np.median(merged_ocn)),
+                "val": np.concatenate([ca["val"], cb["val"]]),
+            }
+            r_clusters.pop(b)
+
+        for s_id in low_ids:
+            sd = seg_data[s_id]
+            s_med = float(np.median(sd["ocn"]))
+            best_c = -1
+            best_diff = np.inf
+            for c_idx, c in enumerate(r_clusters):
+                diff = abs(s_med - c["ocn_med"])
+                if diff < best_diff:
+                    best_diff = diff
+                    best_c = c_idx
+            can_merge = False
+            if best_c >= 0 and best_diff < 0.04:
+                if sd["val"].size >= 2 and r_clusters[best_c]["val"].size >= 2:
+                    pval = float(
+                        mannwhitneyu(
+                            sd["val"],
+                            r_clusters[best_c]["val"],
+                            alternative="two-sided",
+                        ).pvalue
+                    )
+                    can_merge = pval > 0.001
+                else:
+                    can_merge = True
+            if can_merge:
+                merged_ocn = np.concatenate([r_clusters[best_c]["ocn"], sd["ocn"]])
+                r_clusters[best_c]["segs"].append(s_id)
+                r_clusters[best_c]["ocn"] = merged_ocn
+                r_clusters[best_c]["ocn_med"] = float(np.median(merged_ocn))
+                r_clusters[best_c]["val"] = np.concatenate(
+                    [r_clusters[best_c]["val"], sd["val"]]
+                )
+            else:
+                r_clusters.append(
+                    {
+                        "segs": [s_id],
+                        "ocn": sd["ocn"],
+                        "ocn_med": s_med,
+                        "val": sd["val"],
+                    }
+                )
+
+        r_clusters.sort(key=lambda c: min(c["segs"]))
+        seg_to_clust_r: dict[int, int] = {}
+        for clust_id, c in enumerate(r_clusters):
+            for s_id in c["segs"]:
+                seg_to_clust_r[s_id] = clust_id
+
+        segs["segclust"] = [seg_to_clust_r[int(s)] for s in seg_ids]
+        snps["segclust"] = [seg_to_clust_r[int(s)] for s in snp_seg_idx]
+        return segs, snps
     het = snps["het"].to_numpy(dtype=bool) & np.isfinite(
         snps["logor2_stat"].to_numpy(dtype=np.float64)
     )
@@ -713,11 +921,13 @@ def proc_sample(
     min_seg_snps: int | None = None,
     diploid_logr: float | None = None,
     delta_cn: float | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> SegmentedResult:
     """
-    Run two-stage bivariate Hotelling-T2 CBS (`pre_seg` + `seg`), cluster segments,
+    Run two-stage bivariate CBS (`pre_seg` + `seg`), cluster segments,
     and estimate the diploid logR baseline (`dipLogR`).
     """
+    validate_settings(settings)
     cfg = preproc.config
     eff_pre_cval = float(pre_cval if pre_cval is not None else cfg.pre_cval)
     eff_cval = float(cval if cval is not None else cfg.cval)
@@ -772,11 +982,13 @@ def proc_sample(
             cnlr_work[a0:a1],
             z2_all[a0:a1],
             het_all[a0:a1],
+            valor=valor_all[a0:a1],
             cval=eff_pre_cval,
             min_seg_snps=eff_min_seg,
             sigma_logr=sigma1_pre,
             sigma_logor2=sigma2_pre,
             r12=r12,
+            settings=settings,
         )
         for s0, s1 in pre_segs:
             g0, g1 = a0 + s0, a0 + s1
@@ -826,11 +1038,13 @@ def proc_sample(
             cnlr_work[a0:a1],
             z2_all[a0:a1],
             het_all[a0:a1],
+            valor=valor_all[a0:a1],
             cval=eff_cval,
             min_seg_snps=eff_min_seg,
             sigma_logr=sigma1_seg,
             sigma_logor2=sigma2_seg,
             r12=r12,
+            settings=settings,
         )
         for s0, s1 in arm_segs:
             g0, g1 = a0 + s0, a0 + s1
@@ -869,6 +1083,7 @@ def proc_sample(
         sigma_logr=sigma1_seg,
         sigma_logor2=sigma2_seg,
         r12=r12,
+        settings=settings,
     )
 
     col_order = [

@@ -6,13 +6,14 @@ Continuous-BAF ASCAT equations and 2D grid goodness-of-fit solver
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
 from .em import FacetsResult
+from .io import validate_settings
 from .segment import SegmentedResult
 
 
@@ -205,21 +206,48 @@ def _extract_ascat_segments(
     )
 
 
+def _find_grid_local_minima(dist_g: np.ndarray) -> np.ndarray:
+    """Return boolean mask of 2D 3x3 Moore-neighborhood local minima on `dist_g`."""
+    nr, np_ = dist_g.shape
+    if nr < 3 or np_ < 3:
+        return np.ones_like(dist_g, dtype=bool)
+    padded = np.pad(dist_g, pad_width=1, mode="edge")
+    is_min = np.ones_like(dist_g, dtype=bool)
+    for dr in (-1, 0, 1):
+        for dp in (-1, 0, 1):
+            if dr == 0 and dp == 0:
+                continue
+            nbr = padded[1 + dr : 1 + dr + nr, 1 + dp : 1 + dp + np_]
+            is_min &= dist_g <= (nbr + 1e-12)
+    return is_min
+
+
 def fit_ascat(
     segments_or_result: pd.DataFrame | SegmentedResult | FacetsResult,
     *,
-    gamma_ascat: float = 1.0,
+    gamma_ascat: float | None = None,
     min_nhet: int = 15,
     purity_grid: np.ndarray | None = None,
     ploidy_grid: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> AscatResult:
     """
     Solve for tumor purity (rho), ploidy (psi_t), and integer allele-specific
     copy numbers (n_major, n_minor) via Van Loo et al. (2010) 2D distance grid
     search + Nelder-Mead local refinement.
+
+    - `settings="default"`: `gamma_ascat=1.0` default, `rho` in `[0.10, 1.00]`, uniform segment weights.
+    - `settings="R_default"`: `VanLoo-lab/ascat` v3.2.0 defaults (`gamma=0.55`, `rho` grid `[0.10, 1.05]`,
+      `0.05` weight on allelically balanced segments, and 4-tier cascading distance acceptance).
     """
-    if gamma_ascat <= 0.0:
-        raise ValueError(f"`gamma_ascat` must be > 0, got {gamma_ascat}.")
+    validate_settings(settings)
+    eff_gamma = (
+        float(gamma_ascat)
+        if gamma_ascat is not None
+        else (0.55 if settings == "R_default" else 1.0)
+    )
+    if eff_gamma <= 0.0:
+        raise ValueError(f"`gamma_ascat` must be > 0, got {eff_gamma}.")
 
     seg_df = _extract_ascat_segments(segments_or_result)
     logr = seg_df["logr"].to_numpy(dtype=np.float64)
@@ -241,99 +269,240 @@ def fit_ascat(
     r_fit = logr[fit_mask]
     b_fit = baf[fit_mask]
     w_fit = weights[fit_mask]
-    w_norm = w_fit / float(np.sum(w_fit))
-    pow2_r = np.power(2.0, r_fit / float(gamma_ascat))
+    w_span_norm = w_fit / float(np.sum(w_fit))
+    pow2_r = np.power(2.0, r_fit / eff_gamma)
 
-    rhos = (
-        np.asarray(purity_grid, dtype=np.float64)
-        if purity_grid is not None
-        else np.linspace(0.10, 1.00, 46)
-    )
-    psis = (
-        np.asarray(ploidy_grid, dtype=np.float64)
-        if ploidy_grid is not None
-        else np.linspace(1.50, 5.50, 81)
-    )
+    if settings == "R_default":
+        is_bal = np.abs(b_fit - 0.5) < 0.02
+        w_ascat = w_fit * np.where(is_bal, 0.05, 1.0)
+        if float(np.sum(w_ascat)) <= 0.0:
+            w_ascat = w_fit.copy()
+        w_norm = w_ascat / float(np.sum(w_ascat))
 
-    def _eval_objective(rho_val: float, psi_val: float, penalize_neg: bool = True) -> float:
-        if rho_val < 0.05 or rho_val > 1.0 or psi_val < 1.0 or psi_val > 6.5:
-            return 1e9
-        psi_bulk = 2.0 * (1.0 - rho_val) + rho_val * psi_val
-        tot = psi_bulk * pow2_r
-        nb = (rho_val - 1.0 + b_fit * tot) / rho_val
-        na = (rho_val - 1.0 + (1.0 - b_fit) * tot) / rho_val
-
-        neg_frac = float(np.sum(w_norm[(nb < -0.35) | (na < -0.35)]))
-        if penalize_neg and neg_frac > 0.05:
-            return 1e6 + 1e3 * neg_frac
-
-        nb_int = np.maximum(np.rint(nb), 0.0)
-        na_int = np.maximum(np.rint(na), 0.0)
-        dist = float(np.sum(w_norm * ((na - na_int) ** 2 + (nb - nb_int) ** 2)))
-        psi_impl = float(np.sum(w_norm * (na_int + nb_int)))
-        # Mild self-consistency + parsimony tie-breaker against 2x doubling degeneracy
-        return (
-            dist
-            + 0.02 * ((psi_impl - psi_val) ** 2)
-            + 2e-4 * max(0.0, psi_val - 2.2)
+        rhos = (
+            np.asarray(purity_grid, dtype=np.float64)
+            if purity_grid is not None
+            else np.round(np.arange(0.10, 1.0501, 0.01), 4)
+        )
+        psis = (
+            np.asarray(ploidy_grid, dtype=np.float64)
+            if ploidy_grid is not None
+            else np.round(np.arange(1.00, 5.5001, 0.05), 4)
         )
 
-    # Vectorized 2D grid evaluation across (R, P, S)
-    rr = rhos[:, None, None]
-    pp = psis[None, :, None]
-    psi_bulk_grid = 2.0 * (1.0 - rr) + rr * pp
-    tot_grid = psi_bulk_grid * pow2_r[None, None, :]
-    nb_grid = (rr - 1.0 + b_fit[None, None, :] * tot_grid) / rr
-    na_grid = (rr - 1.0 + (1.0 - b_fit[None, None, :]) * tot_grid) / rr
+        rr = rhos[:, None, None]
+        pp = psis[None, :, None]
+        psi_bulk_grid = 2.0 * (1.0 - rr) + rr * pp
+        tot_grid = psi_bulk_grid * pow2_r[None, None, :]
+        nb_grid = (rr - 1.0 + b_fit[None, None, :] * tot_grid) / rr
+        na_grid = (rr - 1.0 + (1.0 - b_fit[None, None, :]) * tot_grid) / rr
 
-    nb_int_g = np.maximum(np.rint(nb_grid), 0.0)
-    na_int_g = np.maximum(np.rint(na_grid), 0.0)
-    neg_frac_g = np.sum(
-        w_norm[None, None, :] * ((nb_grid < -0.35) | (na_grid < -0.35)), axis=2
-    )
-    dist_g = np.sum(
-        w_norm[None, None, :]
-        * ((na_grid - na_int_g) ** 2 + (nb_grid - nb_int_g) ** 2),
-        axis=2,
-    )
-    psi_impl_g = np.sum(w_norm[None, None, :] * (na_int_g + nb_int_g), axis=2)
-    obj_grid = (
-        dist_g
-        + 0.02 * ((psi_impl_g - psis[None, :]) ** 2)
-        + 2e-4 * np.maximum(0.0, psis[None, :] - 2.2)
-    )
-    obj_grid = np.where(neg_frac_g > 0.05, 1e6 + 1e3 * neg_frac_g, obj_grid)
-
-    # Pick top 3 well-separated grid minima and refine via Nelder-Mead
-    flat_order = np.argsort(obj_grid.ravel(), kind="mergesort")
-    top_starts: list[tuple[float, float]] = []
-    for flat_idx in flat_order:
-        ri, pi = divmod(int(flat_idx), psis.size)
-        r0, p0 = float(rhos[ri]), float(psis[pi])
-        if not any(abs(r0 - tr) < 0.08 and abs(p0 - tp) < 0.25 for tr, tp in top_starts):
-            top_starts.append((r0, p0))
-        if len(top_starts) >= 3:
-            break
-
-    best_params = top_starts[0]
-    best_val = np.inf
-    for r0, p0 in top_starts:
-        res = minimize(
-            lambda x: _eval_objective(float(x[0]), float(x[1]), penalize_neg=True),
-            x0=np.array([r0, p0], dtype=np.float64),
-            method="Nelder-Mead",
-            options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 200},
+        nb_int_g = np.maximum(np.rint(nb_grid), 0.0)
+        na_int_g = np.maximum(np.rint(na_grid), 0.0)
+        dist_g = np.sum(
+            w_norm[None, None, :]
+            * ((na_grid - na_int_g) ** 2 + (nb_grid - nb_int_g) ** 2),
+            axis=2,
         )
-        if float(res.fun) < best_val:
-            best_val = float(res.fun)
-            best_params = (
-                float(np.clip(res.x[0], 0.05, 1.0)),
-                float(np.clip(res.x[1], 1.0, 6.5)),
+        neg_frac_g = np.sum(
+            w_span_norm[None, None, :] * ((nb_grid < -0.30) | (na_grid < -0.30)),
+            axis=2,
+        )
+        homdel_frac_g = np.sum(
+            w_span_norm[None, None, :] * ((nb_int_g + na_int_g) == 0),
+            axis=2,
+        )
+        psi_impl_g = np.sum(
+            w_span_norm[None, None, :] * (na_int_g + nb_int_g),
+            axis=2,
+        )
+        score_g = (
+            dist_g
+            + 0.02 * ((psi_impl_g - psis[None, :]) ** 2)
+            + 2e-4 * np.maximum(0.0, psis[None, :] - 2.2)
+        )
+
+        local_min = _find_grid_local_minima(score_g)
+        rho_2d = np.broadcast_to(rhos[:, None], score_g.shape)
+
+        # 4-tier cascading ASCAT acceptance rules across rho in [0.10, 1.05]
+        tier_masks = [
+            # Tier 1: local minima in [0.10, 1.05], physiological ploidy [1.5, 4.8], strict non-neg/homdel
+            local_min
+            & (rho_2d <= 1.05 + 1e-9)
+            & (psi_impl_g >= 1.5)
+            & (psi_impl_g <= 4.8)
+            & (neg_frac_g <= 0.005)
+            & (homdel_frac_g <= 0.05),
+            # Tier 2: local minima in [0.10, 1.05], physiological ploidy [1.5, 4.8], relaxed homdel/neg
+            local_min
+            & (rho_2d <= 1.05 + 1e-9)
+            & (psi_impl_g >= 1.5)
+            & (psi_impl_g <= 4.8)
+            & (neg_frac_g <= 0.03)
+            & (homdel_frac_g <= 0.15),
+            # Tier 3: expanded extreme ploidy [1.0, 6.0]
+            local_min
+            & (rho_2d <= 1.05 + 1e-9)
+            & (psi_impl_g >= 1.0)
+            & (psi_impl_g <= 6.0)
+            & (neg_frac_g <= 0.05),
+            # Tier 4: unconstrained fallback across entire grid
+            np.ones_like(score_g, dtype=bool),
+        ]
+
+        chosen_cands: list[tuple[float, float]] = []
+        for t_mask in tier_masks:
+            if np.any(t_mask):
+                cand_rc = np.argwhere(t_mask)
+                cand_scores = score_g[t_mask]
+                order_t = np.argsort(cand_scores, kind="mergesort")
+                for idx_o in order_t:
+                    ri, pi = int(cand_rc[idx_o, 0]), int(cand_rc[idx_o, 1])
+                    r0, p0 = float(rhos[ri]), float(psis[pi])
+                    if not any(
+                        abs(r0 - tr) < 0.08 and abs(p0 - tp) < 0.25
+                        for tr, tp in chosen_cands
+                    ):
+                        chosen_cands.append((r0, p0))
+                    if len(chosen_cands) >= 3:
+                        break
+                break
+
+        def _eval_obj_r(rho_val: float, psi_val: float) -> float:
+            if rho_val < 0.05 or rho_val > 1.05 or psi_val < 0.8 or psi_val > 6.5:
+                return 1e9
+            psi_b = 2.0 * (1.0 - rho_val) + rho_val * psi_val
+            tot = psi_b * pow2_r
+            nb = (rho_val - 1.0 + b_fit * tot) / rho_val
+            na = (rho_val - 1.0 + (1.0 - b_fit) * tot) / rho_val
+            neg_f = float(np.sum(w_span_norm[(nb < -0.35) | (na < -0.35)]))
+            if neg_f > 0.05:
+                return 1e6 + 1e3 * neg_f
+            nb_i = np.maximum(np.rint(nb), 0.0)
+            na_i = np.maximum(np.rint(na), 0.0)
+            d_val = float(np.sum(w_norm * ((na - na_i) ** 2 + (nb - nb_i) ** 2)))
+            psi_i = float(np.sum(w_span_norm * (na_i + nb_i)))
+            return (
+                d_val
+                + 0.02 * ((psi_i - psi_val) ** 2)
+                + 2e-4 * max(0.0, psi_val - 2.2)
             )
+
+        best_params = (
+            float(np.clip(chosen_cands[0][0], 0.05, 1.0)),
+            float(np.clip(chosen_cands[0][1], 0.8, 6.5)),
+        )
+        best_val = np.inf
+        for r0, p0 in chosen_cands:
+            res = minimize(
+                lambda x: _eval_obj_r(float(x[0]), float(x[1])),
+                x0=np.array([r0, p0], dtype=np.float64),
+                method="Nelder-Mead",
+                options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 200},
+            )
+            if float(res.fun) < best_val:
+                best_val = float(res.fun)
+                best_params = (
+                    float(np.clip(res.x[0], 0.05, 1.0)),
+                    float(np.clip(res.x[1], 0.8, 6.5)),
+                )
+    else:
+        w_norm = w_span_norm
+        rhos = (
+            np.asarray(purity_grid, dtype=np.float64)
+            if purity_grid is not None
+            else np.linspace(0.10, 1.00, 46)
+        )
+        psis = (
+            np.asarray(ploidy_grid, dtype=np.float64)
+            if ploidy_grid is not None
+            else np.linspace(1.50, 5.50, 81)
+        )
+
+        def _eval_objective(
+            rho_val: float, psi_val: float, penalize_neg: bool = True
+        ) -> float:
+            if rho_val < 0.05 or rho_val > 1.0 or psi_val < 1.0 or psi_val > 6.5:
+                return 1e9
+            psi_bulk = 2.0 * (1.0 - rho_val) + rho_val * psi_val
+            tot = psi_bulk * pow2_r
+            nb = (rho_val - 1.0 + b_fit * tot) / rho_val
+            na = (rho_val - 1.0 + (1.0 - b_fit) * tot) / rho_val
+
+            neg_frac = float(np.sum(w_norm[(nb < -0.35) | (na < -0.35)]))
+            if penalize_neg and neg_frac > 0.05:
+                return 1e6 + 1e3 * neg_frac
+
+            nb_int = np.maximum(np.rint(nb), 0.0)
+            na_int = np.maximum(np.rint(na), 0.0)
+            dist = float(np.sum(w_norm * ((na - na_int) ** 2 + (nb - nb_int) ** 2)))
+            psi_impl = float(np.sum(w_norm * (na_int + nb_int)))
+            # Mild self-consistency + parsimony tie-breaker against 2x doubling degeneracy
+            return (
+                dist
+                + 0.02 * ((psi_impl - psi_val) ** 2)
+                + 2e-4 * max(0.0, psi_val - 2.2)
+            )
+
+        # Vectorized 2D grid evaluation across (R, P, S)
+        rr = rhos[:, None, None]
+        pp = psis[None, :, None]
+        psi_bulk_grid = 2.0 * (1.0 - rr) + rr * pp
+        tot_grid = psi_bulk_grid * pow2_r[None, None, :]
+        nb_grid = (rr - 1.0 + b_fit[None, None, :] * tot_grid) / rr
+        na_grid = (rr - 1.0 + (1.0 - b_fit[None, None, :]) * tot_grid) / rr
+
+        nb_int_g = np.maximum(np.rint(nb_grid), 0.0)
+        na_int_g = np.maximum(np.rint(na_grid), 0.0)
+        neg_frac_g = np.sum(
+            w_norm[None, None, :] * ((nb_grid < -0.35) | (na_grid < -0.35)), axis=2
+        )
+        dist_g = np.sum(
+            w_norm[None, None, :]
+            * ((na_grid - na_int_g) ** 2 + (nb_grid - nb_int_g) ** 2),
+            axis=2,
+        )
+        psi_impl_g = np.sum(w_norm[None, None, :] * (na_int_g + nb_int_g), axis=2)
+        obj_grid = (
+            dist_g
+            + 0.02 * ((psi_impl_g - psis[None, :]) ** 2)
+            + 2e-4 * np.maximum(0.0, psis[None, :] - 2.2)
+        )
+        obj_grid = np.where(neg_frac_g > 0.05, 1e6 + 1e3 * neg_frac_g, obj_grid)
+
+        # Pick top 3 well-separated grid minima and refine via Nelder-Mead
+        flat_order = np.argsort(obj_grid.ravel(), kind="mergesort")
+        top_starts: list[tuple[float, float]] = []
+        for flat_idx in flat_order:
+            ri, pi = divmod(int(flat_idx), psis.size)
+            r0, p0 = float(rhos[ri]), float(psis[pi])
+            if not any(
+                abs(r0 - tr) < 0.08 and abs(p0 - tp) < 0.25 for tr, tp in top_starts
+            ):
+                top_starts.append((r0, p0))
+            if len(top_starts) >= 3:
+                break
+
+        best_params = top_starts[0]
+        best_val = np.inf
+        for r0, p0 in top_starts:
+            res = minimize(
+                lambda x: _eval_objective(float(x[0]), float(x[1]), penalize_neg=True),
+                x0=np.array([r0, p0], dtype=np.float64),
+                method="Nelder-Mead",
+                options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 200},
+            )
+            if float(res.fun) < best_val:
+                best_val = float(res.fun)
+                best_params = (
+                    float(np.clip(res.x[0], 0.05, 1.0)),
+                    float(np.clip(res.x[1], 1.0, 6.5)),
+                )
 
     rho_hat, psi_hat_init = best_params
     na_cont, nb_cont = ascat_invert_cn(
-        logr, baf, rho_hat, psi_hat_init, gamma_ascat=gamma_ascat
+        logr, baf, rho_hat, psi_hat_init, gamma_ascat=eff_gamma
     )
     na_int = np.maximum(np.rint(na_cont), 0.0).astype(np.int64)
     nb_int = np.maximum(np.rint(nb_cont), 0.0).astype(np.int64)
@@ -344,7 +513,7 @@ def fit_ascat(
 
     # Compute raw distance metric on fit segments for goodness_of_fit
     na_fit_c, nb_fit_c = ascat_invert_cn(
-        r_fit, b_fit, rho_hat, psi_hat_init, gamma_ascat=gamma_ascat
+        r_fit, b_fit, rho_hat, psi_hat_init, gamma_ascat=eff_gamma
     )
     d_raw = float(
         np.sum(
@@ -385,9 +554,12 @@ def fit_ascat(
         ploidy=ploidy_final,
         goodness_of_fit=gof,
         psi_bulk=psi_bulk,
-        gamma_ascat=float(gamma_ascat),
+        gamma_ascat=eff_gamma,
         segments=out_df,
     )
+
+
+run_ascat = fit_ascat
 
 
 def compare_facets_ascat(
