@@ -1,62 +1,76 @@
 # Pythonic Biotools
 
-Pythonic implementations of published R, C++, and command-line bioinformatics and statistical genetics libraries.
+Pythonic implementations of published R, C++, Fortran, and command-line bioinformatics, cancer genomics, and statistical genetics libraries.
 
-Each directory is an independent, self-contained package (`pyproject.toml` + unit tests) so any individual tool—such as [`slopehunter`](slopehunter/README.md), [`limma`](limma/README.md), [`chromvar`](chromvar/README.md), [`rose`](rose/README.md), or [`coloc`](coloc/README.md)—can be installed and used standalone.
+Each directory is an independent, self-contained package (`pyproject.toml` + `pytest` suite) so any individual tool—such as [`slopehunter`](slopehunter/README.md), [`mrpresso`](mrpresso/README.md), [`hyprcoloc`](hyprcoloc/README.md), [`discover`](discover/README.md), [`shatterseek`](shatterseek/README.md), [`limma`](limma/README.md), or [`chromvar`](chromvar/README.md)—can be installed and used standalone without `rpy2`, compiled Fortran toolchains, or external R sessions.
 
 ---
 
 ## Documentation Guides
 
 - **[Use Cases by Biological & Statistical Problem (`docs/USE_CASES_BY_PROBLEM.md`)](docs/USE_CASES_BY_PROBLEM.md)** — Problem-driven guide mapping analysis tasks to standalone tools and multi-tool workflows.
-- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables for selecting among related Mendelian Randomization, conditional/collider-adjusted GWAS, deconvolution, epigenomics, and progression-modeling tools.
+- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables for selecting among Mendelian Randomization, colocalization/mediation, conditional/collider-adjusted GWAS, deconvolution, somatic cancer genomics, and progression-modeling tools.
 
 ---
 
-## Tools Implemented
+## Tools Implemented (30 Python Packages + WDL Workflows)
 
 ### 1. Bulk Deconvolution & Xenograft Read Filtering
-| Directory | Package | Published Tool & Citation |
-|---|---|---|
-| **[`xenofilterR/`](xenofilterR/README.md)** | `xenofilterR` | **XenofilteR**: Read-level edit-distance filtering of host reads from xenograft BAMs (Kluin et al., *BMC Bioinformatics* 2018). |
-| **[`music/`](music/README.md)** | `music` | **MuSiC / MuSiC2**: Cross-subject variance-weighted NNLS bulk RNA-seq deconvolution on `AnnData` (Wang et al., *Nat Commun* 2019; Fan et al., *Brief Bioinform* 2022). |
-| **[`bayesprism/`](bayesprism/pythonic_bayesprism/pythonic_bayesprism.md)** | `pythonic_bayesprism` | **BayesPrism**: Bayesian Gibbs deconvolution of cell-type fractions and sample-specific cell-type expression (Chu et al., *Nat Cancer* 2022). |
+| Directory | Import Name | License | Published Tool & Citation |
+|---|---|---|---|
+| **[`xenofilterR/`](xenofilterR/README.md)** | `xenofilterR` | MIT | **XenofilteR**: Read-level `NM` + CIGAR clip edit-distance filtering of host reads from xenograft BAMs (Kluin et al., *BMC Bioinformatics* 2018). |
+| **[`music/`](music/README.md)** | `music` | MIT | **MuSiC / MuSiC2**: Cross-subject variance-weighted NNLS bulk RNA-seq deconvolution on `AnnData` (Wang et al., *Nat Commun* 2019; Fan et al., *Brief Bioinform* 2022). |
+| **[`bayesprism/`](bayesprism/README.md)** | `pythonic_bayesprism` | MIT | **BayesPrism**: Bayesian Gibbs deconvolution of cell-type fractions, sample-specific cell-type expression, and spatial MLE updates (Chu et al., *Nat Cancer* 2022). |
 
-### 2. Mendelian Randomization & Genetic Colocalization
-| Directory | Package | Published Tool & Citation |
-|---|---|---|
-| **[`coloc/`](coloc/README.md)** | `coloc` | **coloc (`coloc.abf`)**: Approximate Bayes Factor colocalization (Wakefield, *Genet Epidemiol* 2009; Giambartolomei et al., *PLOS Genet* 2014). |
-| **[`twosamplemr/`](twosamplemr/README.md)** | `twosamplemr` | **TwoSampleMR / MVMR**: `IVW` (Burgess et al., 2013), `MR-Egger` (Bowden et al., *IJE* 2015), `Weighted Median` (Bowden et al., 2016), `MVMR` (Sanderson et al., *Stat Med* 2019), & LD clumping. |
-| **[`mrraps/`](mrraps/README.md)** | `mrraps` | **mr.raps**: Robust Adjusted Profile Score two-sample MR with `l2`, `huber`, and `tukey` losses (Zhao et al., *Ann Stat* 2020). |
-| **[`mrhorse/`](mrhorse/README.md)** | `mrhorse` | **MR-Horse / MVMR-Horse**: Univariable & multivariable Bayesian Horseshoe MR for correlated pleiotropy (Grant & Burgess, *AJHG* 2024). |
-| **[`mrapss/`](mrapss/README.md)** | `mrapss` | **MR-APSS**: Foreground–background mixture MR accounting for pleiotropy, selection truncation, and sample overlap (Hu et al., *Nat Commun* 2022). |
-| **[`mrbee/`](mrbee/README.md)** | `mrbee` | **MRBEE**: Bias-corrected estimating equations MR with Winner's Curse & IMRP outlier removal (Lorincz-Comi et al., *AJHG* 2024). |
-| **[`mvcml/`](mvcml/README.md)** | `mvcml` | **MVMR-cML**: Multivariable Constrained Maximum Likelihood MR & conditional GWAS adjustment (Lin et al., *AJHG* 2023). |
+### 2. Mendelian Randomization, Colocalization & Locus Mediation
+| Directory | Import Name | License | Published Tool & Citation |
+|---|---|---|---|
+| **[`coloc/`](coloc/README.md)** | `coloc` | MIT | **coloc (`coloc.abf`)**: Log-space Approximate Bayes Factor two-trait colocalization (Wakefield, *Genet Epidemiol* 2009; Giambartolomei et al., *PLOS Genet* 2014). |
+| **[`hyprcoloc/`](hyprcoloc/README.md)** | `hyprcoloc` | MIT | **HyPrColoc**: Deterministic $O(MQ)$ multi-trait Bayesian colocalization and branch-and-bound trait clustering (Foley et al., *Nat Commun* 2021). |
+| **[`smr-heidi/`](smr-heidi/README.md)** | `smr_heidi` | GPL-3.0+ | **SMR, SMR-multi & HEIDI**: cis-xQTL + GWAS Summary-data-based MR and LD-aware locus `HEIDI` heterogeneity testing (Zhu et al., *Nat Genet* 2016; Wu et al., *Nat Commun* 2018). |
+| **[`twosamplemr/`](twosamplemr/README.md)** | `twosamplemr` | MIT | **TwoSampleMR / MVMR**: `IVW` (Burgess et al., 2013), coding-invariant `MR-Egger` (Bowden et al., *IJE* 2015), `Weighted Median` (Bowden et al., 2016), `MVMR` with Sanderson–Windmeijer $F$ (Sanderson et al., 2019), allele harmonization & LD clumping. |
+| **[`mrpresso/`](mrpresso/README.md)** | `mrpresso` | GPL-3.0+ | **MR-PRESSO / MVMR-PRESSO**: Vectorized horizontal pleiotropy Global, Outlier, and Distortion tests (Verbanck et al., *Nat Genet* 2018). |
+| **[`mrraps/`](mrraps/README.md)** | `mrraps` | GPL-3.0+ | **mr.raps**: Robust Adjusted Profile Score two-sample MR with `l2`, `huber`, and `tukey` losses (Zhao et al., *Ann Stat* 2020). |
+| **[`mrhorse/`](mrhorse/README.md)** | `mrhorse` | MIT | **MR-Horse / MVMR-Horse**: Univariable & multivariable Bayesian Horseshoe MR for correlated pleiotropy (Grant & Burgess, *AJHG* 2024). |
+| **[`mrapss/`](mrapss/README.md)** | `mrapss` | MIT | **MR-APSS**: Foreground–background mixture MR accounting for pleiotropy, selection truncation, and sample overlap (Hu et al., *Nat Commun* 2022). |
+| **[`mrbee/`](mrbee/README.md)** | `mrbee` | MIT | **MRBEE**: Univariable & multivariable bias-corrected estimating equations MR with IMRP Sidak outlier removal (Lorincz-Comi et al., *AJHG* 2024). |
+| **[`mvcml/`](mvcml/README.md)** | `mvcml` | MIT | **MVMR-cML**: Multivariable Constrained Maximum Likelihood MR with BIC Model Averaging, Data Perturbation (`cML-DP`), & conditional GWAS adjustment (Lin et al., *AJHG* 2023). |
 
 ### 3. Conditional GWAS & Index-Event / Collider-Bias Adjustment
-| Directory | Package | Published Tool & Citation |
-|---|---|---|
-| **[`slopehunter/`](slopehunter/README.md)** | `slopehunter` | **SlopeHunter**: Two-component Gaussian-mixture EM collider-bias adjustment (Mahmoud et al., *Nat Commun* 2022). |
-| **[`indexevent/`](indexevent/README.md)** | `indexevent` | **indexevent**: `CWLS`, `Hedges-Olkin`, and `SIMEX` profile-likelihood index-event bias adjustment (Dudbridge et al., *Nat Commun* 2019). |
-| **[`colliderbias/`](colliderbias/README.md)** | `colliderbias` | **ColliderBias**: Instrumental-effect `CWLS` (`methodCB`) and bivariate `CWBLS` (Cai et al., *Genet Epidemiol* 2022; Cai & Dudbridge, 2024). |
-| **[`mtcojo/`](mtcojo/README.md)** | `mtcojo` | **GCTA-mtCOJO & GSMR**: Multi-trait conditional & joint GWAS summary analysis, two-step LDSC, and `HEIDI-outlier` filtering (Zhu et al., *Nat Commun* 2018). |
+| Directory | Import Name | License | Published Tool & Citation |
+|---|---|---|---|
+| **[`slopehunter/`](slopehunter/README.md)** | `slopehunter` | MIT | **SlopeHunter**: Two-component Gaussian-mixture EM collider-bias adjustment (Mahmoud et al., *Nat Commun* 2022). |
+| **[`indexevent/`](indexevent/README.md)** | `indexevent` | MIT | **indexevent**: Coding-invariant `CWLS`, `Hedges-Olkin`, and `SIMEX` profile-likelihood index-event bias adjustment (Dudbridge et al., *Nat Commun* 2019). |
+| **[`colliderbias/`](colliderbias/README.md)** | `colliderbias` | MIT | **ColliderBias**: Instrumental-effect `CWLS` (`methodCB`) and bivariate `CWBLS` (Cai et al., *Genet Epidemiol* 2022; Cai & Dudbridge, 2024). |
+| **[`mtcojo/`](mtcojo/README.md)** | `mtcojo` | GPL-3.0+ | **GCTA-mtCOJO & GSMR**: Multi-trait conditional & joint GWAS summary analysis, two-step LDSC, `.bim` allele alignment, and `HEIDI-outlier` filtering (Zhu et al., *Nat Commun* 2018). |
 
-### 4. Differential Expression, Regression & Survival Biostatistics
-| Directory | Package | Published Tool & Citation |
-|---|---|---|
-| **[`limma/`](limma/README.md)** | `limma` | **limma (`eBayes`)**: Empirical Bayes moderated linear models, contrasts, and $t$-statistics (Smyth, *SAGMB* 2004; Phipson et al., *NAR* 2016). |
-| **[`logistf/`](logistf/README.md)** | `logistf` | **logistf**: Firth Jeffreys-prior penalized logistic regression for rare events and separation (Firth, *Biometrika* 1993; Heinze & Schemper, *Stat Med* 2002). |
-| **[`biostats/`](biostats/README.md)** | `pythonic_biostats` | **survival / cmprsk / sandwich / qvalue**: Efron-tie Cox PH (Efron, 1977), IPCW Fine–Gray competing risks (Fine & Gray, *JASA* 1999), HC3 WLS (MacKinnon & White, 1985), and pooled-null permutation FDR (Storey & Tibshirani, *PNAS* 2003). |
+### 4. Differential Expression, Regression & Survival / Competing-Risks Biostatistics
+| Directory | Import Name | License | Published Tool & Citation |
+|---|---|---|---|
+| **[`limma/`](limma/README.md)** | `limma` | MIT | **limma (`eBayes`)**: Empirical Bayes moderated linear models, contrasts, `limma-trend`, and `robust=True` outlier variance winsorization (Smyth, *SAGMB* 2004; Phipson et al., *NAR* 2016). |
+| **[`logistf/`](logistf/README.md)** | `logistf` | MIT | **logistf**: Firth Jeffreys-prior penalized logistic regression with Profile Penalized Likelihood CIs and Penalized LRTs (Firth, *Biometrika* 1993; Heinze & Schemper, *Stat Med* 2002). |
+| **[`biostats/`](biostats/README.md)** | `pythonic_biostats` | MIT | **survival / cmprsk / sandwich / qvalue**: Efron-tie Cox PH (Efron, 1977), time-varying IPCW Fine–Gray competing risks with martingale sandwich SEs (Fine & Gray, *JASA* 1999), HC3 WLS (MacKinnon & White, 1985), pooled-null permutation FDR, and Storey cubic-spline `qvalue` (Storey & Tibshirani, *PNAS* 2003). |
+| **[`timeroc/`](timeroc/README.md)** | `timeroc` | GPL-2.0+ | **timeROC**: IPCW time-dependent ROC curves, competing-risks `AUC_1`/`AUC_2`, asymptotic IID influence-function SEs, simultaneous confidence bands, and paired biomarker comparisons (Blanche et al., *Stat Med* 2013). |
 
-### 5. Epigenomics, Gene-Program Activity, Cancer Progression & Public Databases
-| Directory | Package | Published Tool & Citation |
-|---|---|---|
-| **[`chromvar/`](chromvar/README.md)** | `chromvar` | **chromVAR**: GC- and accessibility-corrected TF motif deviations & variability (Schep et al., *Nat Methods* 2017), plus GTF TSS & log-odds PWM scanning (Wasserman & Sandelin, 2004). |
-| **[`rose/`](rose/README.md)** | `rose` | **ROSE**: Rank Ordering of Super-Enhancers (Whyte et al., *Cell* 2013; Lovén et al., *Cell* 2013). |
-| **[`decoupler-ulm/`](decoupler-ulm/README.md)** | `decoupler_ulm` | **decoupleR (`ULM`)**: Univariate Linear Model continuous gene-program activity projection (Badia-i-Mompel et al., *Bioinform Adv* 2022). |
-| **[`evam/`](evam/README.md)** | `evam` | **EvAM-Tools (`Oncotree`, `OncoBN`, `H-CBN`, `MHN`)**: Cross-sectional evolutionary accumulation models (Desper et al., 1999; Gerstung et al., 2009; Schill et al., 2020; Nicol et al., 2021; Diaz-Uriarte & Herrera-Nieto, *Bioinformatics* 2022). |
-| **[`cohort-curation/`](cohort-curation/README.md)** | `cohort_curation` | **Public Genomics Parsers**: `cBioPortal` REST API (Cerami et al., 2012), `GISTIC2.0` wide peaks (Mermel et al., 2011), `AACR GENIE` panel coverage masking (2017), `HGNC` / Excel symbol repair (Zeeberg et al., 2004), and `Cellosaurus` (Bairoch, 2018). |
-| **[`wdl-workflows/`](wdl-workflows/README.md)** | WDL 1.0 | **Terra / Cromwell WDLs**: `fastp` QC (Chen et al., 2018) and `XenofilteR` BAM filtering (Kluin et al., 2018). |
+### 5. Cancer Somatic Genomics, Structural Variants, Epigenomics & Public Cohorts
+| Directory | Import Name | License | Published Tool & Citation |
+|---|---|---|---|
+| **[`discover/`](discover/README.md)** | `discover` | MIT | **DISCOVER**: Maximum-entropy background mutation burden modeling and exact DFT Poisson-Binomial pairwise/groupwise somatic mutual exclusivity & co-occurrence (Canisius et al., *Genome Biol* 2016). |
+| **[`fishhook/`](fishhook/README.md)** | `fishhook` | MIT | **fishHook**: Gamma–Poisson (Negative Binomial) somatic mutation enrichment across genomic intervals with callable-territory offsets and chromatin covariates (Imielinski et al., *Cell* 2017). |
+| **[`shatterseek/`](shatterseek/README.md)** | `shatterseek` | MIT | **ShatterSeek**: Chromothripsis detection and PCAWG confidence classification from interleaved structural variants and oscillating copy-number chains (Cortés-Ciriano et al., *Nat Genet* 2020). |
+| **[`scarhrd/`](scarhrd/README.md)** | `scarhrd` | MIT | **scarHRD**: Homologous Recombination Deficiency genomic scar scoring (`HRD-LOH`, `TAI`, `LST`, and clinical `HRD-sum`) across `GRCh38`/`GRCh37` (Sztupinszki et al., *NPJ Breast Cancer* 2018). |
+| **[`evam/`](evam/README.md)** | `evam` | AGPL-3.0+ | **EvAM-Tools (`Oncotree`, `OncoBN`, `H-CBN`, `MHN`)**: Cross-sectional evolutionary accumulation models with BIC complexity control (Desper et al., 1999; Gerstung et al., 2009; Schill et al., 2020; Nicol et al., 2021; Diaz-Uriarte & Herrera-Nieto, *Bioinformatics* 2022). |
+| **[`chromvar/`](chromvar/README.md)** | `chromvar` | MIT | **chromVAR**: Sparse-ready GC- and accessibility-corrected TF motif deviations & variability (Schep et al., *Nat Methods* 2017), plus GTF TSS & log-odds PWM scanning (Wasserman & Sandelin, 2004). |
+| **[`rose/`](rose/README.md)** | `rose` | MIT | **ROSE**: Rank Ordering of Super-Enhancers with optional Input/IgG bigWig control subtraction (Whyte et al., *Cell* 2013; Lovén et al., *Cell* 2013). |
+| **[`decoupler-ulm/`](decoupler-ulm/README.md)** | `decoupler_ulm` | MIT | **decoupleR (`ULM`)**: Univariate Linear Model continuous gene-program activity projection (Badia-i-Mompel et al., *Bioinform Adv* 2022). |
+| **[`cohort-curation/`](cohort-curation/README.md)** | `cohort_curation` | MIT | **Public Genomics Parsers**: `cBioPortal` REST API (Cerami et al., 2012), `GISTIC2.0` wide peaks (Mermel et al., 2011), `AACR GENIE` panel coverage masking (2017), `HGNC` / Excel symbol repair (Zeeberg et al., 2004), and `Cellosaurus` (Bairoch, 2018). |
+| **[`wdl-workflows/`](wdl-workflows/README.md)** | WDL 1.0 | MIT | **Terra / Cromwell WDLs**: `fastp` QC (Chen et al., 2018) and `XenofilteR` CIGAR-aware BAM filtering (Kluin et al., 2018). |
+
+---
+
+## Licensing Note
+
+Root repository scaffolding and MIT-designated packages are licensed under the [MIT License](LICENSE). Individual ports derived from copyleft upstream statistical packages carry their respective compatible copyleft SPDX licenses in their local `pyproject.toml` (`GPL-2.0-or-later` in `timeroc`; `GPL-3.0-or-later` in `mrpresso`, `mrraps`, `mtcojo`, and `smr-heidi`; `AGPL-3.0-or-later` in `evam`).
 
 ---
 
@@ -65,10 +79,11 @@ Each directory is an independent, self-contained package (`pyproject.toml` + uni
 Install any standalone package directly:
 
 ```bash
-pip install -e ./slopehunter
+pip install -e ./mrpresso
+pip install -e ./hyprcoloc
+pip install -e ./discover
 pip install -e ./limma
-pip install -e ./chromvar
 
 # Run unit tests for an individual package
-pytest slopehunter/tests -q
+pytest mrpresso/tests -q
 ```
