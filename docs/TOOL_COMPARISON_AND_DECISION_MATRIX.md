@@ -1,6 +1,6 @@
 # Tool Comparison & Decision Matrix
 
-Use the comparison tables below to choose among published methods implemented across all 57 standalone Python packages in `pythonic_biotools`.
+Use the comparison tables below to choose among published methods implemented across all 70 standalone Python packages in `pythonic_biotools`.
 
 ---
 
@@ -18,6 +18,9 @@ Use the comparison tables below to choose among published methods implemented ac
 | **[`mvcml`](../mvcml/README.md)** | `MVMR-cML` (Lin et al., 2023) | Independent genome-wide | BIC Model Averaging + Data Perturbation (`cML-DP`) | **Yes** (`rho_yx` matrix) | **Yes** (`cml_ma`, `mvcml_dp`) |
 | **[`cause`](../cause/README.md)** | `CAUSE` (Morrison et al., 2020) | Genome-wide + LD-pruned | Correlated ($\eta, q$) + uncorrelated bivariate `ash` (`PSIS-LOO`) | **Yes** (null $\hat{\rho}$ MLE) | No |
 | **[`mrclust`](../mrclust/README.md)** | `MR-Clust` (Foley et al., 2021) | Independent genome-wide | $K$ causal pathway clusters + Null + Student-$t$ Junk | Requires $F > 10$ | No |
+| **[`lhcmr`](../lhcmr/README.md)** | `LHC-MR` (Darrous et al., 2021) | Genome-wide + LD scores | **Bidirectional** ($\alpha_{X\to Y}, \alpha_{Y\to X}$) + latent heritable confounder $U$ | **Yes** (bivariate LDSC $i_{XY}$) | Bidirectional |
+| **[`mrlap`](../mrlap/README.md)** | `MRlap` (Mounier & Kutalik, 2023) | Clumped (`|z_X| > T`) + genome-wide | Analytical joint correction for **overlap + Winner's curse + weak IVs** | **Yes** ($p_{\text{diff}}$ bias test) | No |
+| **[`grapple`](../grapple/README.md)** | `GRAPPLE` (Wang et al., 2021) | Weak + strong IVs (`p < 1e-4`) | **Multimodal** Tukey/Huber profile likelihood discovering distinct pathways | **Yes** (`estimate_cor_mat`) | **Yes** (`grapple_mvmr`) |
 
 ---
 
@@ -31,6 +34,8 @@ Use the comparison tables below to choose among published methods implemented ac
 | **[`smr-heidi`](../smr-heidi/README.md)** | `SMR`, `SMR-multi` & `HEIDI` (Zhu et al., 2016; Wu et al., 2018) | cis-xQTL + GWAS | **Yes** (`HEIDI` & `SMR-multi`) | Causal mediation $\hat{b}_{xy}$, $p_{\text{SMR}}$, and $p_{\text{HEIDI}}$ (pleiotropy vs. linkage) |
 | **[`ctwas`](../ctwas/README.md)** | `cTWAS` (Zhao et al., 2024) | Multi-gene cis-weights + direct cis-SNPs + GWAS | **Yes** | Empirical Bayes $(\pi_G, \pi_S, \sigma_G^2, \sigma_S^2)$, mediated $h_G^2$, & joint SuSiE-RSS PIPs |
 | **[`hdl`](../hdl/README.md)** | `HDL`, `HDL-L` & `HDL.S` (Ning et al., 2020) | Genome-wide, single-locus, or stratified GWAS | **Yes** (regularized LD eigenpanels) | High-precision global $r_g$, local $r_{g,\text{loc}}$, and annotation-partitioned $h^2$ |
+| **[`lava`](../lava/README.md)** | `LAVA` (Werme et al., 2022) | Multi-trait single-locus ($P \ge 2$) | **Yes** (LD PCA `lim=0.99`) | Univariate $h^2_{\text{loc}}$, bivariate $r_g$, **partial local $r_g(X,Y\mid\mathbf{Z})$**, & local multiple regression |
+| **[`genomicsem`](../genomicsem/README.md)** | `GenomicSEM` (Grotzinger et al., 2019) | Multi-trait genetic covariance $(S, V_S)$ | Via LDSC / `HDL` | `lavaan` structural equation models (`DWLS`/`ML`, GWAS-by-subtraction) & Common-Factor SNP GWAS ($Q_{\text{SNP}}$) |
 | **[`fgwas`](../fgwas/README.md)** | `fgwas` (Pickrell, 2014) | Genome-wide GWAS + epigenomic annotations | Block windows or `-fine` regions | Log-enrichment $\hat{\gamma}_a$ (profile CIs, `-xv` ridge) & re-weighted SNP `PPA` |
 
 ---
@@ -65,6 +70,10 @@ Use the comparison tables below to choose among published methods implemented ac
 | **[`facets`](../facets/README.md)** | `FACETS` & `ASCAT` (Shen & Seshan, 2016; Van Loo et al., 2010) | Tumor-normal SNP pileups ($\log R$, $\log\text{OR}$) | **Yes** (`unmatched=True` optional) | Purity, ploidy, integer $(C_{\text{major}}, C_{\text{minor}})$, LOH, and clonal CCF in WES/WGS |
 | **[`purecn`](../purecn/README.md)** | `PureCN` (Riester et al., 2016) | **Tumor-only targeted panel** coverage + variants + dbSNP/PoN | **No** (tumor-only) | Purity/ploidy, Beta-Binomial **somatic vs. germline** status, LOH, CCF, and cleaned TMB/CIN |
 | **[`qdnaseq`](../qdnaseq/README.md)** | `QDNAseq` & `ACE` (Scheinin et al., 2014; Poell et al., 2019) | **Shallow/low-pass WGS (`0.1x–1x` cfDNA / FFPE)** | **No** (2D GC+mappability loess) | Binned copy-number segments/calls + reference-free `ACE` cellularity & ploidy |
+| **[`ichorcna`](../ichorcna/README.md)** | `ichorCNA` (Adalsteinsson et al., 2017) | **ULP-WGS cfDNA (`0.1x`) + PoN** | **No** (PoN optional) | ctDNA **tumor fraction (`TFx` down to 2–3%)**, ploidy, & subclonal CNA Student-$t$ HMM |
+| **[`mutationtimer`](../mutationtimer/README.md)** | `MutationTimeR` (Gerstung et al., 2020) | Somatic SNVs/SVs + allele-specific CN + purity | Somatic callset | `early`/`late`/`subclonal` mutation timing, CN gain times $T \in [0, 1]$, & **WGD timing** |
+| **[`conipher`](../conipher/README.md)** | `CONIPHER` (Grigoriadis et al., 2023) | **Multi-region ($R \ge 2$) somatic SNVs + CN** | Somatic callset | Multi-region PhyloCCF clusters, Pigeonhole/Crossing-Rule clone trees, & alternative topologies |
+| **[`mmsig`](../mmsig/README.md)** | `mmsig` (Rustad et al., 2021) | 96-channel SNV catalogs + reference signatures | Somatic callset | Backward cosine-pruned signature refitting, multinomial bootstrap CIs, & strand-bias checks |
 | **[`scarhrd`](../scarhrd/README.md)** | `scarHRD` (Sztupinszki et al., 2018) | Allele-specific CN segments (`total_cn`, `minor_cn`) | Via `facets` / `purecn` | Copy-number genomic scars: `HRD-LOH` + `TAI` + `LST` (`HRD-sum >= 42`) |
 | **[`chord`](../chord/README.md)** | `CHORD` (Nguyen et al., 2020) | Somatic SNVs (96 SBS) + indels (`bimh` MH) + SVs | Somatic callset | Mutational-signature HRD probability **and `BRCA1`-type vs. `BRCA2`-type** subtyping |
 | **[`tracksig`](../tracksig/README.md)** | `TrackSig` / `TrackSigFreq` (Rubanova et al., 2020) | Somatic SNVs (96 SBS + VAF/CCF + CN) + signatures | Somatic callset | `PELT` evolutionary pseudotime changepoints where mutational signatures shift |
@@ -82,6 +91,7 @@ Use the comparison tables below to choose among published methods implemented ac
 | Package | Published Method | Data Modality & Design | Latent / Random Effects | Primary Output |
 |---|---|---|---|---|
 | **[`limma`](../limma/README.md)** | `limma` (`eBayes`, `limma-trend`) (Smyth, 2004; Phipson et al., 2016) | Continuous log-expression, proteomics, CRISPR | Fixed covariates | Empirical Bayes `squeezeVar` moderated $t$/$F$ statistics & BH-FDR |
+| **[`deqms`](../deqms/README.md)** | `DEqMS` (Zhu et al., 2020) | **TMT, DIA & label-free quantitative proteomics** | Fixed design + PSM/peptide count | Two-way `median_sweeping` + **PSM-count-moderated** Empirical Bayes (`sca.t`, `sca.P.Value`) |
 | **[`saturn`](../saturn/README.md)** | `satuRn` & `stageR` (Gilis et al., 2022) | **Bulk or sparse scRNA-seq isoform/exon counts** | Fixed design (`AnnData`) | Quasi-binomial EB moderated **differential transcript usage (`DTU`)**, `locfdr` empirical null, & `stageR` OFDR |
 | **[`sva`](../sva/README.md)** | `SVA` / `irwsva` / `svaseq` (Leek & Storey, 2007; Leek, 2014) | Arrays or moderated counts | **Unmeasured latent batch** | Surrogate variables $S$ (`augment_design`) + nested `f_pvalue` |
 | **[`variancepartition`](../variancepartition/README.md)** | `variancePartition` & `dream` (Hoffman & Roussos, 2021) | Continuous/weighted bulk or pseudobulk | **Known random effects** REML | ICC variance shares + Satterthwaite df + `dream` EB moderated DE |
@@ -98,6 +108,8 @@ Use the comparison tables below to choose among published methods implemented ac
 | **[`timeroc`](../timeroc/README.md)** | `timeROC` (Blanche et al., 2013) | Right-censored survival & competing risks | Horizon-specific IPCW $\text{AUC}_1(t), \text{AUC}_2(t)$ & simultaneous bands | Evaluating discrimination of a single continuous biomarker or comparing two markers' AUCs |
 | **[`survidinri`](../survidinri/README.md)** | `survIDINRI` (Uno et al., 2013) | Right-censored nested Cox prognostic models at $t_0$ | IPCW **`IDI` (`M1`)**, continuous/categorical **`NRI` (`M2`)**, & median improvement (`M3`) | Quantifying incremental patient risk reclassification from adding a genomic score to clinical staging |
 | **[`buysetest`](../buysetest/README.md)** | `BuyseTest` (Péron et al., 2016) & `WR::pwreg` (Mao & Wang, 2020) | **Prioritized composite endpoints** (OS $\succ$ PFS $\succ$ Toxicity/QoL) | **Win Ratio**, **Net Benefit**, **Win Odds** (Péron KM rule) & covariate-adjusted log-WR (`pwreg`) | Two-arm randomized clinical trials or observational comparative effectiveness with hierarchical endpoints |
+| **[`survrm2`](../survrm2/README.md)** | `survRM2` (Uno et al., 2014; Tian et al., 2014) | Right-censored non-proportional hazards at horizon $\tau$ | Unadjusted & ANCOVA covariate-adjusted **`RMST` / `RMTL` difference & ratio** | Immunotherapy / delayed-separation survival trials violating proportional hazards |
+| **[`jmbayes2`](../jmbayes2/README.md)** | `JMbayes2` (Rizopoulos et al.; Papageorgiou et al., 2019) | **Serial longitudinal biomarker + survival / competing risks** | Bayesian joint `value`/`slope`/`area` association $\boldsymbol{\alpha}$ + **dynamic landmark survival** | Real-time individualized risk updating from serial ctDNA, PSA, eGFR, or CA-125 trajectories |
 
 ---
 
@@ -107,6 +119,7 @@ Use the comparison tables below to choose among published methods implemented ac
 |---|---|---|---|---|
 | **[`dss`](../dss/README.md)** | `DSS`, `DSS-general` & `DMRcate` (Wu et al., 2013; Park & Wu, 2016; Peters et al., 2015) | Bisulfite / EM-seq `(N, X)` CpG read counts | BSmooth tricube + log-normal EB Beta-Binomial dispersion + arcsine GLS + Satterthwaite kernel | Differentially Methylated Loci (`DML`) & Regions (`DMR`) for two-group or multifactor designs |
 | **[`csaw`](../csaw/README.md)** | `csaw` (Lun & Smyth, 2016) | ChIP-seq / ATAC / CUT&RUN BAMs or fragments | Sliding windows + 10 kb TMM / loess offsets + NB Quasi-Likelihood F-test + **Simes' procedure** | **Peak-free** differentially bound regions (`up`/`down`/`mixed`) with rigorous region-level FDR |
+| **[`monalisa`](../monalisa/README.md)** | `monaLisa` (Machlab et al., 2022) | Genomic sequences + quantitative $\Delta$ (`DMR`s / `csaw` regions) + PWMs | Iterative GC/CpG composition-matched background + Complementary-Pairs Randomized Lasso | Binned TF motif `log2enr` & `PFER`-controlled stability-selected causal TF motifs |
 | **[`rose`](../rose/README.md)** | `ROSE` (Whyte et al., 2013; Lovén et al., 2013) | H3K27ac ChIP / ATAC peaks + signal | Ranked stitched-enhancer tangent inflection point | Super-enhancer vs. typical enhancer calls |
 | **[`chromvar`](../chromvar/README.md)** | `chromVAR` (Schep et al., 2017) | scATAC / ATAC peak counts + PWMs | GC- and accessibility-matched background peaks | Per-cell bias-corrected TF motif deviation $Z$-scores & variability |
 | **[`figr`](../figr/README.md)** | `FigR` (Kartha et al., 2022) | Paired scATAC + scRNA multiome + motifs | Background-matched cis peak-to-gene Spearman $Z$-tests | DORC regulatory genes, kNN-smoothed DORC scores, & signed TF-DORC GRNs |

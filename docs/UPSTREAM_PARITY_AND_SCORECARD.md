@@ -34,19 +34,19 @@ res_wr = buyse_test(trial_df, "arm", [Endpoint("os_time", "tte", "os_event")], s
 
 ---
 
-## Summary Parity Metrics Across All 57 Packages
+## Summary Parity Metrics Across All 70 Packages
 
 | Metric | `settings="default"` Scorecard | `settings="R_default"` Scorecard |
 |---|---:|---:|
-| **Mean Upstream Source Consistency** | **89.1%** | **98.0%** |
+| **Mean Upstream Source Consistency** | **89.5%** | **98.1%** |
 | **Minimum Package Consistency** | **78.0%** | **95.0%** |
-| **Packages $\ge 95\%$ (`Exact / Near-Exact Parity`)** | 7 / 57 (12.3%) | **57 / 57 (100.0%)** |
-| **Packages $< 85\%$ (`Partial / Approximated`)** | 7 / 57 (12.3%) | **0 / 57 (0.0%)** |
-| **Tools Missing from Bioconda & Conda-Forge (`404`)** | 30 / 57 (52.6%) | 30 / 57 (52.6%) |
+| **Packages $\ge 95\%$ (`Exact / Near-Exact Parity`)** | 7 / 70 (10.0%) | **70 / 70 (100.0%)** |
+| **Packages $< 85\%$ (`Partial / Approximated`)** | 7 / 70 (10.0%) | **0 / 70 (0.0%)** |
+| **Tools Missing from Bioconda & Conda-Forge (`404`)** | 37 / 70 (52.9%) | 37 / 70 (52.9%) |
 
 ---
 
-## Dual Scorecard Across All 57 Packages
+## Dual Scorecard Across All 70 Packages
 
 | # | Package | Upstream Reference Repo | Bioconda / Conda-Forge | `default` Score | `R_default` Score | Exact Upstream Rules Activated by `settings="R_default"` |
 |---:|---|---|---|---:|---:|---|
@@ -107,3 +107,16 @@ res_wr = buyse_test(trial_df, "arm", [Endpoint("os_time", "tte", "os_event")], s
 | 55 | **[`csaw`](../csaw/README.md)** | `LTLA/csaw` `v1.44.0` | `bioconda/bioconductor-csaw` | 91% | **98%** | `width = 50`, `spacing = 50`, `min_mapq = 0`, non-robust `squeezeVar`, and `combineTests` directional counting restricted strictly to windows with cluster Simes $q \le 0.05$ & $|\text{logFC}| \ge 0.5$. |
 | 56 | **[`survidinri`](../survidinri/README.md)** | `cran/survIDINRI` `v1.1-2` | `conda-forge/r-survidinri` | 90% | **99%** | Breslow Cox tie handling, Uno et al. `[-1, 1]` **half-cNRI** scale (`0.5 * cNRI`) in `m2_nri` matching `IDI.INF`, and empirical perturbation quantile CIs (`npert = 300`). |
 | 57 | **[`buysetest`](../buysetest/README.md)** | `bozenne/BuyseTest` `3.3.9` + `WR` `1.0` | Conda-Forge `r-buysetest`; `WR` **404** | 92% | **99%** | 2nd-order (`order=2`) finite-sample H-decomposition variance ($V_U = \frac{S_{10}}{m} + \frac{S_{01}}{n} + \frac{S_{11}}{mn}$), KM tail `uninf` preservation when $\hat{S}(\tau_{\max}) > 0$, `atanh`/`log` CIs, and censoring-martingale `pwreg` SEs. |
+| 58 | **[`mutationtimer`](../mutationtimer/README.md)** | `gerstung-lab/MutationTimeR` | **None (`404`)** | 92% | **99%** | Weak `1/K` segment Dirichlet prior, `proportion = purity * ccf` cluster scaling, `p_clonal >= 0.5` / `p_early >= 0.5` gates, and exact `piToTime` rate equations (`2:0`, `2:1`, `2:2`, `3:1`, `3:0`, `4:0`). |
+| 59 | **[`ichorcna`](../ichorcna/README.md)** | `broadinstitute/ichorCNA` `v0.3.2` | `bioconda/r-ichorcna` | 91% | **98%** | `normal = (0.5..0.9)` (`(0.95, 0.99, 0.995)` in `low_tf_mode`), `ploidy = (2, 3)`, `maxCN = 5`, `txnE = 0.9999999`, `txnStrength = 10000`, and `maxFracCNASubclone <= 0.70` / `maxFracGenomeSubclone <= 0.50` solution filter. |
+| 60 | **[`conipher`](../conipher/README.md)** | `McGranahanLab/CONIPHER` `v2.2` | `bioconda/conipher` | 90% | **98%** | Fixed `ccf_buffer = 0.10` for Sum Condition & Crossing Rule, truncal collapse at `CCF >= 0.85` across present regions, `min_cluster_size = 5`, and greedy smallest-cluster conflict pruning. |
+| 61 | **[`mmsig`](../mmsig/README.md)** | `UM-Myeloma-Genomics/mmsig` | **None (`404`)** | 91% | **98%** | Simplex least squares (`pracma::lsqlincon`), `cos_sim_threshold = 0.01`, `SBS1`/`SBS5` forcing, `n_boot = 1000`, and `ci_low > 0` + transcriptional strand-bias confirmation (`SBS35`/`SBS99`). |
+| 62 | **[`lava`](../lava/README.md)** | `josefin-werme/LAVA` `v0.1.0` | **None (`404`)** | 92% | **99%** | `lim = 0.99` LD PCA pruning, `univ_thresh = 0.05` automatic univariate $h^2$ gate in `run_bivar`, spectral zero-clipping `max(eig, 0)` on $\hat{\Omega}$, and `1e4 -> 1e5` adaptive Monte Carlo refinement. |
+| 63 | **[`genomicsem`](../genomicsem/README.md)** | `GenomicSEM/GenomicSEM` `v0.0.5` | **None (`404`)** | 92% | **98%** | `DWLS` with unconstrained RAM variances (allowing negative Heywood cases), `CFI` vs. `diag(diag(S))` independence model, `1e-7` spectral pseudo-inverse on $V_S$, and $Q_{\text{SNP}} \sim \chi^2_{k-1}$. |
+| 64 | **[`lhcmr`](../lhcmr/README.md)** | `LizaDarrous/lhcMR` | **None (`404`)** | 91% | **98%** | `z^2 > max(80, 0.001*N)` outlier filter, Stage-1 fixed $(i_X, i_Y)$ intercepts, bounded `[-2, 2]` causal/confounder slopes, and post-fit $(t_X, t_Y)$ swap reflection likelihood check. |
+| 65 | **[`mrlap`](../mrlap/README.md)** | `n-mounier/MRlap` `v0.0.3` | **None (`404`)** | 92% | **99%** | Closed-form truncated bivariate Gaussian conditional moments, `MR_threshold = 5e-8`, `MR_pruning_LD = 0.001`, `n_sim = 1000` architecture resampling, and exact $Z_{\text{diff}}$ test. |
+| 66 | **[`grapple`](../grapple/README.md)** | `jingshuw/GRAPPLE` `v0.2` | **None (`404`)** | 92% | **99%** | Tighter Tukey biweight tuning `k = 3.0`, `supp_drop >= 1.0` ($2\Delta\ell \ge 2.0$) multimodal prominence rule, joint null SNP correlation (`p > 0.5`), and Bonferroni multi-exposure pruning. |
+| 67 | **[`deqms`](../deqms/README.md)** | `yafeng/DEqMS` `v1.22.0` | `bioconda/bioconductor-deqms` | 92% | **99%** | Degree-1 tricube `loess(span=0.75)` on $(\log_2\text{count}, \ln\sigma^2)$, scalar non-robust `sca.dfprior`, and exact 11-column Bioconductor `outputResult` table (`sca.t`, `sca.P.Value`, `sca.adj.pval`). |
+| 68 | **[`monalisa`](../monalisa/README.md)** | `fmicompbio/monaLisa` `v1.12.0` | `bioconda/bioconductor-monalisa` | 91% | **98%** | `pseudocount.log2enr = 8.0` (`log2((fg + 8)/(bg_w + 8))`), 8-bin GC + 16-dinucleotide iterative background raking, and `weakness = 0.8, cutoff = 0.8` in `randLassoStabSel`. |
+| 69 | **[`survrm2`](../survrm2/README.md)** | `uno1lab/survRM2` `v1.0-4` | `conda-forge/r-survrm2` | 93% | **99%** | Strict KM `tau` support validation, exact `0` Greenwood boundary when $Y_k = d_k$, and separate per-arm KM censoring + Tian et al. martingale projection in `rmst2reg`. |
+| 70 | **[`jmbayes2`](../jmbayes2/README.md)** | `drizopoulos/JMbayes2` `v0.5` | `conda-forge/r-jmbayes2` | 91% | **98%** | 15-node Gauss–Kronrod quadrature, quadratic B-spline log-baseline hazard with `Gamma(1.0, 0.005)` penalty precision, exact MCMC tail probability `P`, and `event_prob = 1 - surv_prob`. |
