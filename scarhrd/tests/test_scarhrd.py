@@ -235,3 +235,152 @@ def test_input_validation_errors():
     )
     with pytest.raises(ValueError, match="calculate_hrd_cohort"):
         calculate_hrd(multi)
+
+    single = pd.DataFrame(
+        [{"chrom": "chr1", "start": 0, "end": 50_000_000, "total_cn": 2, "minor_cn": 1}]
+    )
+    with pytest.raises(ValueError, match="settings"):
+        calculate_hrd(single, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        calculate_hrd_cohort(multi, settings="invalid")  # type: ignore[arg-type]
+
+
+def test_r_default_chrx_exclusion_and_no_loh_smoothing():
+    """
+    In settings='R_default':
+    - chrX is excluded unless include_chr_x=True is explicitly supplied.
+    - HRD-LOH does NOT apply <3 Mb LST pre-smoothing.
+    """
+    ref1 = GRCH38_REFERENCE["chr1"]
+    refx = GRCH38_REFERENCE["chrX"]
+    segs = pd.DataFrame(
+        [
+            # chr1: two 10 Mb LOH blocks split by a 2 Mb balanced segment
+            # default smooths the 2 Mb segment -> 22 Mb LOH (>15 Mb -> 1)
+            # R_default does NOT smooth -> two 10 Mb LOH blocks (<=15 Mb -> 0)
+            {"chrom": "chr1", "start": 0, "end": 10_000_000, "total_cn": 1, "minor_cn": 0},
+            {"chrom": "chr1", "start": 10_000_000, "end": 12_000_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr1", "start": 12_000_000, "end": 22_000_000, "total_cn": 1, "minor_cn": 0},
+            {"chrom": "chr1", "start": 22_000_000, "end": ref1.centromere_start, "total_cn": 2, "minor_cn": 1},
+            # chrX: 25 Mb p-arm LOH
+            {"chrom": "chrX", "start": 0, "end": 25_000_000, "total_cn": 1, "minor_cn": 0},
+            {"chrom": "chrX", "start": 25_000_000, "end": refx.centromere_start, "total_cn": 2, "minor_cn": 1},
+        ]
+    )
+
+    res_def = calculate_hrd(segs, genome="GRCh38", settings="default")
+    res_r = calculate_hrd(segs, genome="GRCh38", settings="R_default")
+    res_r_with_x = calculate_hrd(
+        segs, genome="GRCh38", include_chr_x=True, settings="R_default"
+    )
+
+    assert res_def.hrd_loh == 2  # chr1 (merged 22 Mb) + chrX (25 Mb)
+    assert res_r.hrd_loh == 0  # chr1 unsmoothed + chrX excluded
+    assert "chrX" not in set(res_r.per_chrom_breakdown["chrom"])
+    assert res_r_with_x.hrd_loh == 1  # chrX explicitly included
+
+
+def test_r_default_tai_1mb_filter_outermost_arm_and_odd_ploidy_neutrality():
+    """
+    Verify sztup/scarHRD v0.1.1 calc.ai_new.R behaviors under settings='R_default':
+    - >=1 Mb segment filter without <3 Mb smoothing
+    - outermost segment on p-arm (end <= cen_start) / q-arm (start >= cen_end) counts
+      without requiring >=11 Mb length or <=10 Mb telomere margin
+    - modal odd-ploidy neutrality: when round(ploidy) is odd, (total_cn == round(ploidy)
+      and minor_cn != 0) is NOT considered allelic imbalance.
+    """
+    ref1 = GRCH38_REFERENCE["chr1"]
+    ref2 = GRCH38_REFERENCE["chr2"]
+    ref4 = GRCH38_REFERENCE["chr4"]
+
+    segs = pd.DataFrame(
+        [
+            # chr1: 2 Mb balanced tip [0..2M] (>=1 Mb, <3 Mb) blocks [2M..30M] AI in R_default,
+            # whereas default smooths out <3 Mb tip and calls +1 TAI!
+            {"chrom": "chr1", "start": 0, "end": 2_000_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr1", "start": 2_000_000, "end": 30_000_000, "total_cn": 3, "minor_cn": 1},
+            {"chrom": "chr1", "start": 30_000_000, "end": ref1.centromere_start, "total_cn": 2, "minor_cn": 1},
+            # chr2: 0.5 Mb balanced tip (<1 Mb) is filtered out in R_default -> [0.5M..30M] is outermost -> +1 TAI
+            {"chrom": "chr2", "start": 0, "end": 500_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr2", "start": 500_000, "end": 30_000_000, "total_cn": 3, "minor_cn": 1},
+            {"chrom": "chr2", "start": 30_000_000, "end": ref2.centromere_start, "total_cn": 2, "minor_cn": 1},
+            # chr4: 7 Mb outermost p-arm AI starting at 15 Mb (>10 Mb margin and <11 Mb length):
+            # default -> 0 TAI; R_default -> 1 TAI!
+            {"chrom": "chr4", "start": 15_000_000, "end": 22_000_000, "total_cn": 3, "minor_cn": 1},
+            {"chrom": "chr4", "start": 22_000_000, "end": ref4.centromere_start, "total_cn": 2, "minor_cn": 1},
+        ]
+    )
+
+    by_def = calculate_hrd(segs, ploidy=2.0, settings="default").per_chrom_breakdown.set_index("chrom")
+    by_r = calculate_hrd(segs, ploidy=2.0, settings="R_default").per_chrom_breakdown.set_index("chrom")
+
+    assert by_def.loc["chr1", "tai"] == 1
+    assert by_r.loc["chr1", "tai"] == 0
+
+    assert by_r.loc["chr2", "tai"] == 1
+
+    assert by_def.loc["chr4", "tai"] == 0
+    assert by_r.loc["chr4", "tai"] == 1
+
+    # Triploid (ploidy=3.0 -> modal odd ploidy 3): (total=3, minor=1) is balanced in R_default,
+    # whereas (total=3, minor=0) is still AI!
+    triploid_segs = pd.DataFrame(
+        [
+            {"chrom": "chr1", "start": 0, "end": 25_000_000, "total_cn": 3, "minor_cn": 1},
+            {"chrom": "chr1", "start": 25_000_000, "end": ref1.centromere_start, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr2", "start": 0, "end": 25_000_000, "total_cn": 3, "minor_cn": 0},
+            {"chrom": "chr2", "start": 25_000_000, "end": ref2.centromere_start, "total_cn": 3, "minor_cn": 1},
+        ]
+    )
+    tri_def = calculate_hrd(triploid_segs, ploidy=3.0, settings="default").per_chrom_breakdown.set_index("chrom")
+    tri_r = calculate_hrd(triploid_segs, ploidy=3.0, settings="R_default").per_chrom_breakdown.set_index("chrom")
+
+    assert tri_def.loc["chr1", "tai"] == 1
+    assert tri_r.loc["chr1", "tai"] == 0
+    assert tri_r.loc["chr2", "tai"] == 1
+
+
+def test_r_default_lst_left_to_right_pop_strict_gap_and_ploidy_formula():
+    """
+    Verify sztup/scarHRD v0.1.1 calc.lst.R behaviors under settings='R_default':
+    - Left-to-right popping of <3 Mb segments (rather than shortest-first argmin)
+    - Strict gap < 3_000_000 bp
+    - lst_ploidy_adjusted = max(0.0, lst - 15.5 * ploidy)
+    """
+    segs = pd.DataFrame(
+        [
+            # chr1 p-arm: [0..20M A], [20M..22.5M B (2.5Mb)], [22.5M..24.5M A (2.0Mb)], [24.5M..33M B (8.5Mb)]
+            # default (argmin pops 2.0Mb A first) -> B merges to 13Mb >= 10Mb -> 1 LST
+            # R_default (left-to-right pops 2.5Mb B first) -> A merges to 24.5Mb, B stays 8.5Mb < 10Mb -> 0 LST
+            {"chrom": "chr1", "start": 0, "end": 20_000_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr1", "start": 20_000_000, "end": 22_500_000, "total_cn": 3, "minor_cn": 1},
+            {"chrom": "chr1", "start": 22_500_000, "end": 24_500_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr1", "start": 24_500_000, "end": 33_000_000, "total_cn": 3, "minor_cn": 1},
+            # chr2 p-arm: exact 3_000_000 bp gap between two 15 Mb segments
+            # default (<= 3 Mb) -> 1 LST; R_default (< 3 Mb) -> 0 LST
+            {"chrom": "chr2", "start": 0, "end": 15_000_000, "total_cn": 2, "minor_cn": 1},
+            {"chrom": "chr2", "start": 18_000_000, "end": 33_000_000, "total_cn": 1, "minor_cn": 0},
+        ]
+    )
+
+    res_def = calculate_hrd(segs, ploidy=2.0, settings="default")
+    res_r = calculate_hrd(segs, ploidy=2.0, settings="R_default")
+    assert res_def.lst == 2
+    assert res_r.lst == 0
+
+    # Test lst_ploidy_adjusted = max(0.0, lst - 15.5 * ploidy) when LST > 15.5 * ploidy
+    many_lst_rows = []
+    for idx in range(1, 19):
+        ch = f"chr{idx}"
+        ref = GRCH38_REFERENCE[ch]
+        q0 = ref.centromere_end
+        many_lst_rows.extend(
+            [
+                {"chrom": ch, "start": q0, "end": q0 + 11_000_000, "total_cn": 2, "minor_cn": 1},
+                {"chrom": ch, "start": q0 + 11_000_000, "end": q0 + 22_000_000, "total_cn": 3, "minor_cn": 1},
+                {"chrom": ch, "start": q0 + 22_000_000, "end": q0 + 33_000_000, "total_cn": 2, "minor_cn": 1},
+            ]
+        )
+    res_high = calculate_hrd(pd.DataFrame(many_lst_rows), ploidy=2.0, settings="R_default")
+    assert res_high.lst == 36
+    assert np.isclose(res_high.lst_ploidy_adjusted, 36.0 - 15.5 * 2.0)

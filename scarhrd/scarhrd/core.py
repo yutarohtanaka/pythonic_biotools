@@ -9,12 +9,22 @@ Core genomic scar Homologous Recombination Deficiency (HRD) scoring algorithms:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .reference import ChromArmReference, canonical_hrd_chrom, get_genome_reference
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass
@@ -123,6 +133,206 @@ def _smooth_arm_segments(
         cur = _merge_identical_states(cur, max_merge_gap_bp)
 
     return cur
+
+
+def _is_ai_r_default(seg: _Seg, modal_ploidy: int) -> bool:
+    """Allelic imbalance predicate in sztup/scarHRD v0.1.1 calc.ai_new.R."""
+    if seg.total_cn < 1:
+        return False
+    if modal_ploidy % 2 == 1 and seg.total_cn == modal_ploidy and seg.minor_cn != 0:
+        return False
+    return seg.major_cn != seg.minor_cn
+
+
+def _smooth_arm_segments_r_default(
+    segs: list[_Seg],
+    *,
+    min_segment_bp: int,
+    max_lst_gap_bp: int,
+) -> list[list[_Seg]]:
+    """
+    Match sztup/scarHRD v0.1.1 calc.lst.R per-arm smoothing:
+    1. Split arm into contiguous sub-blocks where initial gap >= max_lst_gap_bp.
+    2. Within each block, merge adjacent identical (major_cn, minor_cn) states and
+       iteratively pop the FIRST segment < min_segment_bp in left-to-right order.
+    """
+    if not segs:
+        return []
+
+    blocks: list[list[_Seg]] = [[_Seg(segs[0].start, segs[0].end, segs[0].major_cn, segs[0].minor_cn)]]
+    for s in segs[1:]:
+        prev = blocks[-1][-1]
+        if (s.start - prev.end) >= max_lst_gap_bp:
+            blocks.append([_Seg(s.start, s.end, s.major_cn, s.minor_cn)])
+        else:
+            blocks[-1].append(_Seg(s.start, s.end, s.major_cn, s.minor_cn))
+
+    def _shrink_identical(block: list[_Seg]) -> list[_Seg]:
+        if not block:
+            return []
+        out: list[_Seg] = [_Seg(block[0].start, block[0].end, block[0].major_cn, block[0].minor_cn)]
+        for item in block[1:]:
+            last = out[-1]
+            if last.major_cn == item.major_cn and last.minor_cn == item.minor_cn:
+                last.end = max(last.end, item.end)
+            else:
+                out.append(_Seg(item.start, item.end, item.major_cn, item.minor_cn))
+        return out
+
+    smoothed_blocks: list[list[_Seg]] = []
+    for blk in blocks:
+        cur = _shrink_identical(blk)
+        if min_segment_bp > 0:
+            while cur:
+                first_short = next(
+                    (idx for idx, seg in enumerate(cur) if seg.length < min_segment_bp),
+                    None,
+                )
+                if first_short is None:
+                    break
+                cur.pop(first_short)
+                cur = _shrink_identical(cur)
+        if cur:
+            smoothed_blocks.append(cur)
+    return smoothed_blocks
+
+
+def _score_single_chromosome_r_default(
+    raw_segs: list[_Seg],
+    ref: ChromArmReference,
+    *,
+    est_ploidy: float,
+    min_loh_bp: int,
+    min_lst_bp: int,
+    min_segment_bp: int,
+    max_lst_gap_bp: int,
+    centromere_margin_bp: int,
+    min_tai_filter_bp: int = 1_000_000,
+) -> tuple[int, int, int]:
+    """
+    Exact sztup/scarHRD v0.1.1 (calc.hrd.R, calc.ai_new.R, calc.lst.R) per-chromosome scoring.
+    """
+    p_raw, q_raw, _ = _split_chrom_into_arms(raw_segs, ref)
+
+    # ------------------------------------------------------------------
+    # 1. HRD-LOH (calc.hrd.R): > 15 Mb LOH without <3 Mb LST pre-smoothing
+    # ------------------------------------------------------------------
+    p_loh_runs = _merge_boolean_runs(p_raw, "is_loh", max_lst_gap_bp)
+    q_loh_runs = _merge_boolean_runs(q_raw, "is_loh", max_lst_gap_bp)
+
+    combined_loh_lengths: list[int] = []
+    bridged_cen_loh = (
+        len(p_loh_runs) > 0
+        and len(q_loh_runs) > 0
+        and p_loh_runs[-1][2]
+        and q_loh_runs[0][2]
+        and p_loh_runs[-1][1] >= (ref.centromere_start - centromere_margin_bp)
+        and q_loh_runs[0][0] <= (ref.centromere_end + centromere_margin_bp)
+    )
+    if bridged_cen_loh:
+        for s_r, e_r, flag in p_loh_runs[:-1]:
+            if flag:
+                combined_loh_lengths.append(e_r - s_r)
+        bridged_len = (p_loh_runs[-1][1] - p_loh_runs[-1][0]) + (
+            q_loh_runs[0][1] - q_loh_runs[0][0]
+        )
+        combined_loh_lengths.append(bridged_len)
+        for s_r, e_r, flag in q_loh_runs[1:]:
+            if flag:
+                combined_loh_lengths.append(e_r - s_r)
+    else:
+        for s_r, e_r, flag in p_loh_runs:
+            if flag:
+                combined_loh_lengths.append(e_r - s_r)
+        for s_r, e_r, flag in q_loh_runs:
+            if flag:
+                combined_loh_lengths.append(e_r - s_r)
+
+    all_chr_segs = q_raw if ref.is_acrocentric and not p_raw else (p_raw + q_raw)
+    total_loh_bp = sum(combined_loh_lengths)
+    all_called_are_loh = len(all_chr_segs) > 0 and all(s.is_loh for s in all_chr_segs)
+    is_whole_chr_loh = (
+        all_called_are_loh and total_loh_bp >= 0.75 * ref.callable_length
+    ) or (total_loh_bp >= 0.90 * ref.callable_length and len(combined_loh_lengths) == 1)
+
+    if is_whole_chr_loh:
+        loh_count = 0
+    else:
+        loh_count = sum(1 for ln in combined_loh_lengths if ln > min_loh_bp)
+
+    # ------------------------------------------------------------------
+    # 2. TAI (calc.ai_new.R): filter >= 1 Mb without <3 Mb smoothing,
+    #    telomeric iff end <= cen_start (p) or start >= cen_end (q),
+    #    modal odd-ploidy neutrality.
+    # ------------------------------------------------------------------
+    modal_ploidy = int(round(est_ploidy))
+    clipped_sorted: list[_Seg] = []
+    for s in raw_segs:
+        st = max(0, s.start)
+        en = min(ref.length, s.end) if s.end <= ref.length + 5_000_000 else s.end
+        if en - st >= min_tai_filter_bp:
+            clipped_sorted.append(_Seg(st, en, s.major_cn, s.minor_cn))
+    clipped_sorted.sort(key=lambda x: (x.start, x.end))
+
+    chr_ai_runs: list[tuple[int, int, bool]] = []
+    for s in clipped_sorted:
+        flag = _is_ai_r_default(s, modal_ploidy)
+        if not chr_ai_runs:
+            chr_ai_runs.append((s.start, s.end, flag))
+            continue
+        p_st, p_en, p_flag = chr_ai_runs[-1]
+        bridges_cen = (
+            p_en >= (ref.centromere_start - centromere_margin_bp)
+            and s.start <= (ref.centromere_end + centromere_margin_bp)
+        )
+        if flag == p_flag and ((s.start - p_en) <= max_lst_gap_bp or bridges_cen):
+            chr_ai_runs[-1] = (p_st, max(p_en, s.end), p_flag)
+        else:
+            chr_ai_runs.append((s.start, s.end, flag))
+
+    tai_count = 0
+    if not ref.is_acrocentric and len(chr_ai_runs) > 0:
+        ps, pe, p_flag = chr_ai_runs[0]
+        if p_flag and pe <= ref.centromere_start:
+            tai_count += 1
+
+    if len(chr_ai_runs) > 0:
+        qs, qe, q_flag = chr_ai_runs[-1]
+        acrocentric_whole_chr = (
+            ref.is_acrocentric
+            and len(chr_ai_runs) == 1
+            and qs <= (ref.centromere_end + centromere_margin_bp)
+            and (qe - qs) >= 0.75 * ref.q_arm_length
+        )
+        if q_flag and qs >= ref.centromere_end and not acrocentric_whole_chr:
+            tai_count += 1
+
+    # ------------------------------------------------------------------
+    # 3. LST (calc.lst.R): left-to-right <3 Mb pop, strict gap < 3 Mb
+    # ------------------------------------------------------------------
+    lst_count = 0
+    for arm_raw in (p_raw, q_raw):
+        blocks = _smooth_arm_segments_r_default(
+            arm_raw,
+            min_segment_bp=min_segment_bp,
+            max_lst_gap_bp=max_lst_gap_bp,
+        )
+        for blk in blocks:
+            for k in range(len(blk) - 1):
+                left_s = blk[k]
+                right_s = blk[k + 1]
+                if (
+                    left_s.length >= min_lst_bp
+                    and right_s.length >= min_lst_bp
+                    and (right_s.start - left_s.end) < max_lst_gap_bp
+                    and (
+                        left_s.major_cn != right_s.major_cn
+                        or left_s.minor_cn != right_s.minor_cn
+                    )
+                ):
+                    lst_count += 1
+
+    return loh_count, tai_count, lst_count
 
 
 def _merge_boolean_runs(
@@ -396,7 +606,7 @@ def calculate_hrd(
     genome: str = "GRCh38",
     ploidy: float | None = None,
     sample_id: str = "Sample_1",
-    include_chr_x: bool = True,
+    include_chr_x: bool | None = None,
     min_loh_bp: int = 15_000_000,
     min_tai_bp: int = 11_000_000,
     min_lst_bp: int = 10_000_000,
@@ -407,17 +617,22 @@ def calculate_hrd(
     ploidy_lst_slope: float = 2.5,
     use_ploidy_adjusted_sum: bool = False,
     hrd_threshold: float = 42.0,
+    settings: SettingsMode = "default",
 ) -> ScarHRDResult:
     """
     Compute `scarHRD` genomic scar scores (`hrd_loh`, `tai`, `lst`, and `hrd_sum`)
     from allele-specific copy-number segments (Sztupinszki et al., 2018).
     """
+    _validate_settings(settings)
     if ploidy is not None and ploidy <= 0.0:
         raise ValueError(f"ploidy must be > 0, got {ploidy}.")
     if min_loh_bp < 0 or min_tai_bp < 0 or min_lst_bp < 0 or min_segment_bp < 0:
         raise ValueError("Size thresholds must be non-negative.")
 
-    ref_map = get_genome_reference(genome, include_chr_x=include_chr_x)
+    eff_include_chr_x = (
+        (settings != "R_default") if include_chr_x is None else bool(include_chr_x)
+    )
+    ref_map = get_genome_reference(genome, include_chr_x=eff_include_chr_x)
     parsed = _parse_allele_segments(segments)
 
     if "sample_id" in parsed.columns:
@@ -431,7 +646,8 @@ def calculate_hrd(
 
     valid = parsed.loc[parsed["chrom"].isin(ref_map.keys())].copy()
     if len(valid) == 0:
-        raise ValueError("No segments mapped to evaluated chromosomes (chr1-chr22, chrX).")
+        chrom_desc = "chr1-chr22, chrX" if eff_include_chr_x else "chr1-chr22"
+        raise ValueError(f"No segments mapped to evaluated chromosomes ({chrom_desc}).")
 
     seg_lengths = (valid["end"] - valid["start"]).to_numpy(dtype=np.float64)
     est_ploidy = (
@@ -456,24 +672,41 @@ def calculate_hrd(
         if not ch_segs:
             chrom_rows.append({"chrom": ch, "hrd_loh": 0, "tai": 0, "lst": 0})
             continue
-        c_loh, c_tai, c_lst = _score_single_chromosome(
-            ch_segs,
-            ref,
-            min_loh_bp=min_loh_bp,
-            min_tai_bp=min_tai_bp,
-            min_lst_bp=min_lst_bp,
-            min_segment_bp=min_segment_bp,
-            max_lst_gap_bp=max_lst_gap_bp,
-            telomere_margin_bp=telomere_margin_bp,
-            centromere_margin_bp=centromere_margin_bp,
-        )
+        if settings == "R_default":
+            c_loh, c_tai, c_lst = _score_single_chromosome_r_default(
+                ch_segs,
+                ref,
+                est_ploidy=est_ploidy,
+                min_loh_bp=min_loh_bp,
+                min_lst_bp=min_lst_bp,
+                min_segment_bp=min_segment_bp,
+                max_lst_gap_bp=max_lst_gap_bp,
+                centromere_margin_bp=centromere_margin_bp,
+            )
+        else:
+            c_loh, c_tai, c_lst = _score_single_chromosome(
+                ch_segs,
+                ref,
+                min_loh_bp=min_loh_bp,
+                min_tai_bp=min_tai_bp,
+                min_lst_bp=min_lst_bp,
+                min_segment_bp=min_segment_bp,
+                max_lst_gap_bp=max_lst_gap_bp,
+                telomere_margin_bp=telomere_margin_bp,
+                centromere_margin_bp=centromere_margin_bp,
+            )
         total_loh += c_loh
         total_tai += c_tai
         total_lst += c_lst
         chrom_rows.append({"chrom": ch, "hrd_loh": c_loh, "tai": c_tai, "lst": c_lst})
 
     hrd_sum = int(total_loh + total_tai + total_lst)
-    lst_adj = float(max(0.0, float(total_lst) - ploidy_lst_slope * (est_ploidy - 2.0)))
+    if settings == "R_default":
+        lst_adj = float(max(0.0, float(total_lst) - 15.5 * est_ploidy))
+    else:
+        lst_adj = float(
+            max(0.0, float(total_lst) - ploidy_lst_slope * (est_ploidy - 2.0))
+        )
     hrd_sum_adj = float(total_loh + total_tai) + lst_adj
 
     score_for_call = hrd_sum_adj if use_ploidy_adjusted_sum else float(hrd_sum)
@@ -500,7 +733,7 @@ def calculate_hrd_cohort(
     *,
     sample_col: str = "sample_id",
     genome: str = "GRCh38",
-    include_chr_x: bool = True,
+    include_chr_x: bool | None = None,
     min_loh_bp: int = 15_000_000,
     min_tai_bp: int = 11_000_000,
     min_lst_bp: int = 10_000_000,
@@ -511,8 +744,10 @@ def calculate_hrd_cohort(
     ploidy_lst_slope: float = 2.5,
     use_ploidy_adjusted_sum: bool = False,
     hrd_threshold: float = 42.0,
+    settings: SettingsMode = "default",
 ) -> pd.DataFrame:
     """Compute scarHRD scores across a multi-sample allele-specific segment cohort."""
+    _validate_settings(settings)
     if not isinstance(segments, pd.DataFrame):
         segments = pd.DataFrame(segments)
     if sample_col not in segments.columns:
@@ -538,6 +773,7 @@ def calculate_hrd_cohort(
             ploidy_lst_slope=ploidy_lst_slope,
             use_ploidy_adjusted_sum=use_ploidy_adjusted_sum,
             hrd_threshold=hrd_threshold,
+            settings=settings,
         )
         dfs.append(res.to_dataframe())
 
