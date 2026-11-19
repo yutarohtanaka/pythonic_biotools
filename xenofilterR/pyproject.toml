@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xenofilterR"
+version = "0.2.0"
+description = "Filter mouse reads from human xenograft RNA-seq or DNA-seq BAMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    { name = "Yutaro Tanaka" }
+]
+dependencies = [
+    "pysam>=0.21",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+xenofilter = "xenofilterR.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xenofilterR*"]
