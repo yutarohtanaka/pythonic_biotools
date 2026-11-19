@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pythonic-rose"
+version = "0.1.0"
+description = "Python implementation of ROSE (Rank Ordering of Super-Enhancers; Whyte et al., Cell 2013)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.24", "pandas>=2.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["rose"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
