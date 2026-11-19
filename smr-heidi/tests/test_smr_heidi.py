@@ -7,7 +7,15 @@ import pandas as pd
 import pytest
 from scipy import stats
 
-from smr_heidi import heidi_test, pchisqsum, run_locus_smr_heidi, smr_multi, smr_single
+from smr_heidi import (
+    est_cov_bxy,
+    heidi_test,
+    pchisqsum,
+    run_locus_smr_heidi,
+    smr_heidi_locus,
+    smr_multi,
+    smr_single,
+)
 
 
 def _simulate_cis_locus(
@@ -279,3 +287,111 @@ def test_invalid_inputs_raise_value_error():
     R_bad_diag[2, 2] = 0.8
     with pytest.raises(ValueError, match="diagonal"):
         heidi_test(b, s, b, s, R_bad_diag)
+
+
+def test_r_default_settings():
+    R4 = np.eye(4)
+    b_zy = np.array([0.08, 0.07, 0.06, 0.05])
+    se_zy = np.full(4, 0.015)
+    b_zx = np.array([0.40, 0.35, 0.30, 0.25])
+    se_zx = np.full(4, 0.025)
+    gwas_df = pd.DataFrame(
+        {"SNP": ["rs1", "rs2", "rs3", "rs4"], "A1": ["A"] * 4, "A2": ["G"] * 4, "b": b_zy, "se": se_zy}
+    )
+    eqtl_df = pd.DataFrame(
+        {"SNP": ["rs1", "rs2", "rs3", "rs4"], "A1": ["A"] * 4, "A2": ["G"] * 4, "b": b_zx, "se": se_zx}
+    )
+
+    # 1. Invalid settings raises ValueError across all entrypoints
+    with pytest.raises(ValueError, match="Unknown settings"):
+        pchisqsum(5.0, [1.0, 1.0], settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        smr_single(0.08, 0.015, 0.40, 0.025, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        est_cov_bxy(b_zy, se_zy, b_zx, se_zx, R4, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        heidi_test(b_zy, se_zy, b_zx, se_zx, R4, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        smr_multi(b_zy, se_zy, b_zx, se_zx, R4, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        run_locus_smr_heidi(gwas_df, eqtl_df, R4, settings="invalid")  # type: ignore[arg-type]
+
+    # 2. est_cov_bxy: 4th-order -b_xy_i * b_xy_j / (z_zx_i^2 * z_zx_j^2) term + 1e-8 diagonal ridge
+    R_corr = _simulate_cis_locus(np.random.default_rng(9), m_snps=4, rho_ar1=0.65)
+    cov_def = est_cov_bxy(b_zy, se_zy, b_zx, se_zx, R_corr, settings="default")
+    cov_r = est_cov_bxy(b_zy, se_zy, b_zx, se_zx, R_corr, settings="R_default")
+    b_xy = b_zy / b_zx
+    z_zx = b_zx / se_zx
+    expected_diff = -np.outer(b_xy / (z_zx**2), b_xy / (z_zx**2)) + 1e-8 * np.eye(4)
+    np.testing.assert_allclose(cov_r - cov_def, expected_diff, rtol=1e-12, atol=1e-15)
+
+    # 3. rm_cor_sbat degree-based iterative LD pruning vs greedy forward pruning
+    # Construct exact SPD correlation matrix from 4D unit vectors:
+    # SNP 0 (top): r = 0.50 (r^2 = 0.25) with SNPs 1, 2, 3
+    # SNP 1 (hub): r = 0.97 (r^2 = 0.9409 > 0.90) with both SNP 2 and SNP 3 -> degree 2
+    # SNPs 2 & 3 (spokes): r_23 = 0.8824 (r^2 = 0.7786 <= 0.90) -> degree 1 each
+    c_val = 0.50
+    s_val = np.sqrt(1.0 - c_val**2)
+    cos_a = 0.96
+    sin_a = np.sqrt(1.0 - cos_a**2)
+    V = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [c_val, s_val, 0.0, 0.0],
+            [c_val, s_val * cos_a, s_val * sin_a, 0.0],
+            [c_val, s_val * cos_a, -s_val * sin_a, 0.0],
+        ]
+    )
+    R_hub = V @ V.T + 1e-4 * np.eye(4)
+    d_inv = 1.0 / np.sqrt(np.diag(R_hub))
+    R_hub = R_hub * np.outer(d_inv, d_inv)
+    np.fill_diagonal(R_hub, 1.0)
+
+    bzx_hub = np.array([0.50, 0.36, 0.33, 0.31])  # |z_zx|: SNP 0 > SNP 1 > SNP 2 > SNP 3
+    szx_hub = np.full(4, 0.025)
+    bzy_hub = np.array([0.10, 0.072, 0.068, 0.059])
+    szy_hub = np.full(4, 0.015)
+
+    h_def = heidi_test(bzy_hub, szy_hub, bzx_hub, szx_hub, R_hub, top_idx=0, min_snps=3, settings="default")
+    h_r = heidi_test(bzy_hub, szy_hub, bzx_hub, szx_hub, R_hub, top_idx=0, min_snps=3, settings="R_default")
+    # Greedy keeps [0, 1] (2 SNPs < min_snps=3 => NaN), whereas rm_cor_sbat removes degree-2 hub 1 and keeps [0, 2, 3]!
+    assert h_def.selected_indices == [0, 1]
+    assert np.isnan(h_def.p_heidi)
+    assert h_r.selected_indices == [0, 2, 3]
+    assert np.isfinite(h_r.p_heidi) and 0.0 < h_r.p_heidi <= 1.0
+
+    # Equal-degree tie-breaking removes smaller |z_zx|
+    R_pair = np.array(
+        [
+            [1.0, 0.50, 0.50, 0.50],
+            [0.50, 1.0, 0.96, 0.30],
+            [0.50, 0.96, 1.0, 0.30],
+            [0.50, 0.30, 0.30, 1.0],
+        ]
+    )
+    bzx_pair = np.array([0.50, 0.28, 0.38, 0.32])  # SNP 2 stronger than SNP 1; both degree 1
+    h_pair = heidi_test(bzy_hub, szy_hub, bzx_pair, szx_hub, R_pair, top_idx=0, min_snps=3, settings="R_default")
+    assert h_pair.selected_indices == [0, 2, 3]
+
+    # 4. pchisqsum: Kuonen saddlepoint on (-inf, 1/(2*lambda_max)) + Satterthwaite fallback at the mean
+    lam = np.array([3.2, 0.6, 0.2])
+    # Right tail and left tail (zeta < 0) use Kuonen saddlepoint
+    for q_val in (1.2, 10.5, 28.0):
+        p_r = pchisqsum(q_val, lam, settings="R_default")
+        p_sp = pchisqsum(q_val, lam, method="saddlepoint", settings="R_default")
+        assert np.isclose(p_r, p_sp, rtol=1e-13)
+    # Right at the mean q == sum(lam) == 4.0, saddlepoint falls back to Satterthwaite
+    p_at_mean = pchisqsum(float(np.sum(lam)), lam, settings="R_default")
+    p_satt_mean = pchisqsum(float(np.sum(lam)), lam, method="satterthwaite", settings="R_default")
+    assert np.isclose(p_at_mean, p_satt_mean, rtol=1e-13)
+
+    # End-to-end locus runner with alias smr_heidi_locus
+    gwas_hub = pd.DataFrame(
+        {"SNP": ["rs1", "rs2", "rs3", "rs4"], "A1": ["A"] * 4, "A2": ["G"] * 4, "b": bzy_hub, "se": szy_hub}
+    )
+    eqtl_hub = pd.DataFrame(
+        {"SNP": ["rs1", "rs2", "rs3", "rs4"], "A1": ["A"] * 4, "A2": ["G"] * 4, "b": bzx_hub, "se": szx_hub}
+    )
+    loc_r = smr_heidi_locus(gwas_hub, eqtl_hub, R_hub, settings="R_default")
+    assert loc_r.heidi.selected_indices == [0, 2, 3]
+    assert np.isfinite(loc_r.heidi.p_heidi)

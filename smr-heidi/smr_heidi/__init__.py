@@ -5,9 +5,11 @@ from .core import (
     LocusSMRResult,
     SMRMultiResult,
     SMRSingleResult,
+    est_cov_bxy,
     heidi_test,
     pchisqsum,
     run_locus_smr_heidi,
+    smr_heidi_locus,
     smr_multi,
     smr_single,
 )
@@ -17,9 +19,11 @@ __all__ = [
     "LocusSMRResult",
     "SMRMultiResult",
     "SMRSingleResult",
+    "est_cov_bxy",
     "heidi_test",
     "pchisqsum",
     "run_locus_smr_heidi",
+    "smr_heidi_locus",
     "smr_multi",
     "smr_single",
 ]

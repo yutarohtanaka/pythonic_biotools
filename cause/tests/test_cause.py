@@ -490,3 +490,87 @@ def test_cause_api_dataclasses_and_error_handling():
 
     with pytest.raises(ValueError):
         compare_elpd({"null": res_df.loo_null})
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(9090)
+    df = _simulate_cause_gwas(
+        rng,
+        n_snps=2500,
+        n_causal_x=120,
+        gamma=0.45,
+        eta=0.0,
+        q=0.0,
+        rho=0.45,
+        sigma_x=0.08,
+        n_pleio_snps=40,
+    )
+
+    # 1. Invalid settings raises ValueError on both est_cause_params and cause
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        est_cause_params(df, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        cause(df, pval_thresh=1e-3, settings="bad")  # type: ignore[arg-type]
+
+    # 2. Variance grid includes 2 * max and 4 * max tail SD points (4x and 16x tail variances)
+    p_def = est_cause_params(df, settings="default")
+    p_r = est_cause_params(df, settings="R_default")
+    assert p_def.grid_S1 is not None and p_r.grid_S1 is not None
+    assert p_r.grid_S1.size == p_def.grid_S1.size + 2
+    assert p_r.grid_S2.size == p_def.grid_S2.size + 2
+    np.testing.assert_allclose(p_r.grid_S1[:-2], p_def.grid_S1, rtol=1e-13)
+    assert p_r.grid_S1[-2] == pytest.approx(4.0 * p_def.grid_S1[-1], rel=1e-13)
+    assert p_r.grid_S1[-1] == pytest.approx(16.0 * p_def.grid_S1[-1], rel=1e-13)
+
+    # 3. Joint optimization of rho with arctanh(rho) ~ N(0, 0.5^2) prior in est_cause_params
+    assert p_r.converged
+    assert abs(p_r.rho - 0.45) < 0.10
+    assert p_r.n_null_snps_rho == len(df)
+    # Verify N(0, 0.5^2) prior on arctanh(rho) regularizes extreme rho toward 0 on small N
+    df_small = _simulate_cause_gwas(
+        np.random.default_rng(4242),
+        n_snps=80,
+        n_causal_x=0,
+        gamma=0.0,
+        eta=0.0,
+        q=0.0,
+        rho=0.80,
+        n_pleio_snps=0,
+    )
+    p_small_def = est_cause_params(df_small, settings="default")
+    p_small_r = est_cause_params(df_small, settings="R_default")
+    assert abs(p_small_r.rho) < abs(p_small_def.rho)
+
+    # 4. Exact sigma_g via P(|N(0, sigma_g)| > max(|b2 / b1|)) = 0.05 on SNPs with p1 < 1e-3
+    #    and default n_samples = 1000 (vs 2000 in "default")
+    res_def = cause(df, param_ests=p_def, pval_thresh=1e-3, n_grid=21, n_q=11, seed=5, settings="default")
+    res_r = cause(df, param_ests=p_r, pval_thresh=1e-3, n_grid=21, n_q=11, seed=5, settings="R_default")
+    assert res_def.n_samples == 2000 and res_def.causal.log_lik_draws.shape[0] == 2000
+    assert res_r.n_samples == 1000 and res_r.causal.log_lik_draws.shape[0] == 1000
+
+    p1_inst = 2.0 * stats.norm.sf(np.abs(res_r.beta_hat_1 / res_r.seb1))
+    strong = p1_inst < 1e-3
+    assert np.any(strong)
+    max_ratio = float(np.max(np.abs(res_r.beta_hat_2[strong] / res_r.beta_hat_1[strong])))
+    tail_prob = float(2.0 * stats.norm.sf(max_ratio, loc=0.0, scale=res_r.sigma_g))
+    assert tail_prob == pytest.approx(0.05, rel=1e-12)
+    assert res_r.p_value < 0.05
+
+    # Explicit n_samples override is respected in R_default
+    res_r_600 = cause(
+        df, param_ests=p_r, pval_thresh=1e-3, n_grid=21, n_q=11, n_samples=600, seed=5, settings="R_default"
+    )
+    assert res_r_600.n_samples == 600 and res_r_600.causal.log_lik_draws.shape[0] == 600
+
+    # Fallback when no SNPs satisfy p1 < 1e-3
+    weak_df = pd.DataFrame(
+        {
+            "snp": [f"rs_w{i}" for i in range(10)],
+            "beta_hat_1": np.linspace(0.01, 0.03, 10),
+            "seb1": np.full(10, 0.02),
+            "beta_hat_2": np.linspace(0.005, 0.015, 10),
+            "seb2": np.full(10, 0.02),
+        }
+    )
+    res_weak = cause(weak_df, n_grid=15, n_q=9, n_samples=200, seed=1, settings="R_default")
+    assert np.isfinite(res_weak.sigma_g) and res_weak.sigma_g > 0.0

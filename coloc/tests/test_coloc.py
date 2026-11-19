@@ -124,3 +124,79 @@ def test_coloc_sdy_scaling_and_table_credible_set_and_validation():
         coloc_abf(b1, se1, b2, se2, sd_y1=0.0)
     with pytest.raises(ValueError):
         r_unit.credible_set(0.0)
+
+
+def test_r_default_settings():
+    m = 60
+    se1 = np.full(m, 0.06)
+    se2 = np.full(m, 0.06)
+    b1 = np.zeros(m)
+    b2 = np.zeros(m)
+    b1[10] = 0.36
+    b2[10] = 0.34
+
+    # 1. Invalid settings and dataset_type validation
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        coloc_abf(b1, se1, b2, se2, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown dataset_type1"):
+        coloc_abf(b1, se1, b2, se2, dataset_type1="binary")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown dataset_type2"):
+        coloc_abf(b1, se1, b2, se2, dataset_type2="continuous")  # type: ignore[arg-type]
+
+    # 2. Distinct dataset_type1 / dataset_type2 auto-set Wakefield prior_w (0.15 quant vs 0.20 cc)
+    res_qc = coloc_abf(b1, se1, b2, se2, dataset_type1="quant", dataset_type2="cc")
+    res_qc_explicit = coloc_abf(b1, se1, b2, se2, prior_w1=0.15, prior_w2=0.20)
+    assert res_qc.prior_w1 == pytest.approx(0.15)
+    assert res_qc.prior_w2 == pytest.approx(0.20)
+    np.testing.assert_allclose(res_qc.lbf_trait1, res_qc_explicit.lbf_trait1, rtol=1e-14)
+    np.testing.assert_allclose(res_qc.lbf_trait2, res_qc_explicit.lbf_trait2, rtol=1e-14)
+    assert res_qc.pp_h4 == pytest.approx(res_qc_explicit.pp_h4, rel=1e-14)
+
+    res_cq = coloc_abf(b1, se1, b2, se2, dataset_type1="cc", dataset_type2="quant")
+    assert res_cq.prior_w1 == pytest.approx(0.20)
+    assert res_cq.prior_w2 == pytest.approx(0.15)
+    assert not np.isclose(res_cq.lbf_trait1[10], res_qc.lbf_trait1[10])
+
+    # Explicit per-trait or shared prior_w overrides dataset_type defaults
+    res_override = coloc_abf(b1, se1, b2, se2, prior_w1=0.12, dataset_type1="cc", dataset_type2="cc")
+    assert res_override.prior_w1 == pytest.approx(0.12)
+    assert res_override.prior_w2 == pytest.approx(0.20)
+    res_shared_w = coloc_abf(b1, se1, b2, se2, prior_w=0.18, dataset_type1="cc", dataset_type2="quant")
+    assert res_shared_w.prior_w1 == pytest.approx(0.18)
+    assert res_shared_w.prior_w2 == pytest.approx(0.18)
+
+    # 3. Upstream claudia.R:173-182 adjust_prior shrinkage + UserWarning when nsnps * p >= 1
+    m_large = 12_000
+    b1_lg = np.zeros(m_large)
+    b2_lg = np.zeros(m_large)
+    se_lg = np.full(m_large, 0.05)
+    b1_lg[500] = 0.45
+    b2_lg[500] = 0.42
+
+    with pytest.warns(UserWarning, match=r"nsnps >= 1, setting p"):
+        res_lg = coloc_abf(b1_lg, se_lg, b2_lg, se_lg, settings="R_default")
+
+    expected_p = 1.0 / float(m_large + 1)
+    assert res_lg.p1 == pytest.approx(expected_p, rel=1e-14)
+    assert res_lg.p2 == pytest.approx(expected_p, rel=1e-14)
+    assert res_lg.p12 == pytest.approx(1e-5, rel=1e-14)
+
+    res_lg_manual = coloc_abf(
+        b1_lg, se_lg, b2_lg, se_lg, p1=expected_p, p2=expected_p, p12=1e-5, settings="default"
+    )
+    assert res_lg.pp_h4 == pytest.approx(res_lg_manual.pp_h4, rel=1e-13)
+    assert res_lg.pp_h3 == pytest.approx(res_lg_manual.pp_h3, rel=1e-13)
+
+    # High explicit priors that raise ValueError in "default" are shrunk with warning in "R_default"
+    with pytest.raises(ValueError):
+        coloc_abf(b1, se1, b2, se2, p1=0.5, p2=0.4, p12=0.2, settings="default")
+    with pytest.warns(UserWarning, match=r"nsnps >= 1, setting p"):
+        res_shrunk = coloc_abf(b1, se1, b2, se2, p1=0.5, p2=0.4, p12=0.2, settings="R_default")
+    assert res_shrunk.p1 == pytest.approx(1.0 / (m + 1))
+    assert res_shrunk.p2 == pytest.approx(1.0 / (m + 1))
+    assert res_shrunk.p12 == pytest.approx(1.0 / (m + 1))
+    assert np.isclose(
+        res_shrunk.pp_h0 + res_shrunk.pp_h1 + res_shrunk.pp_h2 + res_shrunk.pp_h3 + res_shrunk.pp_h4,
+        1.0,
+        atol=1e-12,
+    )

@@ -18,6 +18,12 @@ import pandas as pd
 from scipy import optimize, stats
 
 QuadMethod = Literal["auto", "imhof", "saddlepoint", "satterthwaite"]
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 _GL16_NODES, _GL16_WEIGHTS = np.polynomial.legendre.leggauss(16)
 _EULER_M = 32
@@ -253,12 +259,13 @@ def _kuonen_saddlepoint_pvalue(q: float, lam: np.ndarray) -> float:
     lam_s = lam / scale
     x = q / scale
     mean_x = float(np.sum(lam_s))
+    sd_x = float(np.sqrt(2.0 * np.sum(lam_s**2)))
 
-    if abs(x - mean_x) <= 1e-7 * max(mean_x, 1.0):
-        return -1.0  # Signal caller to use Imhof or Satterthwaite right at the mean
+    if abs(x - mean_x) <= 1e-4 * max(sd_x, 1e-12):
+        return -1.0  # Signal caller to use fallback right at the mean
 
     def _K(z: float) -> float:
-        return float(-0.5 * np.sum(np.log(1.0 - 2.0 * z * lam_s)))
+        return float(-0.5 * np.sum(np.log1p(-2.0 * z * lam_s)))
 
     def _Kp(z: float) -> float:
         return float(np.sum(lam_s / (1.0 - 2.0 * z * lam_s)))
@@ -266,12 +273,18 @@ def _kuonen_saddlepoint_pvalue(q: float, lam: np.ndarray) -> float:
     def _Kpp(z: float) -> float:
         return float(2.0 * np.sum((lam_s / (1.0 - 2.0 * z * lam_s)) ** 2))
 
-    lmax = 0.499999 / float(np.max(lam_s))
+    inv_two_lmax = 0.5 / float(np.max(lam_s))
     if x > mean_x:
         lmin = 0.0
+        eps_hi = 1e-6
+        lmax = inv_two_lmax * (1.0 - eps_hi)
+        while _Kp(lmax) <= x and eps_hi > 1e-15:
+            eps_hi *= 0.1
+            lmax = inv_two_lmax * (1.0 - eps_hi)
     else:
+        lmax = 0.0
         lmin = -0.5 * len(lam_s) / max(x, 1e-300)
-        while _Kp(lmin) > x:
+        while _Kp(lmin) >= x:
             lmin *= 2.0
 
     fa = _Kp(lmin) - x
@@ -285,7 +298,7 @@ def _kuonen_saddlepoint_pvalue(q: float, lam: np.ndarray) -> float:
         return -1.0
     w = float(np.sign(zeta) * np.sqrt(val_term))
     u = float(zeta * np.sqrt(_Kpp(zeta)))
-    if abs(w) < 1e-6 or u <= 0.0:
+    if abs(w) < 1e-4 or (u / w) <= 0.0:
         return -1.0
     z_star = w + np.log(u / w) / w
     p = float(stats.norm.sf(z_star))
@@ -311,7 +324,8 @@ def pchisqsum(
     q: float,
     weights: Sequence[float] | np.ndarray,
     *,
-    method: QuadMethod = "auto",
+    method: QuadMethod | None = None,
+    settings: SettingsMode = "default",
 ) -> float:
     """Evaluate Pr(sum_l weights_l * chi^2_1 >= q) for positive quadratic-form weights.
 
@@ -321,12 +335,15 @@ def pchisqsum(
         Observed quadratic-form statistic.
     weights : array-like
         Eigenvalues / positive weights of independent 1-df central chi-square variables.
-    method : {'auto', 'imhof', 'saddlepoint', 'satterthwaite'}, default='auto'
-        In `'auto'` mode, uses exact Imhof numerical integration for bulk/moderate tails
-        (`p > 1e-7`) and switches to Kuonen's saddlepoint approximation in extreme tails
-        (`p <= 1e-7`) where floating-point cancellation limits `0.5 + integral`, with
-        Satterthwaite moment-matching fallback.
+    method : {'auto', 'imhof', 'saddlepoint', 'satterthwaite'}, optional
+        In `'default'` settings, defaults to `'auto'` (exact Imhof integration for `p > 1e-7`
+        and Kuonen saddlepoint for `p <= 1e-7`, with Satterthwaite fallback).
+        In `'R_default'` settings, defaults to Kuonen (1999) saddlepoint approximation with
+        Satterthwaite two-moment fallback matching YangLab C++ `StatFunc::pchisqsum`.
+    settings : {'default', 'R_default'}, default='default'
+        Execution mode (`'default'` or `'R_default'`).
     """
+    _validate_settings(settings)
     if not np.isfinite(q):
         raise ValueError("Statistic q must be finite.")
     w_arr = np.asarray(weights, dtype=np.float64).ravel()
@@ -344,14 +361,21 @@ def pchisqsum(
     if pos.size == 1:
         return float(stats.chi2.sf(q / pos[0], df=1))
 
-    if method == "satterthwaite":
-        return _satterthwaite_pvalue(q, pos)
-    if method == "imhof":
-        return _imhof_pvalue(q, pos)
-    if method == "saddlepoint":
+    if settings == "R_default" and method is None:
         p_sp = _kuonen_saddlepoint_pvalue(q, pos)
-        return p_sp if p_sp >= 0.0 else _imhof_pvalue(q, pos)
-    if method == "auto":
+        return p_sp if p_sp >= 0.0 else _satterthwaite_pvalue(q, pos)
+
+    eff_method: str = "auto" if method is None else method
+    if eff_method == "satterthwaite":
+        return _satterthwaite_pvalue(q, pos)
+    if eff_method == "imhof":
+        return _imhof_pvalue(q, pos)
+    if eff_method == "saddlepoint":
+        p_sp = _kuonen_saddlepoint_pvalue(q, pos)
+        if p_sp >= 0.0:
+            return p_sp
+        return _satterthwaite_pvalue(q, pos) if settings == "R_default" else _imhof_pvalue(q, pos)
+    if eff_method == "auto":
         # Check saddlepoint first if far out in the right tail; use exact Imhof when p > 1e-7
         p_sp = _kuonen_saddlepoint_pvalue(q, pos)
         if 0.0 <= p_sp <= 1e-7:
@@ -362,7 +386,7 @@ def pchisqsum(
         if p_sp >= 0.0:
             return p_sp
         return _satterthwaite_pvalue(q, pos)
-    raise ValueError(f"Unknown pchisqsum method '{method}'.")
+    raise ValueError(f"Unknown pchisqsum method '{eff_method}'.")
 
 
 def smr_single(
@@ -372,8 +396,10 @@ def smr_single(
     se_zx: float,
     *,
     snp_id: str = "top_snp",
+    settings: SettingsMode = "default",
 ) -> SMRSingleResult:
     """Compute single-instrument SMR estimate, Delta-method SE, T_SMR, and p_SMR (Zhu et al., 2016)."""
+    _validate_settings(settings)
     vals = np.array([b_zy, se_zy, b_zx, se_zx], dtype=np.float64)
     if not np.all(np.isfinite(vals)):
         raise ValueError("b_zy, se_zy, b_zx, se_zx must all be finite.")
@@ -449,6 +475,40 @@ def _validate_locus_inputs(
     return bzy, szy, bzx, szx, R_sym, ids
 
 
+def est_cov_bxy(
+    b_zy: Sequence[float] | np.ndarray,
+    se_zy: Sequence[float] | np.ndarray,
+    b_zx: Sequence[float] | np.ndarray,
+    se_zx: Sequence[float] | np.ndarray,
+    ld_matrix: np.ndarray,
+    *,
+    settings: SettingsMode = "default",
+) -> np.ndarray:
+    """Compute m x m sampling covariance Cov(b_xy(i), b_xy(j)) across dependent cis-instruments.
+
+    In `'default'` mode, uses the second-order expression of Zhu et al. (2016) Eq. 9.
+    In `'R_default'` mode, includes the upstream YangLab `SMR_data.cpp` fourth-order
+    `- b_xy_i * b_xy_j / (z_zx_i^2 * z_zx_j^2)` bias-product correction plus `1e-8` diagonal ridge.
+    """
+    _validate_settings(settings)
+    bzy, szy, bzx, szx, R_sub, _ = _validate_locus_inputs(b_zy, se_zy, b_zx, se_zx, ld_matrix, None)
+    if np.any(bzx == 0.0):
+        raise ValueError("eQTL effects b_zx must be non-zero in est_cov_bxy.")
+    bxy = bzy / bzx
+    z_zx = bzx / szx
+    ratio_gwas = szy / bzx
+    if settings == "default":
+        ratio_eqtl = bxy / z_zx
+        return R_sub * np.outer(ratio_gwas, ratio_gwas) + R_sub * np.outer(ratio_eqtl, ratio_eqtl)
+
+    z_zx2 = z_zx**2
+    cov = R_sub * np.outer(ratio_gwas, ratio_gwas) + np.outer(bxy, bxy) * (
+        R_sub / np.outer(z_zx, z_zx) - 1.0 / np.outer(z_zx2, z_zx2)
+    )
+    cov[np.diag_indices_from(cov)] += 1e-8
+    return cov
+
+
 def _cov_bxy_zhu2016(
     bzy: np.ndarray,
     szy: np.ndarray,
@@ -457,11 +517,55 @@ def _cov_bxy_zhu2016(
     R_sub: np.ndarray,
 ) -> np.ndarray:
     """Compute exact m x m sampling covariance Cov(b_xy(i), b_xy(j)) per Zhu et al. (2016) Eq. 9."""
-    bxy = bzy / bzx
-    z_zx = bzx / szx
-    ratio_gwas = szy / bzx
-    ratio_eqtl = bxy / z_zx
-    return R_sub * np.outer(ratio_gwas, ratio_gwas) + R_sub * np.outer(ratio_eqtl, ratio_eqtl)
+    return est_cov_bxy(bzy, szy, bzx, szx, R_sub, settings="default")
+
+
+def _rm_cor_sbat(
+    R_cand: np.ndarray,
+    z_abs: np.ndarray,
+    r2_thresh: float,
+    protected: set[int] | None = None,
+) -> list[int]:
+    """YangLab `rm_cor_sbat` degree-based iterative LD pruning.
+
+    Iteratively counts how many remaining SNPs each active SNP has `|r| > sqrt(r2_thresh)` with,
+    removing the unprotected SNP with the highest degree (> 0) and breaking ties by removing the
+    SNP with smaller `|z_zx|` (and later position on exact ties), until max degree is 0.
+    """
+    k = R_cand.shape[0]
+    if k <= 1:
+        return list(range(k))
+    r_max = float(np.sqrt(r2_thresh))
+    prot = set() if protected is None else set(protected)
+    active = np.ones(k, dtype=bool)
+    adj = np.abs(R_cand) > r_max
+    np.fill_diagonal(adj, False)
+
+    # Ensure no unprotected SNP violates r_max against a protected SNP
+    for p_idx in prot:
+        if 0 <= p_idx < k and active[p_idx]:
+            violators = np.flatnonzero(adj[p_idx] & active)
+            for v_idx in violators:
+                if int(v_idx) not in prot:
+                    active[v_idx] = False
+
+    while True:
+        act_idx = np.flatnonzero(active)
+        if act_idx.size <= 1:
+            break
+        deg = np.sum(adj[np.ix_(act_idx, act_idx)], axis=1)
+        if int(np.max(deg)) == 0:
+            break
+        unprot_mask = np.array([int(i) not in prot for i in act_idx], dtype=bool)
+        unprot_pos = np.flatnonzero(unprot_mask & (deg > 0))
+        if unprot_pos.size == 0:
+            break
+        max_deg = int(np.max(deg[unprot_pos]))
+        ties = act_idx[unprot_pos[deg[unprot_pos] == max_deg]]
+        rm_idx = int(min(ties, key=lambda idx: (float(z_abs[int(idx)]), -int(idx))))
+        active[rm_idx] = False
+
+    return [int(i) for i in np.flatnonzero(active)]
 
 
 def heidi_test(
@@ -478,9 +582,11 @@ def heidi_test(
     ld_min_r2: float = 0.05,
     max_snps: int = 20,
     min_snps: int = 3,
-    p_method: QuadMethod = "auto",
+    p_method: QuadMethod | None = None,
+    settings: SettingsMode = "default",
 ) -> HeidiResult:
     """Run the HEIDI test for heterogeneity in dependent cis-instruments (Zhu et al., 2016 Eqs. 7-11)."""
+    _validate_settings(settings)
     if not (0.0 < p_het <= 1.0):
         raise ValueError("p_het must lie in (0, 1].")
     if not (0.0 <= ld_min_r2 < ld_top_r2 <= 1.0):
@@ -515,14 +621,19 @@ def heidi_test(
     cand_indices = np.flatnonzero(cand_mask)
     cand_ordered = cand_indices[np.argsort(-z_zx_sq[cand_indices], kind="mergesort")]
 
-    # Greedy pairwise LD pruning (r^2 <= ld_top_r2) up to max_snps total SNPs
-    selected = [t_idx]
-    for c in cand_ordered:
-        if len(selected) >= max_snps:
-            break
-        r2_to_sel = R[int(c), selected] ** 2
-        if np.all(r2_to_sel <= ld_top_r2):
-            selected.append(int(c))
+    if settings == "R_default":
+        cand_all = np.concatenate([np.array([t_idx], dtype=int), cand_ordered.astype(int)])
+        kept_rel = _rm_cor_sbat(R[np.ix_(cand_all, cand_all)], np.abs(z_zx[cand_all]), ld_top_r2, protected={0})
+        selected = [int(cand_all[i]) for i in kept_rel[:max_snps]]
+    else:
+        # Greedy pairwise LD pruning (r^2 <= ld_top_r2) up to max_snps total SNPs
+        selected = [t_idx]
+        for c in cand_ordered:
+            if len(selected) >= max_snps:
+                break
+            r2_to_sel = R[int(c), selected] ** 2
+            if np.all(r2_to_sel <= ld_top_r2):
+                selected.append(int(c))
 
     sel_arr = np.asarray(selected, dtype=int)
     sel_snps = [ids[i] for i in selected]
@@ -545,7 +656,7 @@ def heidi_test(
         )
 
     R_sub = R[np.ix_(sel_arr, sel_arr)]
-    cov_bxy = _cov_bxy_zhu2016(bzy[sel_arr], szy[sel_arr], bzx[sel_arr], szx[sel_arr], R_sub)
+    cov_bxy = est_cov_bxy(bzy[sel_arr], szy[sel_arr], bzx[sel_arr], szx[sel_arr], R_sub, settings=settings)
 
     # Deviation d_i = b_xy(i) - b_xy(top) for i = 1..k (k = m - 1)
     d_vec = bxy_sel[1:] - bxy_sel[0]
@@ -564,7 +675,7 @@ def heidi_test(
     t_heidi = float(np.sum(z_d**2))
     eigs = np.linalg.eigvalsh(psi)
     eigs_clamped = np.maximum(eigs, 0.0)
-    p_heidi = pchisqsum(t_heidi, eigs_clamped, method=p_method)
+    p_heidi = pchisqsum(t_heidi, eigs_clamped, method=p_method, settings=settings)
 
     return HeidiResult(
         top_snp=ids[t_idx],
@@ -593,9 +704,11 @@ def smr_multi(
     p_eqtl_thresh: float = 5e-8,
     ld_prune_r2: float = 0.1,
     max_snps: int | None = None,
-    p_method: QuadMethod = "auto",
+    p_method: QuadMethod | None = None,
+    settings: SettingsMode = "default",
 ) -> SMRMultiResult:
     """Run multi-cis-SNP SMR omnibus test across LD-pruned cis-xQTLs (Wu et al., Nat Commun 2018)."""
+    _validate_settings(settings)
     if not (0.0 < p_eqtl_thresh <= 1.0):
         raise ValueError("p_eqtl_thresh must lie in (0, 1].")
     if not (0.0 < ld_prune_r2 <= 1.0):
@@ -612,12 +725,18 @@ def smr_multi(
         raise ValueError(f"No cis-SNPs passed p_eqtl_thresh = {p_eqtl_thresh:g}.")
 
     ordered = cand[np.argsort(-z_zx_sq[cand], kind="mergesort")]
-    selected: list[int] = []
-    for c in ordered:
-        if max_snps is not None and len(selected) >= max_snps:
-            break
-        if not selected or np.all((R[int(c), selected] ** 2) <= ld_prune_r2):
-            selected.append(int(c))
+    if settings == "R_default":
+        kept_rel = _rm_cor_sbat(R[np.ix_(ordered, ordered)], np.abs(z_zx[ordered]), ld_prune_r2)
+        selected = [int(ordered[i]) for i in kept_rel]
+        if max_snps is not None:
+            selected = selected[:max_snps]
+    else:
+        selected = []
+        for c in ordered:
+            if max_snps is not None and len(selected) >= max_snps:
+                break
+            if not selected or np.all((R[int(c), selected] ** 2) <= ld_prune_r2):
+                selected.append(int(c))
 
     sel_arr = np.asarray(selected, dtype=int)
     z_zx2_sel = z_zx_sq[sel_arr]
@@ -628,14 +747,17 @@ def smr_multi(
 
     R_sub = R[np.ix_(sel_arr, sel_arr)]
     eigs = np.maximum(np.linalg.eigvalsh(0.5 * (R_sub + R_sub.T)), 0.0)
-    p_multi = pchisqsum(t_sum, eigs, method=p_method)
+    p_multi = pchisqsum(t_sum, eigs, method=p_method, settings=settings)
 
     # Inverse-covariance GLS pooled b_xy across the selected cis-SNPs
     bxy_sel = bzy[sel_arr] / bzx[sel_arr]
-    cov_bxy = _cov_bxy_zhu2016(bzy[sel_arr], szy[sel_arr], bzx[sel_arr], szx[sel_arr], R_sub)
-    reg = 1e-10 * max(float(np.mean(np.diag(cov_bxy))), 1e-12) * np.eye(len(selected))
+    cov_bxy = est_cov_bxy(bzy[sel_arr], szy[sel_arr], bzx[sel_arr], szx[sel_arr], R_sub, settings=settings)
     ones = np.ones(len(selected), dtype=np.float64)
-    cinv_ones = np.linalg.solve(cov_bxy + reg, ones)
+    if settings == "R_default":
+        cinv_ones = np.linalg.solve(cov_bxy, ones)
+    else:
+        reg = 1e-10 * max(float(np.mean(np.diag(cov_bxy))), 1e-12) * np.eye(len(selected))
+        cinv_ones = np.linalg.solve(cov_bxy + reg, ones)
     var_gls = float(1.0 / np.sum(cinv_ones))
     b_gls = float(var_gls * (cinv_ones @ bxy_sel))
 
@@ -678,9 +800,11 @@ def run_locus_smr_heidi(
     p_smr_multi_thresh: float = 5e-8,
     ld_multi_r2: float = 0.1,
     drop_incompatible: bool = True,
-    p_method: QuadMethod = "auto",
+    p_method: QuadMethod | None = None,
+    settings: SettingsMode = "default",
 ) -> LocusSMRResult:
     """Harmonize GWAS + xQTL DataFrames + signed LD matrix `R` and execute SMR, HEIDI, and SMR-multi."""
+    _validate_settings(settings)
     g_snp = _find_col(gwas_df, ("snp", "rsid", "id", "variant_id"), "GWAS SNP")
     g_a1 = _find_col(gwas_df, ("a1", "ea", "effect_allele", "alt"), "GWAS A1")
     g_a2 = _find_col(gwas_df, ("a2", "oa", "other_allele", "ref"), "GWAS A2")
@@ -794,7 +918,9 @@ def run_locus_smr_heidi(
     snps = list(harm["snp"])
 
     top_idx = int(np.argmax((bzx / szx) ** 2))
-    smr_res = smr_single(bzy[top_idx], szy[top_idx], bzx[top_idx], szx[top_idx], snp_id=snps[top_idx])
+    smr_res = smr_single(
+        bzy[top_idx], szy[top_idx], bzx[top_idx], szx[top_idx], snp_id=snps[top_idx], settings=settings
+    )
     heidi_res = heidi_test(
         bzy,
         szy,
@@ -809,6 +935,7 @@ def run_locus_smr_heidi(
         max_snps=max_heidi_snps,
         min_snps=min_heidi_snps,
         p_method=p_method,
+        settings=settings,
     )
 
     p_eqtl_min = float(np.min(stats.chi2.sf((bzx / szx) ** 2, df=1)))
@@ -823,6 +950,7 @@ def run_locus_smr_heidi(
             p_eqtl_thresh=p_smr_multi_thresh,
             ld_prune_r2=ld_multi_r2,
             p_method=p_method,
+            settings=settings,
         )
     else:
         multi_res = None
@@ -849,3 +977,6 @@ def run_locus_smr_heidi(
         smr_multi=multi_res,
         harmonized_snps=harm_out,
     )
+
+
+smr_heidi_locus = run_locus_smr_heidi

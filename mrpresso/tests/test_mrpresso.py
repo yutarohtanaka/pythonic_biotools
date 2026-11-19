@@ -270,3 +270,108 @@ def test_invalid_inputs_raise_value_error():
         mr_presso(by, bx, sy, sx, signif_threshold=1.5)
     with pytest.raises(ValueError, match="nb_distribution"):
         mr_presso(by, bx, sy, sx, nb_distribution=5)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(2026)
+    n = 30
+    bx = rng.uniform(0.08, 0.25, size=n)
+    sx = rng.uniform(0.015, 0.030, size=n)
+    sy = rng.uniform(0.012, 0.028, size=n)
+    true_beta = 0.45
+    by = true_beta * bx + rng.normal(0.0, sy * 0.6)
+    # Plant two strong directional pleiotropy outliers
+    by[4] += 0.25
+    by[19] += 0.28
+
+    # 1. Invalid settings raises ValueError across entrypoints
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        mr_presso(by, bx, sy, sx, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        mvmr_presso(
+            by,
+            np.column_stack([bx, bx * 0.5 + 0.02]),
+            sy,
+            np.column_stack([sx, sx]),
+            settings="bad",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+        leave_one_out_ivw(by, bx, sy, settings="bad")  # type: ignore[arg-type]
+
+    # 2. Defaults in R_default: weighted_rss=True, nb_distribution=1000; explicit overrides respected
+    res_def = mr_presso(by, bx, sy, sx, seed=11, settings="default")
+    res_r = mr_presso(by, bx, sy, sx, seed=11, settings="R_default")
+    assert res_def.weighted_rss is False and res_def.nb_distribution == 5000
+    assert res_r.weighted_rss is True and res_r.nb_distribution == 1000
+
+    res_r_custom = mr_presso(
+        by, bx, sy, sx, nb_distribution=400, weighted_rss=False, seed=11, settings="R_default"
+    )
+    assert res_r_custom.weighted_rss is False and res_r_custom.nb_distribution == 400
+
+    # 3. Weighted RSS matches 1 / sy^2 weighting in getRSS_LOO
+    loo_b_r, rss_j_r, rss_tot_r = leave_one_out_ivw(by, bx, sy, settings="R_default")
+    expected_rss_j = ((by - loo_b_r * bx) ** 2) / (sy**2)
+    np.testing.assert_allclose(rss_j_r, expected_rss_j, rtol=1e-13)
+    assert np.isclose(res_r.rss_obs, rss_tot_r, rtol=1e-13)
+
+    # 4. Raw count / K empirical p-values (0 / K == 0.0 vs (0 + 1) / (K + 1))
+    res_def_k = mr_presso(by, bx, sy, sx, nb_distribution=500, seed=99, settings="default")
+    res_r_k = mr_presso(by, bx, sy, sx, nb_distribution=500, seed=99, settings="R_default")
+    assert res_def_k.p_global == pytest.approx(1.0 / 501.0)
+    assert res_r_k.p_global == 0.0
+    assert set(res_r_k.outlier_indices) == {4, 19}
+    assert res_r_k.p_distortion == 0.0
+    assert res_def_k.p_distortion >= 1.0 / 501.0
+
+    # 5. Simulated Outlier Test uses fixed observed LOO slope (mr_presso.R L103-105)
+    from mrpresso.core import _canonicalize_signs, _simulate_rss_univariable
+
+    X_canon, y_canon = _canonicalize_signs(bx[:, None], by)
+    x_c = X_canon[:, 0]
+    loo_c, r_obs_sq_c, _ = leave_one_out_ivw(y_canon, x_c, sy, weighted_rss=True)
+    pred_c = loo_c * x_c
+    w = 1.0 / (sy**2)
+
+    K = 200
+    _, p_emp_r, exp_rss_r = _simulate_rss_univariable(
+        x_c, sx, pred_c, sy, w, r_obs_sq_c, K, True, np.random.default_rng(321),
+        loo_betas_obs=loo_c, settings="R_default",
+    )
+    _, p_emp_def, exp_rss_def = _simulate_rss_univariable(
+        x_c, sx, pred_c, sy, w, r_obs_sq_c, K, True, np.random.default_rng(321),
+        loo_betas_obs=loo_c, settings="default",
+    )
+
+    # Direct single-batch reference against fixed observed LOO slope
+    ref_rng = np.random.default_rng(321)
+    x_sim_ref = x_c[None, :] + sx[None, :] * ref_rng.standard_normal((K, n))
+    y_sim_ref = pred_c[None, :] + sy[None, :] * ref_rng.standard_normal((K, n))
+    r_sq_fixed_ref = ((y_sim_ref - x_sim_ref * loo_c[None, :]) ** 2) * w[None, :]
+    np.testing.assert_allclose(exp_rss_r, np.mean(r_sq_fixed_ref, axis=0), rtol=1e-13)
+    np.testing.assert_allclose(p_emp_r, np.mean(r_sq_fixed_ref >= r_obs_sq_c[None, :], axis=0), rtol=1e-13)
+    assert not np.allclose(exp_rss_r, exp_rss_def)
+
+    # 6. Distortion Test BiasObs = (Beta_all - Beta_no_outliers) / |Beta_no_outliers| with raw count / K
+    from mrpresso.core import _bootstrap_distortion
+
+    keep = np.ones(n, dtype=bool)
+    keep[[4, 19]] = False
+    b_raw_arr = np.array([res_r.beta_raw])
+    b_corr_arr = np.array([res_r.beta_corrected])
+    dc_r, pd_r, _ = _bootstrap_distortion(
+        X_canon[keep], y_canon[keep], w[keep], b_raw_arr, b_corr_arr, 300,
+        np.random.default_rng(777), settings="R_default",
+    )
+    boot_rng = np.random.default_rng(777)
+    n_val = int(np.sum(keep))
+    idx_b = boot_rng.integers(0, n_val, size=(300, n_val))
+    xb = X_canon[keep][idx_b, 0]
+    yb = y_canon[keep][idx_b]
+    wb = w[keep][idx_b]
+    b_boot = np.sum(wb * xb * yb, axis=1) / np.sum(wb * (xb**2), axis=1)
+    bias_obs_ref = (b_raw_arr[0] - b_corr_arr[0]) / abs(b_corr_arr[0])
+    bias_exp_ref = (b_boot - b_corr_arr[0]) / abs(b_corr_arr[0])
+    p_dist_ref = float(np.mean(np.abs(bias_exp_ref) >= abs(bias_obs_ref)))
+    assert np.isclose(dc_r[0], 100.0 * bias_obs_ref, rtol=1e-13)
+    assert np.isclose(pd_r[0], p_dist_ref, rtol=1e-13)

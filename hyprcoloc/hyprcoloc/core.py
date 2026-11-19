@@ -84,6 +84,7 @@ class HyPrColocResult:
     align_thresh: float
     bb_selection: str
     uniform_priors: bool
+    settings: str = "default"
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return tidy cluster table matching R `hyprcoloc(...)$results`."""
@@ -212,12 +213,28 @@ def _resolve_prior_w(
     return np.where(bin_arr.astype(bool), 0.20, 0.15)
 
 
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+    return settings  # type: ignore[return-value]
+
+
+def _resolve_reg_steps(reg_steps: int | None, settings: Literal["default", "R_default"]) -> int:
+    if reg_steps is None:
+        return 1 if settings == "R_default" else 2
+    rs = int(reg_steps)
+    if rs not in (0, 1, 2):
+        raise ValueError(f"reg_steps must be 0, 1, or 2 (got {reg_steps!r}).")
+    return rs
+
+
 def log_abf(
     betas: np.ndarray | pd.DataFrame,
     ses: np.ndarray | pd.DataFrame,
     *,
     binary_outcomes: Sequence[bool | int] | np.ndarray | None = None,
     prior_w: float | Sequence[float] | np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> np.ndarray:
     """Compute Wakefield log Approximate Bayes Factors (H1 vs H0) of shape `(M, Q)`.
 
@@ -225,6 +242,7 @@ def log_abf(
     and `W = 0.20` for binary case-control traits (`binary_outcomes=True`), unless overridden
     via `prior_w`.
     """
+    _validate_settings(settings)
     b = np.asarray(betas, dtype=np.float64)
     s = np.asarray(ses, dtype=np.float64)
     if b.ndim != 2 or s.ndim != 2 or b.shape != s.shape:
@@ -245,15 +263,25 @@ def log_abf(
     return 0.5 * np.log(1.0 - r) + 0.5 * r * z_sq
 
 
-def _log_config_priors(max_k: int, prior_1: float, prior_c: float, uniform_priors: bool) -> np.ndarray:
+def _log_config_priors(
+    max_k: int,
+    prior_1: float,
+    prior_c: float,
+    uniform_priors: bool,
+    *,
+    n_snps: int = 1,
+    settings: Literal["default", "R_default"] = "default",
+) -> np.ndarray:
     """Compute log(pi_k) for k = 0, 1, ..., max_k per Foley et al. (2021)."""
     log_pi = np.zeros(max_k + 1, dtype=np.float64)
-    if max_k >= 1:
-        log_pi[1] = np.log(prior_1)
     if uniform_priors:
-        for k in range(2, max_k + 1):
-            log_pi[k] = np.log(prior_1)
+        p1_eff = (prior_1 / float(n_snps)) if settings == "R_default" else prior_1
+        log_p1_eff = np.log(p1_eff)
+        for k in range(1, max_k + 1):
+            log_pi[k] = log_p1_eff
     else:
+        if max_k >= 1:
+            log_pi[1] = np.log(prior_1)
         gamma = 1.0 - prior_c
         for k in range(2, max_k + 1):
             # Step probability for adding k-th trait given k-1 traits: 1 - gamma^(k-1)
@@ -328,6 +356,9 @@ def _compute_subset_posteriors(
     log_pi: np.ndarray,
     uniform_priors: bool,
     *,
+    prior_1: float = 1e-4,
+    reg_steps: int = 2,
+    settings: Literal["default", "R_default"] = "default",
     betas: np.ndarray | None = None,
     ses: np.ndarray | None = None,
     w_vec: np.ndarray | None = None,
@@ -432,19 +463,32 @@ def _compute_subset_posteriors(
             log_d_terms[q_pos] = shift_a + shift_b + np.log(max(quad, 1e-300))
 
     sym_factor = -np.log(2.0) if m_traits == 2 else 0.0
-    log_prior_split = (
-        float(log_pi[1]) if uniform_priors else float(log_pi[m_traits - 1] + log_pi[1])
-    )
+    if uniform_priors and settings == "R_default":
+        if n_snps > 1:
+            p_m_1 = prior_1 / (float(m_traits) * float(n_snps) * float(n_snps - 1))
+            if m_traits == 2:
+                p_m_1 *= 2.0
+            log_prior_split = float(np.log(p_m_1))
+        else:
+            log_prior_split = float(log_pi[1])
+    else:
+        log_prior_split = (
+            float(log_pi[1]) if uniform_priors else float(log_pi[m_traits - 1] + log_pi[1])
+        )
     log_l_align_alt = log_prior_split + sym_factor + float(special.logsumexp(log_d_terms))
 
     log_l_reg_num = float(np.logaddexp(log_l_all, log_l_align_alt))
     p_align = float(np.exp(log_l_all - log_l_reg_num))
 
-    # Regional non-shared hypotheses (0 traits H0, m-1 traits, and m-2 traits via Newton O(M m) identity)
+    # Regional non-shared hypotheses (0 traits H0, m-1 traits, and optional m-2 traits via Newton O(M m) identity)
     log_l_0 = 0.0
     log_l_m_minus_1 = float(log_pi[m_traits - 1] + special.logsumexp(log_w_minus_1))
+    if settings == "R_default" and m_traits == 2:
+        log_l_m_minus_1 += float(np.log(0.25))
 
-    if m_traits == 2:
+    if reg_steps == 0:
+        log_non_reg = log_l_0
+    elif reg_steps == 1 or m_traits == 2:
         log_non_reg = float(np.logaddexp(log_l_0, log_l_m_minus_1))
     else:
         # Exact O(M m) 2-trait-dropped sum via Newton identity:
@@ -458,8 +502,12 @@ def _compute_subset_posteriors(
         log_l_m_minus_2 = float(log_pi[m_traits - 2] + log_w_minus_2)
         log_non_reg = float(special.logsumexp([log_l_0, log_l_m_minus_1, log_l_m_minus_2]))
 
-    log_total = float(np.logaddexp(log_l_reg_num, log_non_reg))
-    p_reg = float(np.exp(log_l_reg_num - log_total))
+    if settings == "R_default":
+        log_reg_denom = float(np.logaddexp(log_l_all, log_non_reg))
+        p_reg = float(np.exp(log_l_all - log_reg_denom))
+    else:
+        log_total = float(np.logaddexp(log_l_reg_num, log_non_reg))
+        p_reg = float(np.exp(log_l_reg_num - log_total))
     pp_coloc = float(p_reg * p_align)
 
     snp_post = np.exp(s_lbf - log_w_all)
@@ -480,10 +528,14 @@ def subset_coloc(
     prior_c: float = 0.02,
     prior_2: float | None = None,
     uniform_priors: bool = False,
+    reg_steps: int | None = None,
     trait_cor: np.ndarray | None = None,
     ld_matrix: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> SubsetColocResult:
     """Evaluate exact O(M |S|) HyPrColoc regional, alignment, and joint posteriors for a fixed subset S."""
+    mode_settings = _validate_settings(settings)
+    rs = _resolve_reg_steps(reg_steps, mode_settings)
     b_arr, s_arr, t_names, s_ids = _extract_matrices(betas, ses, trait_names, snp_ids)
     m_snps, q_traits = b_arr.shape
     if q_traits < 2:
@@ -512,13 +564,18 @@ def subset_coloc(
         if len(set(sub_idx)) != len(sub_idx) or len(sub_idx) < 2:
             raise ValueError("trait_subset must contain >= 2 distinct traits.")
 
-    lbf_mat = log_abf(b_arr, s_arr, prior_w=w_vec)
-    log_pi = _log_config_priors(len(sub_idx), prior_1, pc, uniform_priors)
+    lbf_mat = log_abf(b_arr, s_arr, prior_w=w_vec, settings=mode_settings)
+    log_pi = _log_config_priors(
+        len(sub_idx), prior_1, pc, uniform_priors, n_snps=m_snps, settings=mode_settings
+    )
     p_reg, p_align, pp_coloc, snp_post = _compute_subset_posteriors(
         lbf_mat,
         sub_idx,
         log_pi,
         uniform_priors,
+        prior_1=prior_1,
+        reg_steps=rs,
+        settings=mode_settings,
         betas=b_arr,
         ses=s_arr,
         w_vec=w_vec,
@@ -609,15 +666,22 @@ def hyprcoloc(
     prior_c: float = 0.02,
     prior_2: float | None = None,
     uniform_priors: bool = False,
-    reg_thresh: float = 0.5,
-    align_thresh: float = 0.5,
+    reg_thresh: float | None = None,
+    align_thresh: float | None = None,
+    reg_steps: int | None = None,
     bb_alg: bool = True,
     bb_selection: str = "regional",
     trait_cor: np.ndarray | None = None,
     ld_matrix: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> HyPrColocResult:
     """Run HyPrColoc divisive branch-and-bound multi-trait colocalization (Foley et al., 2021)."""
-    if not (0.0 < reg_thresh < 1.0) or not (0.0 < align_thresh < 1.0):
+    mode_settings = _validate_settings(settings)
+    default_thresh = 0.7 if mode_settings == "R_default" else 0.5
+    rt = default_thresh if reg_thresh is None else float(reg_thresh)
+    at = default_thresh if align_thresh is None else float(align_thresh)
+    rs = _resolve_reg_steps(reg_steps, mode_settings)
+    if not (0.0 < rt < 1.0) or not (0.0 < at < 1.0):
         raise ValueError("reg_thresh and align_thresh must lie strictly in (0, 1).")
     mode = _normalize_bb_selection(bb_selection)
     pc = _resolve_prior_c(prior_1, prior_c, prior_2)
@@ -628,8 +692,10 @@ def hyprcoloc(
     t_cor = _validate_corr_matrix(trait_cor, q_traits, "trait_cor", require_pd=True) if trait_cor is not None else None
     ld_mat = _validate_corr_matrix(ld_matrix, m_snps, "ld_matrix", require_pd=False) if ld_matrix is not None else None
 
-    lbf_mat = log_abf(b_arr, s_arr, prior_w=w_vec)
-    log_pi = _log_config_priors(q_traits, prior_1, pc, uniform_priors)
+    lbf_mat = log_abf(b_arr, s_arr, prior_w=w_vec, settings=mode_settings)
+    log_pi = _log_config_priors(
+        q_traits, prior_1, pc, uniform_priors, n_snps=m_snps, settings=mode_settings
+    )
     single_trait_evidence = special.logsumexp(lbf_mat, axis=0)
 
     def _eval(sub: list[int]) -> tuple[float, float, float, np.ndarray]:
@@ -638,6 +704,9 @@ def hyprcoloc(
             sub,
             log_pi,
             uniform_priors,
+            prior_1=prior_1,
+            reg_steps=rs,
+            settings=mode_settings,
             betas=b_arr,
             ses=s_arr,
             w_vec=w_vec,
@@ -679,10 +748,11 @@ def hyprcoloc(
             lbf_matrix=lbf_mat,
             prior_1=prior_1,
             prior_c=pc,
-            reg_thresh=reg_thresh,
-            align_thresh=align_thresh,
+            reg_thresh=rt,
+            align_thresh=at,
             bb_selection=mode,
             uniform_priors=uniform_priors,
+            settings=mode_settings,
         )
 
     remaining = list(range(q_traits))
@@ -695,8 +765,8 @@ def hyprcoloc(
 
         while len(current) >= 2:
             pr, pa, pp, sp = _eval(current)
-            passes_reg = pr > reg_thresh
-            passes_align = True if mode == "reg_only" else (pa > align_thresh)
+            passes_reg = pr > rt
+            passes_align = True if mode == "reg_only" else (pa > at)
 
             if passes_reg and passes_align:
                 clusters.append(_make_cluster(len(clusters) + 1, current, pr, pa, pp, sp))
@@ -741,10 +811,11 @@ def hyprcoloc(
         lbf_matrix=lbf_mat,
         prior_1=prior_1,
         prior_c=pc,
-        reg_thresh=reg_thresh,
-        align_thresh=align_thresh,
+        reg_thresh=rt,
+        align_thresh=at,
         bb_selection=mode,
         uniform_priors=uniform_priors,
+        settings=mode_settings,
     )
 
 
@@ -759,11 +830,15 @@ def sensitivity_analysis(
     prior_c_grid: Sequence[float] = (0.05, 0.02, 0.01, 0.005),
     reg_thresh_grid: Sequence[float] = (0.6, 0.7, 0.8),
     align_thresh_grid: Sequence[float] = (0.6, 0.7, 0.8),
+    uniform_priors: bool = False,
+    reg_steps: int | None = None,
     bb_selection: str = "regional",
     trait_cor: np.ndarray | None = None,
     ld_matrix: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> SensitivityResult:
     """Evaluate pairwise trait co-clustering similarity across grids of priors and thresholds."""
+    mode_settings = _validate_settings(settings)
     b_arr, s_arr, t_names, s_ids = _extract_matrices(betas, ses, trait_names, snp_ids)
     q_traits = b_arr.shape[1]
     co_counts = np.zeros((q_traits, q_traits), dtype=np.float64)
@@ -781,11 +856,14 @@ def sensitivity_analysis(
                     binary_outcomes=binary_outcomes,
                     prior_1=prior_1,
                     prior_c=pc,
+                    uniform_priors=uniform_priors,
                     reg_thresh=rt,
                     align_thresh=at,
+                    reg_steps=reg_steps,
                     bb_selection=bb_selection,
                     trait_cor=trait_cor,
                     ld_matrix=ld_matrix,
+                    settings=mode_settings,
                 )
                 n_configs += 1
                 for cl in res.clusters:

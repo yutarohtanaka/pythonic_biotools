@@ -740,6 +740,14 @@ def test_strong_plus_weak_uniform_and_numerical_overflow_guards() -> None:
             compute_ratio_estimates(
                 [1e-160, 0.1], [0.01, 0.05], [0.005, 0.005], bxse=[0.005, 0.005], variance_order=2
             )
+        with pytest.raises(ValueError, match="overflowed"):
+            compute_ratio_estimates(
+                [1e-200, 0.1], [1e200, 0.05], [0.005, 0.005], variance_order=1
+            )
+        with pytest.raises(ValueError, match="overflowed"):
+            compute_ratio_estimates(
+                [1e-200, 0.1], [1e200, 0.05], [0.005, 0.005], bxse=[0.0, 0.005], variance_order=2
+            )
         assert len(wrec) == 0
 
     # include_junk=False with 1e200 extreme outlier produces finite responsibilities without warnings
@@ -751,5 +759,93 @@ def test_strong_plus_weak_uniform_and_numerical_overflow_guards() -> None:
         assert np.all(np.isfinite(res_inf.responsibilities))
         np.testing.assert_allclose(res_inf.responsibilities.sum(axis=1), 1.0, atol=1e-12)
         assert len(wrec2) == 0
+
+
+def test_r_default_settings() -> None:
+    from scipy.special import gammaln
+
+    rng = np.random.default_rng(123)
+    theta = np.concatenate(
+        [
+            0.60 + rng.normal(0.0, 0.04, size=22),
+            1.25 + rng.normal(0.0, 0.045, size=20),
+            rng.normal(0.0, 0.04, size=10),
+            np.array([-3.2, 3.5, 6.4]),
+        ]
+    )
+    se = np.concatenate([np.full(52, 0.045), np.array([0.08, 0.09, 0.50])])
+
+    # 1. Strict validation of settings on all entrypoints
+    for bad in ("invalid", "r_default", "", None):
+        with pytest.raises(ValueError, match="Unknown settings"):
+            mr_clust_em(theta, se, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            compute_ratio_estimates([0.1, 0.2], [0.05, 0.1], [0.01, 0.01], settings=bad)  # type: ignore[arg-type]
+
+    res_def = mr_clust_em(theta, se, k_max=4, seed=42, settings="default")
+    res_r = mr_clust_em(theta, se, k_max=4, seed=42, settings="R_default")
+
+    with pytest.raises(ValueError, match="Unknown settings"):
+        pr_clust(res_r, settings="invalid")  # type: ignore[arg-type]
+
+    # 2. Exact upstream R Junk location (0.0) and scale formula without weak-IV hypot inflation
+    assert res_def.settings == "default"
+    assert res_r.settings == "R_default"
+    assert res_def.junk_mean != 0.0
+    assert res_r.junk_mean == 0.0
+
+    idx_max = int(np.argmax(np.abs(theta) + 2.0 * se))
+    expected_r_scale = float(np.max(theta) - np.min(theta)) + float(se[idx_max])
+    assert np.isclose(res_r.junk_scale, expected_r_scale, rtol=1e-13, atol=1e-13)
+
+    # Verify Junk log-density under R_default has NO hypot(psi_junk, theta_se) inflation
+    res_junk_only_r = mr_clust_em(
+        theta, se, k_min=0, k_max=0, include_null=False, include_junk=True, settings="R_default"
+    )
+    res_junk_only_def = mr_clust_em(
+        theta,
+        se,
+        k_min=0,
+        k_max=0,
+        include_null=False,
+        include_junk=True,
+        junk_mean=0.0,
+        junk_scale=expected_r_scale,
+        settings="default",
+    )
+    nu = 4.0
+    exact_r_junk_ll = float(
+        np.sum(
+            gammaln(0.5 * (nu + 1.0))
+            - gammaln(0.5 * nu)
+            - 0.5 * np.log(nu * np.pi)
+            - np.log(expected_r_scale)
+            - 0.5 * (nu + 1.0) * np.log1p(((theta / expected_r_scale) ** 2) / nu)
+        )
+    )
+    assert np.isclose(res_junk_only_r.best_model.log_likelihood, exact_r_junk_ll, rtol=1e-12, atol=1e-12)
+    assert abs(res_junk_only_def.best_model.log_likelihood - exact_r_junk_ll) > 1e-4
+
+    # 3. Default obs_prob_thresh = 0.5 in R_default vs 0.8 in default, plus override & pr_clust inheritance
+    assert res_def.obs_prob_thresh == 0.8
+    assert res_r.obs_prob_thresh == 0.5
+    res_r_override = mr_clust_em(theta, se, k_max=4, obs_prob_thresh=0.75, seed=42, settings="R_default")
+    assert res_r_override.obs_prob_thresh == 0.75
+
+    # Construct boundary SNP with posterior probability in (0.5, 0.8)
+    th_bnd = np.concatenate([0.25 + rng.normal(0.0, 0.03, 20), 0.75 + rng.normal(0.0, 0.03, 20), [0.50]])
+    se_bnd = np.concatenate([np.full(40, 0.035), [0.10]])
+    snps_bnd = [f"rs_{i}" for i in range(41)]
+    r_bnd = mr_clust_em(th_bnd, se_bnd, snp_names=snps_bnd, k_min=2, k_max=2, seed=42, settings="R_default")
+    assert r_bnd.obs_prob_thresh == 0.5
+    filt_r_inh = pr_clust(r_bnd)
+    filt_r_def = pr_clust(r_bnd, settings="default")
+    assert "rs_40" in set(filt_r_inh["observation"])
+    assert "rs_40" not in set(filt_r_def["observation"])
+
+    # 4. 6 unweighted k-means starts recover planted clusters accurately
+    assert res_r.best_k == 2
+    np.testing.assert_allclose(res_r.best_model.cluster_means, [0.60, 1.25], atol=0.06)
+
 
 

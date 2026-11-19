@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 from scipy.optimize import nnls
@@ -15,7 +15,7 @@ from ._linalg import (
     symmetrize,
 )
 from .covariances import _validate_u_dict
-from .data import MashData
+from .data import _DEFAULT_SETTINGS, MashData, _DefaultSettings, _validate_settings
 from .results import MashResult
 
 
@@ -181,13 +181,14 @@ def compute_loglik_matrix(
 
 def optimize_pi(
     loglik_matrix: np.ndarray,
-    prior: str | np.ndarray | Sequence[float] = "nullbiased",
+    prior: str | np.ndarray | Sequence[float] | None = None,
     nullweight: float = 10.0,
     use_pointmass: bool = True,
     opt_method: str = "mixsqp",
     max_iter: int = 5000,
-    tol: float = 1e-6,
+    tol: float | None = None,
     pi_init: np.ndarray | Sequence[float] | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, float, float, int, bool, float]:
     """Optimize mixture weights ``pi`` on the simplex with Dirichlet prior penalty.
 
@@ -197,6 +198,12 @@ def optimize_pi(
 
     Returns ``(pi, loglik, penalized_loglik, n_iter, converged, kkt_gap)``.
     """
+    eff_settings = _validate_settings(settings)
+    prior_val: str | np.ndarray | Sequence[float] = (
+        "nullbiased" if prior is None else prior
+    )
+    tol_val = (1e-8 if eff_settings == "R_default" else 1e-6) if tol is None else float(tol)
+
     L_mat = np.asarray(loglik_matrix, dtype=np.float64)
     if L_mat.ndim != 2 or L_mat.shape[0] < 1 or L_mat.shape[1] < 1:
         raise ValueError("loglik_matrix must be a non-empty 2D array.")
@@ -210,26 +217,26 @@ def optimize_pi(
         raise ValueError(f"nullweight must be finite and >= 1.0; got {nullweight}.")
     if max_iter < 1:
         raise ValueError(f"max_iter must be >= 1; got {max_iter}.")
-    if not np.isfinite(tol) or tol < 0.0:
+    if not np.isfinite(tol_val) or tol_val < 0.0:
         raise ValueError(f"tol must be finite and >= 0; got {tol}.")
     if opt_method not in {"mixsqp", "squarem", "em"}:
         raise ValueError(
             f"opt_method must be 'mixsqp', 'squarem', or 'em'; got {opt_method!r}."
         )
 
-    if isinstance(prior, str):
-        if prior == "nullbiased":
+    if isinstance(prior_val, str):
+        if prior_val == "nullbiased":
             alpha_prior = np.ones(M, dtype=np.float64)
             if use_pointmass:
                 alpha_prior[0] = nw
-        elif prior == "uniform":
+        elif prior_val == "uniform":
             alpha_prior = np.ones(M, dtype=np.float64)
         else:
             raise ValueError(
-                f"Unknown prior {prior!r}; expected 'nullbiased', 'uniform', or array."
+                f"Unknown prior {prior_val!r}; expected 'nullbiased', 'uniform', or array."
             )
     else:
-        alpha_prior = np.asarray(prior, dtype=np.float64)
+        alpha_prior = np.asarray(prior_val, dtype=np.float64)
         if alpha_prior.shape != (M,):
             raise ValueError(f"prior array must have shape ({M},); got {alpha_prior.shape}.")
         if not np.all(np.isfinite(alpha_prior)) or np.any(alpha_prior < 1.0):
@@ -296,7 +303,7 @@ def optimize_pi(
 
     ll, pen_ll, grad, ap = _eval_obj(pi)
     kkt_gap, g_m = _kkt_vec(pi, grad)
-    if kkt_gap <= tol:
+    if kkt_gap <= tol_val:
         return pi, ll, pen_ll, 0, True, kkt_gap
 
     converged = False
@@ -326,7 +333,7 @@ def optimize_pi(
                 pi = pi2
             ll, pen_ll, grad, ap = _eval_obj(pi)
             kkt_gap, g_m = _kkt_vec(pi, grad)
-            if kkt_gap <= tol:
+            if kkt_gap <= tol_val:
                 converged = True
                 break
 
@@ -405,7 +412,7 @@ def optimize_pi(
                             ll, pen_ll, grad, ap = _eval_obj(pi)
 
                 kkt_gap, g_m = _kkt_vec(pi, grad)
-                if kkt_gap <= tol:
+                if kkt_gap <= tol_val:
                     converged = True
                     break
 
@@ -446,7 +453,7 @@ def optimize_pi(
                     ll, pen_ll, grad, ap = _eval_obj(pi)
 
         kkt_gap, g_m = _kkt_vec(pi, grad)
-        if kkt_gap <= tol:
+        if kkt_gap <= tol_val:
             converged = True
             break
 
@@ -649,16 +656,17 @@ def mash(
     grid_mult: float = float(np.sqrt(2.0)),
     normalize_u: bool = True,
     use_pointmass: bool = True,
-    prior: str | np.ndarray | Sequence[float] = "nullbiased",
+    prior: str | np.ndarray | Sequence[float] | None = None,
     nullweight: float = 10.0,
     opt_method: str = "mixsqp",
     max_iter: int = 5000,
-    tol: float = 1e-6,
+    tol: float | None = None,
     compute_posterior: bool = True,
     output_posterior_cov: bool = False,
     pi_init: np.ndarray | Sequence[float] | None = None,
     fix_g: bool = False,
     batch_size: int = 512,
+    settings: Literal["default", "R_default"] = _DEFAULT_SETTINGS,
 ) -> MashResult:
     """Fit the Multivariate Adaptive Shrinkage (MASH) empirical Bayes model.
 
@@ -676,16 +684,18 @@ def mash(
         Divide each ``U_k`` by its maximum diagonal entry before grid expansion.
     use_pointmass : bool, default=True
         Include an exact point-mass-at-zero null component ``U_0 = 0``.
-    prior : {"nullbiased", "uniform"} or array-like, default="nullbiased"
-        Dirichlet prior pseudo-counts on mixture weights ``pi``.
+    prior : {"nullbiased", "uniform"} or array-like, optional
+        Dirichlet prior pseudo-counts on mixture weights ``pi`` (defaults to ``"nullbiased"``,
+        i.e., ``[10.0, 1.0, ..., 1.0]``).
     nullweight : float, default=10.0
         Dirichlet pseudo-count on the null component when ``prior="nullbiased"``.
     opt_method : {"mixsqp", "squarem", "em"}, default="mixsqp"
         Convex mixture optimization solver.
     max_iter : int, default=5000
         Maximum mixture optimization iterations.
-    tol : float, default=1e-6
-        KKT optimality gap stopping tolerance.
+    tol : float, optional
+        KKT optimality gap stopping tolerance (``1e-6`` under ``settings="default"``,
+        ``1e-8`` under ``settings="R_default"`` matching ``mixsqp``).
     compute_posterior : bool, default=True
         Whether to compute posterior moments and ``lfsr``.
     output_posterior_cov : bool, default=False
@@ -696,9 +706,20 @@ def mash(
         If ``True``, evaluate likelihoods and posteriors using fixed ``grid`` and ``pi_init``.
     batch_size : int, default=512
         Batch size for heteroscedastic likelihood/posterior evaluation.
+    settings : {"default", "R_default"}, default="default"
+        Execution mode; inherits ``data.settings`` when omitted, while an explicit
+        ``settings`` argument controls ``mash`` directly.
     """
+    eff_settings = _validate_settings(settings)
     if not isinstance(data, MashData):
         raise TypeError("data must be a MashData instance.")
+    if isinstance(settings, _DefaultSettings):
+        eff_settings = data.settings
+    prior_val: str | np.ndarray | Sequence[float] = (
+        "nullbiased" if prior is None else prior
+    )
+    tol_val = (1e-8 if eff_settings == "R_default" else 1e-6) if tol is None else float(tol)
+
     J, R = data.shape
 
     names, mats = _validate_u_dict(Ulist, R)
@@ -754,13 +775,14 @@ def mash(
     else:
         pi, loglik, pen_loglik, n_iter, converged, kkt_gap = optimize_pi(
             loglik_matrix=loglik_mat,
-            prior=prior,
+            prior=prior_val,
             nullweight=nullweight,
             use_pointmass=use_pointmass,
             opt_method=opt_method,
             max_iter=max_iter,
-            tol=tol,
+            tol=tol_val,
             pi_init=pi_init,
+            settings=eff_settings,
         )
 
     if compute_posterior:
@@ -823,4 +845,5 @@ def mash(
         converged=converged,
         n_iter=n_iter,
         kkt_gap=kkt_gap,
+        settings=eff_settings,
     )

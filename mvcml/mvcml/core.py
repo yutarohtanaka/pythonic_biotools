@@ -3,8 +3,27 @@
 """
 from __future__ import annotations
 
+from typing import Literal
 import numpy as np
 from scipy import stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+
+
+def _normalize_sig(SIG: np.ndarray, m: int, p: int, settings: SettingsMode) -> np.ndarray:
+    """Convert `SIG` into internal `[Y, X_1, ..., X_p]` ordering (`R_default` accepts `[X_1, ..., X_p, Y]`)."""
+    sig_arr = np.asarray(SIG, dtype=float)
+    if sig_arr.shape != (m, p + 1, p + 1):
+        raise ValueError(f"SIG must have shape ({m}, {p + 1}, {p + 1}), got {sig_arr.shape}.")
+    if settings == "R_default":
+        perm = [p] + list(range(p))
+        return sig_arr[:, perm, :][:, :, perm]
+    return sig_arr
 
 
 def _p_from_beta_se(beta: np.ndarray, se: np.ndarray) -> np.ndarray:
@@ -30,6 +49,7 @@ def _fit_cml_path(
     threshold: float,
     maxit: int,
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ):
     m, p = betax.shape
     nk = m - (p + 1) + 1
@@ -39,11 +59,12 @@ def _fit_cml_path(
     bic = np.zeros(nk)
     valid = []
     log_n = float(np.log(N))
+    r_mode = settings == "R_default"
 
     for k in range(nk):
         b = np.zeros(p)
         betayest = np.zeros(m)
-        betaxest = np.zeros((m, p))
+        betaxest = betax.copy() if r_mode else np.zeros((m, p))
         c = 1
         while True:
             c += 1
@@ -74,7 +95,8 @@ def _fit_cml_path(
                 b = np.linalg.solve(a, rb)
             except np.linalg.LinAlgError:
                 b = np.linalg.pinv(a) @ rb
-            if np.abs(old - b).sum() < threshold or c > maxit:
+            converged = (float(np.linalg.norm(b - old)) < threshold) if r_mode else (np.abs(old - b).sum() < threshold)
+            if converged or c > maxit:
                 break
         btotal[:, k] = b
         betayesttotal[:, k] = betayest
@@ -154,23 +176,36 @@ def cml_ma(
     betax: np.ndarray,
     betayc: np.ndarray,
     SIG: np.ndarray,
-    threshold: float = 1e-6,
+    threshold: float | None = None,
     maxit: int = 500,
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Fit MVMR-cML-MA and MVMR-cML-BIC across `k = 0 .. m - (p + 1)` invalid instruments."""
+    _validate_settings(settings)
     betax, betayc = np.asarray(betax, dtype=float), np.asarray(betayc, dtype=float)
-    SIG = np.asarray(SIG, dtype=float)
     m, p = betax.shape
     if m < p + 1:
         raise ValueError(f"Need at least p + 1 = {p + 1} instruments, got {m}")
-    SIGinv = np.linalg.inv(SIG)
+    eff_threshold = (1e-4 if settings == "R_default" else 1e-6) if threshold is None else float(threshold)
+    SIG_ymx = _normalize_sig(SIG, m, p, settings)
+    SIGinv = np.linalg.inv(SIG_ymx)
     A11 = SIGinv[:, 0, 0]
     A12 = SIGinv[:, 0, 1:]
     A22 = SIGinv[:, 1:, 1:]
 
     btotal, _, betaxesttotal, bic, valid = _fit_cml_path(
-        N, betax, betayc, SIGinv, A11, A12, A22, threshold=threshold, maxit=maxit, verbose=verbose
+        N,
+        betax,
+        betayc,
+        SIGinv,
+        A11,
+        A12,
+        A22,
+        threshold=eff_threshold,
+        maxit=maxit,
+        verbose=verbose,
+        settings=settings,
     )
 
     kbest = int(np.argmin(bic))
@@ -224,40 +259,73 @@ def cml_ma(
     )
 
 
+def mvcml_bic(
+    N: float,
+    betax: np.ndarray,
+    betayc: np.ndarray,
+    SIG: np.ndarray,
+    threshold: float | None = None,
+    maxit: int = 500,
+    verbose: bool = False,
+    settings: SettingsMode = "default",
+) -> dict:
+    """Fit MVMR-cML-BIC (`MVmr_cML` in `ZhaotongL/MVMR-cML`), reporting BIC-selected `b` as primary."""
+    _validate_settings(settings)
+    res = cml_ma(
+        N,
+        betax,
+        betayc,
+        SIG,
+        threshold=threshold,
+        maxit=maxit,
+        verbose=verbose,
+        settings=settings,
+    )
+    res["b"] = res["b_bic"]
+    res["b_se"] = res["se_bic"]
+    res["pval"] = res["pval_bic"]
+    res["Covb"] = res["Covb_bic"]
+    return res
+
+
 def mvcml_dp(
     N: float,
     betax: np.ndarray,
     betayc: np.ndarray,
     SIG: np.ndarray,
     num_pert: int = 100,
-    threshold: float = 1e-6,
+    threshold: float | None = None,
     maxit: int = 500,
     seed: int | None = None,
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Data-Perturbation MVMR-cML (`MVmr_cML_DP`, Lin et al., AJHG 2023).
 
     Resamples `num_pert` perturbed summary-statistic datasets `(betayc*, betax*) ~ N((betayc, betax), SIG)`
     to capture invalid-IV model-selection uncertainty.
     """
+    _validate_settings(settings)
     if num_pert < 2:
         raise ValueError("num_pert must be >= 2.")
     betax, betayc = np.asarray(betax, dtype=float), np.asarray(betayc, dtype=float)
-    SIG = np.asarray(SIG, dtype=float)
+    SIG_raw = np.asarray(SIG, dtype=float)
     m, p = betax.shape
     if m < p + 1:
         raise ValueError(f"Need at least p + 1 = {p + 1} instruments, got {m}")
 
-    base = cml_ma(N, betax, betayc, SIG, threshold=threshold, maxit=maxit, verbose=verbose)
-    SIGinv = np.linalg.inv(SIG)
+    eff_threshold = (1e-4 if settings == "R_default" else 1e-6) if threshold is None else float(threshold)
+    base = cml_ma(N, betax, betayc, SIG_raw, threshold=eff_threshold, maxit=maxit, verbose=verbose, settings=settings)
+    SIG_ymx = _normalize_sig(SIG_raw, m, p, settings)
+    SIGinv = np.linalg.inv(SIG_ymx)
     A11 = SIGinv[:, 0, 0]
     A12 = SIGinv[:, 0, 1:]
     A22 = SIGinv[:, 1:, 1:]
 
-    # Batch square-root factors of SIG[i] for fast perturbation sampling
-    L_sig = np.empty_like(SIG)
+    # Batch square-root factors of SIG_raw[i] for fast perturbation sampling
+    L_sig = np.empty_like(SIG_raw)
     for i in range(m):
-        si = 0.5 * (SIG[i] + SIG[i].T)
+        si = 0.5 * (SIG_raw[i] + SIG_raw[i].T)
         try:
             L_sig[i] = np.linalg.cholesky(si)
         except np.linalg.LinAlgError:
@@ -271,10 +339,24 @@ def mvcml_dp(
     for t in range(num_pert):
         z = rng.standard_normal((m, p + 1, 1))
         err = (L_sig @ z)[:, :, 0]
-        by_pt = betayc + err[:, 0]
-        bx_pt = betax + err[:, 1:]
+        if settings == "R_default":
+            bx_pt = betax + err[:, :p]
+            by_pt = betayc + err[:, p]
+        else:
+            by_pt = betayc + err[:, 0]
+            bx_pt = betax + err[:, 1:]
         bt_pt, _, _, bic_pt, _ = _fit_cml_path(
-            N, bx_pt, by_pt, SIGinv, A11, A12, A22, threshold=threshold, maxit=maxit, verbose=False
+            N,
+            bx_pt,
+            by_pt,
+            SIGinv,
+            A11,
+            A12,
+            A22,
+            threshold=eff_threshold,
+            maxit=maxit,
+            verbose=False,
+            settings=settings,
         )
         kb_pt = int(np.argmin(bic_pt))
         w_pt = np.exp(-0.5 * (bic_pt - float(np.min(bic_pt))))
@@ -291,11 +373,16 @@ def mvcml_dp(
     pval_ma_dp = 2.0 * stats.norm.sf(np.abs(b_ma_dp) / se_ma_dp)
     pval_bic_dp = 2.0 * stats.norm.sf(np.abs(b_bic_dp) / se_bic_dp)
 
+    if settings == "R_default":
+        primary_b, primary_se, primary_cov, primary_pval = b_bic_dp, se_bic_dp, Covb_bic_dp, pval_bic_dp
+    else:
+        primary_b, primary_se, primary_cov, primary_pval = b_ma_dp, se_ma_dp, Covb_ma_dp, pval_ma_dp
+
     return dict(
-        b=b_ma_dp,
-        b_se=se_ma_dp,
-        Covb=Covb_ma_dp,
-        pval=pval_ma_dp,
+        b=primary_b,
+        b_se=primary_se,
+        Covb=primary_cov,
+        pval=primary_pval,
         b_ma_dp=b_ma_dp,
         se_ma_dp=se_ma_dp,
         pval_ma_dp=pval_ma_dp,
@@ -318,9 +405,16 @@ def mvcml_dp(
     )
 
 
-def make_corr(p: int, rho_yx=None, rho_xx=None) -> np.ndarray:
+def make_corr(p: int, rho_yx=None, rho_xx=None, *, settings: SettingsMode = "default") -> np.ndarray:
+    _validate_settings(settings)
     R = np.eye(p + 1)
     rho_yx_arr = np.zeros(p) if rho_yx is None else np.broadcast_to(np.asarray(rho_yx, dtype=float), (p,))
+    if settings == "R_default":
+        if rho_xx is not None:
+            R[:p, :p] = np.asarray(rho_xx, dtype=float)
+        R[:p, p] = rho_yx_arr
+        R[p, :p] = rho_yx_arr
+        return R
     R[0, 1:] = rho_yx_arr
     R[1:, 0] = rho_yx_arr
     if rho_xx is not None:
@@ -328,9 +422,26 @@ def make_corr(p: int, rho_yx=None, rho_xx=None) -> np.ndarray:
     return R
 
 
-def adjusted_variances(betaGX, sdGX, betaGYC, sdGYC, fit, R, iv_snp_idx, ld=None, legacy_sigma_gzh: bool = False):
+def adjusted_variances(
+    betaGX,
+    sdGX,
+    betaGYC,
+    sdGYC,
+    fit,
+    R,
+    iv_snp_idx,
+    ld=None,
+    legacy_sigma_gzh: bool = False,
+    *,
+    settings: SettingsMode = "default",
+):
+    _validate_settings(settings)
     b, Covb, Omega = fit["b"], fit["Covb"], fit["Omega"]
     S, p = betaGX.shape
+    R_ymx = np.asarray(R, dtype=float)
+    if settings == "R_default":
+        perm = [p] + list(range(p))
+        R_ymx = R_ymx[np.ix_(perm, perm)]
     b1 = np.einsum("sj,jk,sk->s", betaGX, Covb, betaGX)
     c = (b ** 2 * sdGX ** 2).sum(1)
     d1 = (np.diag(Covb) * sdGX ** 2).sum(1)
@@ -345,7 +456,7 @@ def adjusted_variances(betaGX, sdGX, betaGYC, sdGYC, fit, R, iv_snp_idx, ld=None
     sdZY = sdGYC[ivrow]
     sdZX = sdGX[ivrow]
     D_iv = np.concatenate([sdZY[:, None], sdZX], axis=1)
-    SIG_iv = D_iv[:, :, None] * R[None] * D_iv[:, None, :]
+    SIG_iv = D_iv[:, :, None] * R_ymx[None] * D_iv[:, None, :]
     sZ = np.zeros((nv * (p + 1), nv * (p + 1)))
     for j in range(nv):
         sZ[j * (p + 1) : (j + 1) * (p + 1), j * (p + 1) : (j + 1) * (p + 1)] = SIG_iv[j]
@@ -356,16 +467,16 @@ def adjusted_variances(betaGX, sdGX, betaGYC, sdGYC, fit, R, iv_snp_idx, ld=None
     has_ld = np.any(ldv != 0, axis=1)
     u = Dg * v1[None]
     sub = ~has_ld
-    var_ld[sub] = np.einsum("si,ij,sj->s", u[sub], R, u[sub]) + np.einsum("sj,jk,sk->s", betaGX[sub], M, betaGX[sub])
+    var_ld[sub] = np.einsum("si,ij,sj->s", u[sub], R_ymx, u[sub]) + np.einsum("sj,jk,sk->s", betaGX[sub], M, betaGX[sub])
     for s in np.flatnonzero(has_ld):
         d = Dg[s]
-        sG = d[:, None] * R * d[None, :]
+        sG = d[:, None] * R_ymx * d[None, :]
         s12 = np.zeros((p + 1, nv, p + 1))
-        s12[:, :, 0] = ldv[s][None, :] * d[:, None] * sdZY[None, :] * R[0, :][:, None]
+        s12[:, :, 0] = ldv[s][None, :] * d[:, None] * sdZY[None, :] * R_ymx[0, :][:, None]
         for a in range(1, p + 1):
-            s12[a, :, 1:] = ldv[s][:, None] * d[a] * sdZX * R[a, 1:][None, :]
+            s12[a, :, 1:] = ldv[s][:, None] * d[a] * sdZX * R_ymx[a, 1:][None, :]
         if not legacy_sigma_gzh:
-            s12[0, :, 1:] = ldv[s][:, None] * d[0] * sdZX * R[0, 1:][None, :]
+            s12[0, :, 1:] = ldv[s][:, None] * d[0] * sdZX * R_ymx[0, 1:][None, :]
         s12 = s12.reshape(p + 1, nv * (p + 1))
         U1 = np.zeros((2 * p + 1, 2 * p + 1))
         U1[: p + 1, : p + 1] = sG
@@ -393,15 +504,17 @@ def mvcml_adjust(
     rho_yx=None,
     rho_xx=None,
     ld: np.ndarray | None = None,
-    threshold: float = 1e-6,
+    threshold: float | None = None,
     maxit: int = 500,
     legacy_sigma_gzh: bool = False,
     dp: bool = False,
     num_pert: int = 100,
     seed: int | None = None,
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Estimate multivariable exposure effects via MVMR-cML(-MA/-DP) and adjust conditional GWAS `betaGYC`."""
+    _validate_settings(settings)
     betaGX_a = np.atleast_2d(np.asarray(betaGX, dtype=float).T).T if np.ndim(betaGX) == 1 else np.asarray(betaGX, dtype=float)
     sdGX_a = np.asarray(sdGX, dtype=float).reshape(betaGX_a.shape)
     betaGYC_a, sdGYC_a = np.asarray(betaGYC, dtype=float), np.asarray(sdGYC, dtype=float)
@@ -411,13 +524,36 @@ def mvcml_adjust(
     if iv_mask is not None:
         sel &= np.asarray(iv_mask, dtype=bool)
     iv_idx = np.flatnonzero(sel)
-    R = make_corr(p, rho_yx, rho_xx)
-    D = np.concatenate([sdGYC_a[iv_idx, None], sdGX_a[iv_idx]], axis=1)
+    R = make_corr(p, rho_yx, rho_xx, settings=settings)
+    if settings == "R_default":
+        D = np.concatenate([sdGX_a[iv_idx], sdGYC_a[iv_idx, None]], axis=1)
+    else:
+        D = np.concatenate([sdGYC_a[iv_idx, None], sdGX_a[iv_idx]], axis=1)
     SIG = D[:, :, None] * R[None] * D[:, None, :]
     if dp:
-        fit = mvcml_dp(N, betaGX_a[iv_idx], betaGYC_a[iv_idx], SIG, num_pert=num_pert, threshold=threshold, maxit=maxit, seed=seed, verbose=verbose)
+        fit = mvcml_dp(
+            N,
+            betaGX_a[iv_idx],
+            betaGYC_a[iv_idx],
+            SIG,
+            num_pert=num_pert,
+            threshold=threshold,
+            maxit=maxit,
+            seed=seed,
+            verbose=verbose,
+            settings=settings,
+        )
     else:
-        fit = cml_ma(N, betaGX_a[iv_idx], betaGYC_a[iv_idx], SIG, threshold=threshold, maxit=maxit, verbose=verbose)
+        fit = cml_ma(
+            N,
+            betaGX_a[iv_idx],
+            betaGYC_a[iv_idx],
+            SIG,
+            threshold=threshold,
+            maxit=maxit,
+            verbose=verbose,
+            settings=settings,
+        )
     covb = fit["Covb"]
     ev = float(np.linalg.eigvalsh((covb + covb.T) / 2.0).min())
     if ev < 0:
@@ -430,7 +566,7 @@ def mvcml_adjust(
         ld_arr = np.asarray(ld, dtype=float)
         ld_iv = ld_arr[:, iv_idx] if ld_arr.shape == (S, S) else ld_arr
     v_simple, v_ld = adjusted_variances(
-        betaGX_a, sdGX_a, betaGYC_a, sdGYC_a, fit, R, iv_idx, ld_iv, legacy_sigma_gzh
+        betaGX_a, sdGX_a, betaGYC_a, sdGYC_a, fit, R, iv_idx, ld_iv, legacy_sigma_gzh, settings=settings
     )
     return dict(
         b=b,

@@ -67,6 +67,7 @@ class MRPressoResult:
     nb_distribution: int
     signif_threshold: float
     weighted_rss: bool
+    settings: str = "default"
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return two-row summary DataFrame (`Raw` and `Outlier-corrected`) matching R `Main MR results`."""
@@ -200,6 +201,7 @@ class MVMRPressoResult:
     nb_distribution: int
     signif_threshold: float
     weighted_rss: bool
+    settings: str = "default"
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return per-exposure summary DataFrame (`Raw` and `Outlier-corrected`)."""
@@ -349,12 +351,19 @@ def _fit_ivw(X: np.ndarray, y: np.ndarray, w: np.ndarray) -> IVWFit:
     )
 
 
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+    return settings  # type: ignore[return-value]
+
+
 def leave_one_out_ivw(
     beta_outcome: Sequence[float] | np.ndarray,
     beta_exposure: Sequence[float] | np.ndarray,
     sd_outcome: Sequence[float] | np.ndarray,
     *,
-    weighted_rss: bool = False,
+    weighted_rss: bool | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Compute exact leave-one-out IVW slopes and squared residuals via Sherman-Morrison updates.
 
@@ -373,6 +382,8 @@ def leave_one_out_ivw(
     rss_obs : float
         Total observed LOO residual sum of squares.
     """
+    mode_settings = _validate_settings(settings)
+    w_rss = (mode_settings == "R_default") if weighted_rss is None else bool(weighted_rss)
     y = np.asarray(beta_outcome, dtype=np.float64).ravel()
     sy = np.asarray(sd_outcome, dtype=np.float64).ravel()
     raw_x = np.asarray(beta_exposure, dtype=np.float64)
@@ -400,7 +411,7 @@ def leave_one_out_ivw(
             raise ValueError("Leave-one-out exposure sum of squares is singular for at least one instrument.")
         loo_b = (s_xy - w * x * y) / denom
         resid_loo = y - loo_b * x
-        rss_j = (w * (resid_loo**2)) if weighted_rss else (resid_loo**2)
+        rss_j = (w * (resid_loo**2)) if w_rss else (resid_loo**2)
         return (loo_b if is_1d else loo_b[:, None]), rss_j, float(np.sum(rss_j))
 
     xtw = X.T * w[None, :]
@@ -421,7 +432,7 @@ def leave_one_out_ivw(
     # Sherman-Morrison exact LOO slopes: beta^{(-j)} = beta - w_j A^{-1} x_j e_j / (1 - h_j)
     loo_betas = beta_full[None, :] - (A_inv_Xt * (w * e_full / one_minus_h)[None, :]).T  # (J, P)
     resid_loo = e_full / one_minus_h
-    rss_j = (w * (resid_loo**2)) if weighted_rss else (resid_loo**2)
+    rss_j = (w * (resid_loo**2)) if w_rss else (resid_loo**2)
     return loo_betas, rss_j, float(np.sum(rss_j))
 
 
@@ -522,6 +533,9 @@ def _simulate_rss_univariable(
     nb_distribution: int,
     weighted_rss: bool,
     rng: np.random.Generator,
+    *,
+    loo_betas_obs: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized O(K J) Monte Carlo simulation for univariable MR-PRESSO without J-loops."""
     n = x_obs.size
@@ -545,10 +559,16 @@ def _simulate_rss_univariable(
         beta_loo_sim = (s_xy - wxy) / denom
         resid_sim = y_sim - beta_loo_sim * x_sim
         r_sq = (resid_sim**2) * w[None, :] if weighted_rss else (resid_sim**2)
-
         rss_exp[offset : offset + b] = np.sum(r_sq, axis=1)
-        exceed_counts += np.sum(r_sq >= r_obs_sq[None, :], axis=0)
-        sum_r_sq += np.sum(r_sq, axis=0)
+
+        if settings == "R_default" and loo_betas_obs is not None:
+            resid_out = y_sim - x_sim * loo_betas_obs[None, :]
+            r_sq_out = (resid_out**2) * w[None, :] if weighted_rss else (resid_out**2)
+        else:
+            r_sq_out = r_sq
+
+        exceed_counts += np.sum(r_sq_out >= r_obs_sq[None, :], axis=0)
+        sum_r_sq += np.sum(r_sq_out, axis=0)
         offset += b
 
     return rss_exp, exceed_counts / float(nb_distribution), sum_r_sq / float(nb_distribution)
@@ -564,6 +584,9 @@ def _simulate_rss_multivariable(
     nb_distribution: int,
     weighted_rss: bool,
     rng: np.random.Generator,
+    *,
+    loo_betas_obs: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized batched Sherman-Morrison O(K J P^2) Monte Carlo simulation for MVMR-PRESSO."""
     n, p = X_obs.shape
@@ -593,10 +616,16 @@ def _simulate_rss_multivariable(
         one_minus_h = np.maximum(1.0 - h_sim, 1e-12)
         resid_sim = e_sim / one_minus_h
         r_sq = (resid_sim**2) * w[None, :] if weighted_rss else (resid_sim**2)
-
         rss_exp[offset : offset + b] = np.sum(r_sq, axis=1)
-        exceed_counts += np.sum(r_sq >= r_obs_sq[None, :], axis=0)
-        sum_r_sq += np.sum(r_sq, axis=0)
+
+        if settings == "R_default" and loo_betas_obs is not None:
+            resid_out = y_sim - np.sum(X_sim * loo_betas_obs[None, :, :], axis=2)
+            r_sq_out = (resid_out**2) * w[None, :] if weighted_rss else (resid_out**2)
+        else:
+            r_sq_out = r_sq
+
+        exceed_counts += np.sum(r_sq_out >= r_obs_sq[None, :], axis=0)
+        sum_r_sq += np.sum(r_sq_out, axis=0)
         offset += b
 
     return rss_exp, exceed_counts / float(nb_distribution), sum_r_sq / float(nb_distribution)
@@ -610,6 +639,8 @@ def _bootstrap_distortion(
     beta_corr: np.ndarray,
     nb_distribution: int,
     rng: np.random.Generator,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Bootstrap non-outlier instruments to evaluate empirical two-sided distortion p-values."""
     n_valid, p = X_valid.shape
@@ -637,15 +668,27 @@ def _bootstrap_distortion(
         if np.any(good):
             beta_boot_mat[good] = np.linalg.solve(Ab[good], rhs[good, :, None])[..., 0]
 
-    diff_obs = np.abs(beta_raw - beta_corr)
-    diff_boot = np.abs(beta_boot_mat - beta_corr[None, :])
-
+    abs_corr = np.abs(beta_corr)
+    valid_corr = abs_corr > 1e-15
     distortion_coeff = np.where(
-        np.abs(beta_corr) > 1e-15,
-        100.0 * (beta_raw - beta_corr) / np.abs(beta_corr),
+        valid_corr,
+        100.0 * (beta_raw - beta_corr) / np.maximum(abs_corr, 1e-300),
         np.nan,
     )
-    p_dist = (np.sum(diff_boot >= diff_obs[None, :], axis=0) + 1.0) / (nb_distribution + 1.0)
+
+    if settings == "R_default":
+        denom_corr = np.maximum(abs_corr, 1e-300)
+        bias_obs = (beta_raw - beta_corr) / denom_corr
+        bias_exp = (beta_boot_mat - beta_corr[None, :]) / denom_corr[None, :]
+        p_dist = np.where(
+            valid_corr,
+            np.sum(np.abs(bias_exp) >= np.abs(bias_obs)[None, :], axis=0) / float(nb_distribution),
+            np.nan,
+        )
+    else:
+        diff_obs = np.abs(beta_raw - beta_corr)
+        diff_boot = np.abs(beta_boot_mat - beta_corr[None, :])
+        p_dist = (np.sum(diff_boot >= diff_obs[None, :], axis=0) + 1.0) / (nb_distribution + 1.0)
 
     # Joint Mahalanobis distortion test across all P exposures
     centered = beta_boot_mat - beta_corr[None, :]
@@ -654,7 +697,10 @@ def _bootstrap_distortion(
     pinv_cov = np.linalg.pinv(cov_boot, rcond=1e-10)
     q_obs = float(delta_obs @ pinv_cov @ delta_obs)
     q_boot = np.einsum("kp,pq,kq->k", centered, pinv_cov, centered)
-    p_joint = float((np.sum(q_boot >= q_obs) + 1.0) / (nb_distribution + 1.0))
+    if settings == "R_default":
+        p_joint = float(np.sum(q_boot >= q_obs) / float(nb_distribution))
+    else:
+        p_joint = float((np.sum(q_boot >= q_obs) + 1.0) / (nb_distribution + 1.0))
 
     return distortion_coeff, p_dist, p_joint
 
@@ -671,15 +717,24 @@ def mvmr_presso(
     outlier_test: bool = True,
     distortion_test: bool = True,
     signif_threshold: float = 0.05,
-    nb_distribution: int = 5000,
+    nb_distribution: int | None = None,
     outlier_method: Literal["empirical", "chisq"] = "empirical",
-    weighted_rss: bool = False,
+    weighted_rss: bool | None = None,
     seed: int | np.random.Generator | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> MVMRPressoResult:
     """Run Multivariable MR-PRESSO (P >= 2 exposures) using Sherman-Morrison LOO updates."""
+    mode_settings = _validate_settings(settings)
+    nb_dist = (
+        (1000 if mode_settings == "R_default" else 5000)
+        if nb_distribution is None
+        else int(nb_distribution)
+    )
+    w_rss = (mode_settings == "R_default") if weighted_rss is None else bool(weighted_rss)
+
     if not (0.0 < signif_threshold < 1.0):
         raise ValueError("signif_threshold must lie strictly in (0, 1).")
-    if nb_distribution < 10:
+    if nb_dist < 10:
         raise ValueError("nb_distribution must be >= 10.")
     if outlier_method not in ("empirical", "chisq"):
         raise ValueError("outlier_method must be 'empirical' or 'chisq'.")
@@ -694,25 +749,40 @@ def mvmr_presso(
     w = 1.0 / (sy**2)
     raw_fit = _fit_ivw(X_orig, y_orig, w)
     loo_betas_orig, rss_per_snp, rss_obs = leave_one_out_ivw(
-        y_orig, X_orig, sy, weighted_rss=weighted_rss
+        y_orig, X_orig, sy, weighted_rss=w_rss, settings=mode_settings
     )
 
     # Sign-canonicalized working copy guarantees bit-for-bit MC allele-flip invariance
     X_canon, y_canon = _canonicalize_signs(X_orig, y_orig)
     loo_betas_canon, r_obs_sq_canon, _ = leave_one_out_ivw(
-        y_canon, X_canon, sy, weighted_rss=weighted_rss
+        y_canon, X_canon, sy, weighted_rss=w_rss, settings=mode_settings
     )
     pred_y_loo_canon = np.sum(X_canon * loo_betas_canon, axis=1)
 
     rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
     rss_exp, p_emp_per_snp, expected_rss_per_snp = _simulate_rss_multivariable(
-        X_canon, SX, pred_y_loo_canon, sy, w, r_obs_sq_canon, nb_distribution, weighted_rss, rng
+        X_canon,
+        SX,
+        pred_y_loo_canon,
+        sy,
+        w,
+        r_obs_sq_canon,
+        nb_dist,
+        w_rss,
+        rng,
+        loo_betas_obs=loo_betas_canon,
+        settings=mode_settings,
     )
 
-    exceed_global = int(np.sum(rss_exp > rss_obs))
-    p_global = float((exceed_global + 1.0) / (nb_distribution + 1.0))
-    p_global_emp = float(exceed_global / nb_distribution)
-    p_global_fmt = f"<{1.0 / nb_distribution:.4g}" if exceed_global == 0 else f"{p_global:.4g}"
+    if mode_settings == "R_default":
+        exceed_global = int(np.sum(rss_exp >= rss_obs))
+        p_global_emp = float(exceed_global / nb_dist)
+        p_global = p_global_emp
+    else:
+        exceed_global = int(np.sum(rss_exp > rss_obs))
+        p_global = float((exceed_global + 1.0) / (nb_dist + 1.0))
+        p_global_emp = float(exceed_global / nb_dist)
+    p_global_fmt = f"<{1.0 / nb_dist:.4g}" if exceed_global == 0 else f"{p_global:.4g}"
 
     outlier_indices: list[int] = []
     outlier_snps: list[str] = []
@@ -753,8 +823,9 @@ def mvmr_presso(
                             w[keep_mask],
                             raw_fit.beta,
                             beta_corr,
-                            nb_distribution,
+                            nb_dist,
                             rng,
+                            settings=mode_settings,
                         )
                 except ValueError:
                     pass
@@ -791,9 +862,10 @@ def mvmr_presso(
         distortion_coeff=dist_coeff,
         p_distortion=p_dist,
         p_distortion_joint=p_dist_joint,
-        nb_distribution=nb_distribution,
+        nb_distribution=nb_dist,
         signif_threshold=signif_threshold,
-        weighted_rss=weighted_rss,
+        weighted_rss=w_rss,
+        settings=mode_settings,
     )
 
 
@@ -809,18 +881,27 @@ def mr_presso(
     outlier_test: bool = True,
     distortion_test: bool = True,
     signif_threshold: float = 0.05,
-    nb_distribution: int = 5000,
+    nb_distribution: int | None = None,
     outlier_method: Literal["empirical", "chisq"] = "empirical",
-    weighted_rss: bool = False,
+    weighted_rss: bool | None = None,
     seed: int | np.random.Generator | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> MRPressoResult | MVMRPressoResult:
     """Run MR-PRESSO global, outlier, and distortion tests (Verbanck et al., Nature Genetics 2018).
 
     Automatically dispatches to `mvmr_presso` when `beta_exposure` contains P >= 2 exposures.
     """
+    mode_settings = _validate_settings(settings)
+    nb_dist = (
+        (1000 if mode_settings == "R_default" else 5000)
+        if nb_distribution is None
+        else int(nb_distribution)
+    )
+    w_rss = (mode_settings == "R_default") if weighted_rss is None else bool(weighted_rss)
+
     if not (0.0 < signif_threshold < 1.0):
         raise ValueError("signif_threshold must lie strictly in (0, 1).")
-    if nb_distribution < 10:
+    if nb_dist < 10:
         raise ValueError("nb_distribution must be >= 10.")
     if outlier_method not in ("empirical", "chisq"):
         raise ValueError("outlier_method must be 'empirical' or 'chisq'.")
@@ -840,10 +921,11 @@ def mr_presso(
             outlier_test=outlier_test,
             distortion_test=distortion_test,
             signif_threshold=signif_threshold,
-            nb_distribution=nb_distribution,
+            nb_distribution=nb_dist,
             outlier_method=outlier_method,
-            weighted_rss=weighted_rss,
+            weighted_rss=w_rss,
             seed=seed,
+            settings=mode_settings,
         )
 
     n = y_orig.size
@@ -853,25 +935,40 @@ def mr_presso(
 
     raw_fit = _fit_ivw(X_orig, y_orig, w)
     loo_betas_orig, rss_per_snp, rss_obs = leave_one_out_ivw(
-        y_orig, x_orig, sy, weighted_rss=weighted_rss
+        y_orig, x_orig, sy, weighted_rss=w_rss, settings=mode_settings
     )
 
     X_canon, y_canon = _canonicalize_signs(X_orig, y_orig)
     x_canon = X_canon[:, 0]
     loo_betas_canon, r_obs_sq_canon, _ = leave_one_out_ivw(
-        y_canon, x_canon, sy, weighted_rss=weighted_rss
+        y_canon, x_canon, sy, weighted_rss=w_rss, settings=mode_settings
     )
     pred_y_loo_canon = loo_betas_canon * x_canon
 
     rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
     rss_exp, p_emp_per_snp, expected_rss_per_snp = _simulate_rss_univariable(
-        x_canon, sx, pred_y_loo_canon, sy, w, r_obs_sq_canon, nb_distribution, weighted_rss, rng
+        x_canon,
+        sx,
+        pred_y_loo_canon,
+        sy,
+        w,
+        r_obs_sq_canon,
+        nb_dist,
+        w_rss,
+        rng,
+        loo_betas_obs=loo_betas_canon,
+        settings=mode_settings,
     )
 
-    exceed_global = int(np.sum(rss_exp > rss_obs))
-    p_global = float((exceed_global + 1.0) / (nb_distribution + 1.0))
-    p_global_emp = float(exceed_global / nb_distribution)
-    p_global_fmt = f"<{1.0 / nb_distribution:.4g}" if exceed_global == 0 else f"{p_global:.4g}"
+    if mode_settings == "R_default":
+        exceed_global = int(np.sum(rss_exp >= rss_obs))
+        p_global_emp = float(exceed_global / nb_dist)
+        p_global = p_global_emp
+    else:
+        exceed_global = int(np.sum(rss_exp > rss_obs))
+        p_global = float((exceed_global + 1.0) / (nb_dist + 1.0))
+        p_global_emp = float(exceed_global / nb_dist)
+    p_global_fmt = f"<{1.0 / nb_dist:.4g}" if exceed_global == 0 else f"{p_global:.4g}"
 
     outlier_indices: list[int] = []
     outlier_snps: list[str] = []
@@ -910,8 +1007,9 @@ def mr_presso(
                         w[keep_mask],
                         raw_fit.beta,
                         corr_fit.beta,
-                        nb_distribution,
+                        nb_dist,
                         rng,
+                        settings=mode_settings,
                     )
                     dist_coeff = float(dc_arr[0])
                     p_dist = float(pd_arr[0])
@@ -946,7 +1044,8 @@ def mr_presso(
         outlier_pvalues_chisq=outlier_pvals_chisq,
         distortion_coeff=dist_coeff,
         p_distortion=p_dist,
-        nb_distribution=nb_distribution,
+        nb_distribution=nb_dist,
         signif_threshold=signif_threshold,
-        weighted_rss=weighted_rss,
+        weighted_rss=w_rss,
+        settings=mode_settings,
     )

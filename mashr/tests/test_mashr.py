@@ -786,3 +786,78 @@ def test_scale_invariance_sub_picoscale_and_large_scale():
         df_ed = ed_res.to_dataframe()
         assert np.all(df_ed["rank"] >= 1)
 
+
+def test_r_default_settings():
+    from scipy import stats as sp_stats
+
+    rng = np.random.default_rng(2028)
+    J, R = 400, 3
+    Bhat = rng.normal(0.0, 1.0, size=(J, R))
+    Bhat[:60, :] += rng.normal(0.0, 2.5, size=(60, 1))
+    Shat = rng.uniform(0.5, 1.1, size=(J, R))
+
+    # 1. Strict settings validation across mash_set_data, mash_update_data, optimize_pi, and mash
+    d0 = mash_set_data(Bhat, Shat)
+    u_can = cov_canonical(d0)
+    ll_mat = compute_loglik_matrix(d0, u_can, autoselect_grid(d0))
+    for bad in ("invalid", "r_default", "", None):
+        with pytest.raises(ValueError, match="Unknown settings"):
+            mash_set_data(Bhat, Shat, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            mash_update_data(d0, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            optimize_pi(ll_mat, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            mash(d0, u_can, settings=bad)  # type: ignore[arg-type]
+
+    # 2. Strict mixSQP tolerance 1e-8 + settings inheritance / explicit override
+    # Use opt_method="squarem" as well as default "mixsqp" to verify exact tol=1e-8 vs tol=1e-6 stopping
+    _, _, _, it_sq_def, conv_sq_def, kkt_sq_def = optimize_pi(
+        ll_mat, opt_method="squarem", settings="default"
+    )
+    _, _, _, it_sq_r, conv_sq_r, kkt_sq_r = optimize_pi(
+        ll_mat, opt_method="squarem", settings="R_default"
+    )
+    assert conv_sq_def and 1e-8 < kkt_sq_def <= 1e-6
+    assert conv_sq_r and kkt_sq_r <= 1e-8
+    assert it_sq_r > it_sq_def
+
+    d_r = mash_set_data(Bhat, Shat, settings="R_default")
+    assert d_r.settings == "R_default"
+    assert mash_update_data(d_r, alpha=1.0).settings == "R_default"
+
+    res_inh = mash(d_r, u_can, opt_method="squarem")
+    res_override_def = mash(d_r, u_can, opt_method="squarem", settings="default")
+    res_mx_r = mash(d0, u_can, settings="R_default")
+    assert res_inh.settings == "R_default" and res_inh.kkt_gap <= 1e-8
+    assert res_override_def.settings == "default" and 1e-8 < res_override_def.kkt_gap <= 1e-6
+    assert res_mx_r.settings == "R_default" and res_mx_r.converged and res_mx_r.kkt_gap <= 1e-8
+
+    # Explicit tol override respected in R_default
+    res_tol_ovr = mash(d_r, u_can, opt_method="squarem", tol=1e-4, settings="R_default")
+    assert 1e-6 < res_tol_ovr.kkt_gap <= 1e-4
+
+    # 3. Exact "nullbiased" prior [10.0, 1.0, ..., 1.0] default + explicit prior override
+    M = res_mx_r.pi.size
+    explicit_prior_vec = np.ones(M, dtype=np.float64)
+    explicit_prior_vec[0] = 10.0
+    res_explicit_nb = mash(d0, u_can, prior=explicit_prior_vec, tol=1e-8, settings="R_default")
+    np.testing.assert_allclose(res_mx_r.pi, res_explicit_nb.pi, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        res_mx_r.penalized_loglik, res_explicit_nb.penalized_loglik, rtol=1e-12, atol=1e-12
+    )
+
+    res_unif = mash(d0, u_can, prior="uniform", settings="R_default")
+    assert res_unif.pi[0] < res_mx_r.pi[0]
+
+    # 4. Student-t degrees-of-freedom conversion in mash_set_data (stephenslab/mashr::mash_set_data)
+    B_t = np.array([[0.0, 2.5], [-4.0, 1.2]])
+    S_t = np.array([[0.8, 0.5], [1.0, 0.6]])
+    d_t = mash_set_data(B_t, S_t, df=6.0, settings="R_default")
+    assert d_t.Shat[0, 0] == 0.8  # Bhat == 0 keeps Shat unchanged
+    for idx in ((0, 1), (1, 0), (1, 1)):
+        p_two = 2.0 * sp_stats.t.sf(abs(B_t[idx] / S_t[idx]), df=6.0)
+        z_eq = float(sp_stats.norm.isf(p_two / 2.0))
+        np.testing.assert_allclose(d_t.Shat[idx], abs(B_t[idx]) / z_eq, rtol=1e-12, atol=1e-12)
+
+

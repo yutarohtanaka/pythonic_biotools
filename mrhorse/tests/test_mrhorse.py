@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-from mrhorse import gelman_rubin, mr_horse, mvmr_horse
+import pytest
+from mrhorse import gelman_rubin, horse, mr_horse, mvmr_horse
 from mrhorse.core import _qform, _trunc_norm
 
 
@@ -108,3 +109,61 @@ def test_mr_horse_and_mvmr_horse_correlated_pleiotropy_and_rhat():
         corr_i[1:, 0] = last_rho[i]
         L = np.linalg.cholesky(corr_i)
         assert np.all(np.diag(L) > 0.0)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(77)
+    n, k_exp = 45, 3
+    bx_true = rng.normal(0.0, 0.14, (n, k_exp))
+    theta_true = np.array([0.35, -0.25, 0.20])
+    sx = np.full((n, k_exp), 0.015)
+    sy = np.full(n, 0.020)
+    bx = bx_true + rng.normal(0.0, sx)
+    by = bx_true @ theta_true + rng.normal(0.0, sy)
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mr_horse(by, sy, bx[:, 0], sx[:, 0], settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mvmr_horse(by, sy, bx, sx, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        horse(by, sy, bx, sx, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_thin"):
+        mr_horse(by, sy, bx[:, 0], sx[:, 0], n_thin=0, settings="R_default")
+
+    # 2. Unthinned n_thin=1 by default in R_default vs auto-thinning in default (for n_iter=2000)
+    r_def_thin = mr_horse(by, sy, bx[:, 0], sx[:, 0], n_chains=2, n_iter=2000, n_burnin=100, seed=5, settings="default")
+    r_up_thin = mr_horse(by, sy, bx[:, 0], sx[:, 0], n_chains=2, n_iter=2000, n_burnin=100, seed=5, settings="R_default")
+    r_ovr_thin = mr_horse(
+        by, sy, bx[:, 0], sx[:, 0], n_chains=2, n_iter=2000, n_burnin=100, n_thin=4, seed=5, settings="R_default"
+    )
+    assert r_def_thin["thin"] == 2 and r_def_thin["samples"]["theta[1]"][0].shape == (1000,)
+    assert r_up_thin["thin"] == 1 and r_up_thin["samples"]["theta[1]"][0].shape == (2000,)
+    assert r_ovr_thin["thin"] == 4 and r_ovr_thin["samples"]["theta[1]"][0].shape == (500,)
+
+    # 3. mvmr_horse in R_default: shared scalar rho_i per SNP truncated to |rho_i| < 1 / sqrt(K) - 1e-6
+    r_mv_up = mvmr_horse(
+        by,
+        sy,
+        bx,
+        sx,
+        n_chains=2,
+        n_iter=500,
+        n_burnin=500,
+        seed=11,
+        save=("theta", "rho"),
+        settings="R_default",
+    )
+    est = np.array([e["Estimate"] for e in r_mv_up["estimate"]])
+    rhats = np.array([e["Rhat"] for e in r_mv_up["estimate"]])
+    assert np.allclose(est, theta_true, atol=0.12)
+    assert np.all(rhats < 1.1)
+
+    rho_draws = r_mv_up["extra"]["rho"][0]
+    assert rho_draws.shape == (500, n, k_exp)
+    # Shared scalar rho_i across all K exposures for every SNP and draw
+    np.testing.assert_allclose(rho_draws[:, :, 0], rho_draws[:, :, 1], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(rho_draws[:, :, 0], rho_draws[:, :, 2], rtol=0.0, atol=0.0)
+    # Strictly truncated within 1 / sqrt(K) - 1e-6
+    bound = 1.0 / np.sqrt(k_exp) - 1e-6
+    assert np.all(np.abs(rho_draws) < bound)

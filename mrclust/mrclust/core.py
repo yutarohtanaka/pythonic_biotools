@@ -21,6 +21,22 @@ _LOG_2PI = float(np.log(2.0 * np.pi))
 _EPS_PI = 1e-12
 
 
+class _DefaultSettings(str):
+    """String sentinel equal to ``'default'`` that tracks omitted `settings`."""
+
+
+_DEFAULT_SETTINGS: Literal["default", "R_default"] = _DefaultSettings("default")  # type: ignore[assignment]
+
+
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    """Validate `settings` strictly against `('default', 'R_default')`."""
+    if not isinstance(settings, str) or settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unknown settings {settings!r}; expected 'default' or 'R_default'."
+        )
+    return "R_default" if settings == "R_default" else "default"
+
+
 @dataclass(frozen=True)
 class ClusterInfo:
     """Summary metadata for a single mixture component in the selected MR-Clust model."""
@@ -147,6 +163,7 @@ class MRClustResult:
     junk_mean: float
     junk_scale: float
     junk_df: float
+    settings: Literal["default", "R_default"] = "default"
 
     def to_dataframe(
         self,
@@ -357,6 +374,7 @@ def compute_ratio_estimates(
     byse: Sequence[float] | np.ndarray,
     bxse: Sequence[float] | np.ndarray | None = None,
     variance_order: Literal[1, 2, "first", "second"] = 1,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute Wald ratio estimates theta = by / bx and 1st- or 2nd-order delta-method SEs.
 
@@ -372,6 +390,8 @@ def compute_ratio_estimates(
         Standard errors of `bx` (required when `variance_order=2`, must be >= 0).
     variance_order : {1, 2, "first", "second"}, default=1
         Order of the delta-method variance approximation.
+    settings : {"default", "R_default"}, default="default"
+        Execution mode (`"default"` or upstream R `"R_default"`).
 
     Returns
     -------
@@ -380,6 +400,7 @@ def compute_ratio_estimates(
     theta_se : np.ndarray
         Delta-method standard errors of `theta`.
     """
+    _validate_settings(settings)
     order = _parse_variance_order(variance_order)
     bx_arr = _to_1d_float(bx, "bx")
     by_arr = _to_1d_float(by, "by")
@@ -404,13 +425,7 @@ def compute_ratio_estimates(
             f"byse must be strictly positive; found <= 0 at indices {nonpos_byse[:5].tolist()}."
         )
 
-    theta = by_arr / bx_arr
-    abs_bx = np.abs(bx_arr)
-    first_term = byse_arr / abs_bx
-
-    if order == 1:
-        theta_se = first_term
-    else:
+    if order == 2:
         if bxse is None:
             raise ValueError("bxse is required when variance_order=2.")
         bxse_arr = _to_1d_float(bxse, "bxse")
@@ -423,7 +438,18 @@ def compute_ratio_estimates(
             raise ValueError(
                 f"bxse must be non-negative; found < 0 at indices {neg_bxse[:5].tolist()}."
             )
-        with np.errstate(over="ignore"):
+    else:
+        bxse_arr = None
+
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        theta = by_arr / bx_arr
+        abs_bx = np.abs(bx_arr)
+        first_term = byse_arr / abs_bx
+
+        if order == 1:
+            theta_se = first_term
+        else:
+            assert bxse_arr is not None
             second_term = theta * (bxse_arr / abs_bx)
             theta_se = np.hypot(first_term, second_term)
 
@@ -683,6 +709,25 @@ def _robust_junk_defaults(
     return mu_default, psi_default, wp_mask
 
 
+def _r_junk_defaults(
+    theta: np.ndarray,
+    theta_se: np.ndarray,
+) -> tuple[float, float, np.ndarray]:
+    """Compute upstream R (`cnfoley/mrclust`) Junk location (0.0) and scale."""
+    mu_default = 0.0
+    with np.errstate(over="ignore"):
+        score = np.abs(theta) + 2.0 * theta_se
+        idx_max = int(np.argmax(score))
+        span = float(np.max(theta) - np.min(theta))
+        raw_psi = span + float(theta_se[idx_max])
+    if not np.isfinite(raw_psi):
+        psi_default = float(np.finfo(np.float64).max)
+    else:
+        psi_default = max(raw_psi, 1e-300)
+    wp_mask = np.ones(theta.size, dtype=bool)
+    return mu_default, psi_default, wp_mask
+
+
 def _compute_junk_params_and_logpdf(
     theta: np.ndarray,
     theta_se: np.ndarray,
@@ -692,6 +737,7 @@ def _compute_junk_params_and_logpdf(
     junk_scale: float | None,
     wp_mask: np.ndarray | None = None,
     junk_defaults: tuple[float, float, np.ndarray] | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[float, float, np.ndarray]:
     """Compute fixed Junk component location, scale, and per-observation log-density."""
     if junk_dist not in ("t", "normal", "uniform"):
@@ -700,7 +746,10 @@ def _compute_junk_params_and_logpdf(
         raise ValueError(f"junk_df must be finite and > 0, got {junk_df!r}.")
 
     if junk_defaults is None:
-        mu_default, default_psi, _ = _robust_junk_defaults(theta, theta_se)
+        if settings == "R_default":
+            mu_default, default_psi, _ = _r_junk_defaults(theta, theta_se)
+        else:
+            mu_default, default_psi, _ = _robust_junk_defaults(theta, theta_se)
     else:
         mu_default, default_psi, _ = junk_defaults
 
@@ -709,7 +758,9 @@ def _compute_junk_params_and_logpdf(
         raise ValueError(f"junk_mean must be finite, got {mu_junk!r}.")
 
     if junk_scale is None:
-        if junk_dist == "normal":
+        if settings == "R_default":
+            psi_junk = max(default_psi, 1e-300)
+        elif junk_dist == "normal":
             psi_junk = max(default_psi * 0.5, 1e-300)
         elif junk_dist == "uniform":
             psi_junk = max(default_psi * 2.0, 1e-300)
@@ -722,7 +773,11 @@ def _compute_junk_params_and_logpdf(
 
     if junk_dist == "t":
         nu = float(junk_df)
-        eff_scale = np.hypot(psi_junk, theta_se)
+        eff_scale = (
+            np.full_like(theta_se, psi_junk)
+            if settings == "R_default"
+            else np.hypot(psi_junk, theta_se)
+        )
         const = (
             float(gammaln(0.5 * (nu + 1.0)))
             - float(gammaln(0.5 * nu))
@@ -739,7 +794,11 @@ def _compute_junk_params_and_logpdf(
             )
         log_f = const - 0.5 * (nu + 1.0) * log_quad
     elif junk_dist == "normal":
-        sigma_tot = np.hypot(psi_junk, theta_se)
+        sigma_tot = (
+            np.full_like(theta_se, psi_junk)
+            if settings == "R_default"
+            else np.hypot(psi_junk, theta_se)
+        )
         z = (theta - mu_junk) / sigma_tot
         with np.errstate(over="ignore"):
             log_f = -0.5 * _LOG_2PI - np.log(sigma_tot) - 0.5 * (z * z)
@@ -1287,6 +1346,7 @@ def _fit_for_k(
     max_iter: int,
     tol: float,
     rng: np.random.Generator,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[ClusterFit, bool]:
     """Search for the global MLE fit for a given number of substantive clusters K."""
     n_obs = theta.size
@@ -1333,6 +1393,82 @@ def _fit_for_k(
         return (
             ClusterFit(
                 k=0,
+                n_components=n_comp,
+                n_parameters=n_params,
+                log_likelihood=ll,
+                bic=bic,
+                aic=aic,
+                cluster_means=means,
+                cluster_ses=ses,
+                weights=weights,
+                component_names=comp_names,
+                responsibilities=resp,
+                n_iter=n_iter,
+                converged=conv,
+            ),
+            True,
+        )
+
+    if settings == "R_default":
+        # Upstream `cnfoley/mrclust` initialization: unweighted k-means starts (6 by default)
+        inits_r: list[tuple[np.ndarray, np.ndarray]] = []
+        for r in range(n_init):
+            if r == 0:
+                p_null = 0.10 if include_null else 0.0
+                p_junk = 0.10 if include_junk else 0.0
+                centers, counts = _kmeans_1d(theta, k, rng, sample_weights=None)
+            else:
+                s_nj = float(rng.uniform(0.10, 0.80))
+                u = float(rng.uniform(0.10, 0.90))
+                if include_null and include_junk:
+                    p_null, p_junk = u * s_nj, (1.0 - u) * s_nj
+                elif include_null:
+                    p_null, p_junk = s_nj, 0.0
+                elif include_junk:
+                    p_null, p_junk = 0.0, s_nj
+                else:
+                    p_null, p_junk = 0.0, 0.0
+                m_sub = min(
+                    n_obs,
+                    max(k, int(round((1.0 - p_null - p_junk) * n_obs))),
+                )
+                if m_sub < n_obs and m_sub >= k:
+                    sub_idx = rng.choice(n_obs, size=m_sub, replace=False)
+                    centers, counts = _kmeans_1d(
+                        theta[sub_idx], k, rng, sample_weights=None
+                    )
+                else:
+                    centers, counts = _kmeans_1d(theta, k, rng, sample_weights=None)
+            inits_r.append(
+                (centers, _make_weights(counts, p_null, p_junk, include_null, include_junk))
+            )
+
+        best_r = None
+        for means0, w0 in inits_r:
+            res = _run_em(
+                theta=theta,
+                inv_se=inv_se,
+                log_inv_se=log_inv_se,
+                rel_inv_var=rel_inv_var,
+                min_se=min_se,
+                init_means=means0,
+                init_weights=w0,
+                log_null=log_null,
+                log_junk=log_junk,
+                dirichlet_alpha=dirichlet_alpha,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            if best_r is None or res[4] > best_r[4]:
+                best_r = res
+
+        assert best_r is not None
+        means, ses, weights, resp, ll, n_iter, conv = best_r
+        bic = -2.0 * ll + n_params * float(np.log(n_obs))
+        aic = -2.0 * ll + 2.0 * n_params
+        return (
+            ClusterFit(
+                k=k,
                 n_components=n_comp,
                 n_parameters=n_params,
                 log_likelihood=ll,
@@ -1641,7 +1777,7 @@ def mr_clust_em(
     k_max: int | None = None,
     min_clust_search: int = 10,
     early_stop: bool = False,
-    obs_prob_thresh: float = 0.8,
+    obs_prob_thresh: float | None = None,
     include_null: bool = True,
     include_junk: bool = True,
     junk_dist: Literal["t", "normal", "uniform"] = "t",
@@ -1650,10 +1786,11 @@ def mr_clust_em(
     junk_scale: float | None = None,
     dirichlet_alpha: float = 0.0,
     min_cluster_eff_n: float = 1.5,
-    n_init: int = 20,
+    n_init: int | None = None,
     max_iter: int = 5000,
     tol: float = 1e-6,
     seed: int | None = 42,
+    settings: Literal["default", "R_default"] = "default",
 ) -> MRClustResult:
     """Fit the MR-Clust Gaussian-mixture EM model with BIC selection across K.
 
@@ -1679,8 +1816,9 @@ def mr_clust_em(
         Minimum K reached before `early_stop=True` may terminate the BIC search.
     early_stop : bool, default=False
         If True, stop increasing K once `k >= min_clust_search` and BIC increases.
-    obs_prob_thresh : float, default=0.8
+    obs_prob_thresh : float, optional
         Posterior probability threshold separating confident assignments from `"Unassigned"`.
+        Defaults to `0.8` when `settings="default"` and `0.5` when `settings="R_default"`.
     include_null : bool, default=True
         Include a fixed-zero null component N(0, theta_se^2).
     include_junk : bool, default=True
@@ -1690,7 +1828,7 @@ def mr_clust_em(
     junk_df : float, default=4.0
         Degrees of freedom when `junk_dist="t"`.
     junk_mean : float, optional
-        Optional fixed mean for the junk component (default: mean of `theta`).
+        Optional fixed mean for the junk component (`0.0` under `settings="R_default"`).
     junk_scale : float, optional
         Optional fixed scale for the junk component.
     dirichlet_alpha : float, default=0.0
@@ -1698,14 +1836,20 @@ def mr_clust_em(
     min_cluster_eff_n : float, default=1.5
         Minimum effective number of variants (`sum_j r_{j,k}`) required for a substantive
         cluster to be considered non-singleton during BIC model selection.
-    n_init : int, default=20
-        Number of multi-start k-means++ initializations per K.
+    n_init : int, optional
+        Number of multi-start k-means initializations per K (`20` under `"default"`,
+        `6` unweighted starts under `"R_default"`).
     max_iter : int, default=5000
         Maximum EM iterations per initialization.
     tol : float, default=1e-6
         Log-likelihood convergence tolerance for EM.
     seed : int or None, default=42
         Random seed for deterministic initialization (`np.random.default_rng(seed)`).
+    settings : {"default", "R_default"}, default="default"
+        `"default"` uses weak-IV-robust Junk parameterization and precision-aware initialization;
+        `"R_default"` replicates upstream `cnfoley/mrclust` (`junk_mean=0.0`,
+        `junk_scale = range(theta) + theta_se[argmax(|theta| + 2*theta_se)]` without `hypot`
+        inflation, `obs_prob_thresh=0.5`, and 6 unweighted k-means starts).
 
     Returns
     -------
@@ -1713,7 +1857,17 @@ def mr_clust_em(
         Frozen dataclass containing the BIC-selected model, all evaluated K models,
         cluster metadata, and per-variant responsibilities.
     """
-    if not np.isfinite(obs_prob_thresh) or obs_prob_thresh < 0.0 or obs_prob_thresh > 1.0:
+    eff_settings = _validate_settings(settings)
+    if obs_prob_thresh is None:
+        thresh_val = 0.5 if eff_settings == "R_default" else 0.8
+    else:
+        thresh_val = float(obs_prob_thresh)
+    if n_init is None:
+        n_init_val = 6 if eff_settings == "R_default" else 20
+    else:
+        n_init_val = int(n_init)
+
+    if not np.isfinite(thresh_val) or thresh_val < 0.0 or thresh_val > 1.0:
         raise ValueError(f"obs_prob_thresh must be in [0, 1], got {obs_prob_thresh!r}.")
     if k_min < 0:
         raise ValueError(f"k_min must be >= 0, got {k_min!r}.")
@@ -1723,7 +1877,7 @@ def mr_clust_em(
         raise ValueError(f"dirichlet_alpha must be finite and >= 0, got {dirichlet_alpha!r}.")
     if min_cluster_eff_n < 0.0 or not np.isfinite(min_cluster_eff_n):
         raise ValueError(f"min_cluster_eff_n must be finite and >= 0, got {min_cluster_eff_n!r}.")
-    if n_init < 1:
+    if n_init_val < 1:
         raise ValueError(f"n_init must be >= 1, got {n_init!r}.")
     if max_iter < 1:
         raise ValueError(f"max_iter must be >= 1, got {max_iter!r}.")
@@ -1768,7 +1922,10 @@ def mr_clust_em(
         else None
     )
 
-    junk_defaults = _robust_junk_defaults(theta_arr, theta_se_arr)
+    if eff_settings == "R_default":
+        junk_defaults = _r_junk_defaults(theta_arr, theta_se_arr)
+    else:
+        junk_defaults = _robust_junk_defaults(theta_arr, theta_se_arr)
     wp_mask = junk_defaults[2]
 
     if include_junk:
@@ -1780,6 +1937,7 @@ def mr_clust_em(
             junk_mean=junk_mean,
             junk_scale=junk_scale,
             junk_defaults=junk_defaults,
+            settings=eff_settings,
         )
     else:
         mu_junk = junk_defaults[0] if junk_mean is None else float(junk_mean)
@@ -1806,12 +1964,13 @@ def mr_clust_em(
             include_null=include_null,
             include_junk=include_junk,
             prev_fit=prev_fit,
-            n_init=n_init,
+            n_init=n_init_val,
             dirichlet_alpha=dirichlet_alpha,
             min_cluster_eff_n=min_cluster_eff_n,
             max_iter=max_iter,
             tol=tol,
             rng=rng,
+            settings=eff_settings,
         )
         all_models.append(fit)
         admissible_flags.append(is_adm)
@@ -1827,67 +1986,68 @@ def mr_clust_em(
     best_idx = np.argmax(resp, axis=1)
     assign_probs = resp[np.arange(n_snps), best_idx]
 
-    n_gauss = best_fit.k + (1 if log_null is not None else 0)
-    active_gauss = [g for g in range(n_gauss) if float(best_fit.weights[g]) > 1e-4]
-    if len(active_gauss) >= 2:
-        gauss_cols: list[np.ndarray] = []
-        if best_fit.k > 0:
-            z_g = (theta_arr[:, None] - best_fit.cluster_means[None, :]) * inv_se[:, None]
-            with np.errstate(over="ignore"):
-                log_subst = -0.5 * _LOG_2PI + log_inv_se[:, None] - 0.5 * (z_g * z_g)
-            gauss_cols.append(log_subst)
-        if log_null is not None:
-            gauss_cols.append(log_null[:, None])
-        log_gauss_all = np.concatenate(gauss_cols, axis=1)
-        flat_gauss = _gauss_log_spread(log_gauss_all[:, active_gauss]) < 0.25
-        active_centers = [
-            float(best_fit.cluster_means[g]) if g < best_fit.k else 0.0
-            for g in active_gauss
-        ]
-        active_span = float(np.ptp(active_centers))
-    else:
-        flat_gauss = np.ones(n_snps, dtype=bool)
-        active_span = 0.0
-
-    med_se_all = float(np.median(theta_se_arr))
-    if include_junk:
-        junk_idx = best_fit.n_components - 1
-        junk_active = float(best_fit.weights[junk_idx]) > 1e-4
-        above_junk_scale = (
-            (theta_se_arr > 2.0 * psi_junk)
-            if psi_junk > 0.0
-            else np.ones(n_snps, dtype=bool)
-        )
+    if eff_settings != "R_default":
+        n_gauss = best_fit.k + (1 if log_null is not None else 0)
+        active_gauss = [g for g in range(n_gauss) if float(best_fit.weights[g]) > 1e-4]
         if len(active_gauss) >= 2:
-            weak_se = above_junk_scale & (theta_se_arr > 2.0 * active_span)
+            gauss_cols: list[np.ndarray] = []
+            if best_fit.k > 0:
+                z_g = (theta_arr[:, None] - best_fit.cluster_means[None, :]) * inv_se[:, None]
+                with np.errstate(over="ignore"):
+                    log_subst = -0.5 * _LOG_2PI + log_inv_se[:, None] - 0.5 * (z_g * z_g)
+                gauss_cols.append(log_subst)
+            if log_null is not None:
+                gauss_cols.append(log_null[:, None])
+            log_gauss_all = np.concatenate(gauss_cols, axis=1)
+            flat_gauss = _gauss_log_spread(log_gauss_all[:, active_gauss]) < 0.25
+            active_centers = [
+                float(best_fit.cluster_means[g]) if g < best_fit.k else 0.0
+                for g in active_gauss
+            ]
+            active_span = float(np.ptp(active_centers))
         else:
-            weak_se = (
-                above_junk_scale & ((theta_se_arr > 2.0 * med_se_all) | (assign_probs < 0.75))
-                if junk_active
-                else (theta_se_arr > max(10.0 * psi_junk, 100.0 * med_se_all))
-            )
-    elif include_null:
-        if len(active_gauss) >= 2:
-            weak_se = theta_se_arr > 2.0 * active_span
-        else:
-            weak_se = theta_se_arr > 100.0 * med_se_all
-    else:
-        weak_se = np.zeros(n_snps, dtype=bool)
+            flat_gauss = np.ones(n_snps, dtype=bool)
+            active_span = 0.0
 
-    uninformative_weak = (~wp_mask) & flat_gauss & weak_se & (best_idx < best_fit.k)
-    if np.any(uninformative_weak):
+        med_se_all = float(np.median(theta_se_arr))
         if include_junk:
             junk_idx = best_fit.n_components - 1
-            best_idx[uninformative_weak] = junk_idx
-            assign_probs[uninformative_weak] = resp[uninformative_weak, junk_idx]
+            junk_active = float(best_fit.weights[junk_idx]) > 1e-4
+            above_junk_scale = (
+                (theta_se_arr > 2.0 * psi_junk)
+                if psi_junk > 0.0
+                else np.ones(n_snps, dtype=bool)
+            )
+            if len(active_gauss) >= 2:
+                weak_se = above_junk_scale & (theta_se_arr > 2.0 * active_span)
+            else:
+                weak_se = (
+                    above_junk_scale & ((theta_se_arr > 2.0 * med_se_all) | (assign_probs < 0.75))
+                    if junk_active
+                    else (theta_se_arr > max(10.0 * psi_junk, 100.0 * med_se_all))
+                )
         elif include_null:
-            null_idx = best_fit.k
-            best_idx[uninformative_weak] = null_idx
-            assign_probs[uninformative_weak] = resp[uninformative_weak, null_idx]
+            if len(active_gauss) >= 2:
+                weak_se = theta_se_arr > 2.0 * active_span
+            else:
+                weak_se = theta_se_arr > 100.0 * med_se_all
+        else:
+            weak_se = np.zeros(n_snps, dtype=bool)
+
+        uninformative_weak = (~wp_mask) & flat_gauss & weak_se & (best_idx < best_fit.k)
+        if np.any(uninformative_weak):
+            if include_junk:
+                junk_idx = best_fit.n_components - 1
+                best_idx[uninformative_weak] = junk_idx
+                assign_probs[uninformative_weak] = resp[uninformative_weak, junk_idx]
+            elif include_null:
+                null_idx = best_fit.k
+                best_idx[uninformative_weak] = null_idx
+                assign_probs[uninformative_weak] = resp[uninformative_weak, null_idx]
 
     best_cluster = tuple(best_fit.component_names[i] for i in best_idx)
     membership = tuple(
-        bc if p >= obs_prob_thresh else "Unassigned"
+        bc if p >= thresh_val else "Unassigned"
         for bc, p in zip(best_cluster, assign_probs)
     )
 
@@ -1908,7 +2068,7 @@ def mr_clust_em(
 
         mask_map = best_idx == c_idx
         n_assigned = int(np.sum(mask_map))
-        n_assigned_thresh = int(np.sum(mask_map & (assign_probs >= obs_prob_thresh)))
+        n_assigned_thresh = int(np.sum(mask_map & (assign_probs >= thresh_val)))
         clusters_info.append(
             ClusterInfo(
                 cluster_id=c_name,
@@ -1941,20 +2101,22 @@ def mr_clust_em(
         cluster_membership=membership,
         assignment_probs=assign_probs,
         responsibilities=resp,
-        obs_prob_thresh=float(obs_prob_thresh),
+        obs_prob_thresh=thresh_val,
         junk_dist=junk_dist,
         junk_mean=mu_junk,
         junk_scale=psi_junk,
         junk_df=float(junk_df),
+        settings=eff_settings,
     )
 
 
 def pr_clust(
     result: MRClustResult,
-    obs_prob_thresh: float = 0.8,
+    obs_prob_thresh: float | None = None,
     min_cluster_size: int = 1,
     include_null: bool = True,
     include_junk: bool = False,
+    settings: Literal["default", "R_default"] = _DEFAULT_SETTINGS,
 ) -> pd.DataFrame:
     """Filter variant-cluster assignments by posterior probability and minimum cluster size.
 
@@ -1962,28 +2124,38 @@ def pr_clust(
     ----------
     result : MRClustResult
         Output of `mr_clust_em`.
-    obs_prob_thresh : float, default=0.8
-        Minimum posterior assignment probability required to retain a variant.
+    obs_prob_thresh : float, optional
+        Minimum posterior assignment probability required to retain a variant
+        (`0.8` under `"default"`, `0.5` under `"R_default"`).
     min_cluster_size : int, default=1
         Minimum number of threshold-passing variants required to retain a cluster.
     include_null : bool, default=True
         Whether to retain variants assigned to the `"Null"` cluster.
     include_junk : bool, default=False
         Whether to retain variants assigned to the `"Junk"` cluster.
+    settings : {"default", "R_default"}, default="default"
+        Execution mode; inherits `result.settings` when omitted.
 
     Returns
     -------
     pd.DataFrame
         Filtered tidy assignment table.
     """
+    eff_settings = _validate_settings(settings)
     if not isinstance(result, MRClustResult):
         raise ValueError("`result` must be an MRClustResult instance.")
-    if not np.isfinite(obs_prob_thresh) or obs_prob_thresh < 0.0 or obs_prob_thresh > 1.0:
+    if isinstance(settings, _DefaultSettings):
+        eff_settings = result.settings
+    if obs_prob_thresh is None:
+        thresh_val = 0.5 if eff_settings == "R_default" else 0.8
+    else:
+        thresh_val = float(obs_prob_thresh)
+    if not np.isfinite(thresh_val) or thresh_val < 0.0 or thresh_val > 1.0:
         raise ValueError(f"obs_prob_thresh must be in [0, 1], got {obs_prob_thresh!r}.")
     if min_cluster_size < 1:
         raise ValueError(f"min_cluster_size must be >= 1, got {min_cluster_size!r}.")
 
-    df = result.to_dataframe(obs_prob_thresh=obs_prob_thresh)
+    df = result.to_dataframe(obs_prob_thresh=thresh_val)
     df = df[df["passes_threshold"]].copy()
     if not include_null:
         df = df[df["cluster_class"] != "Null"]

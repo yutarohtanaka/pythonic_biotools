@@ -12,11 +12,19 @@ Implements:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if not isinstance(settings, str) or settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unknown settings {settings!r}; expected 'default' or 'R_default'."
+        )
+    return "R_default" if settings == "R_default" else "default"
 
 
 @dataclass(frozen=True)
@@ -62,8 +70,10 @@ def ivw_mr(
     beta_exp: Sequence[float] | np.ndarray,
     beta_out: Sequence[float] | np.ndarray,
     se_out: Sequence[float] | np.ndarray,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict[str, float]:
     """Multiplicative random-effects Inverse-Variance Weighted (IVW) MR + Cochran's Q."""
+    _validate_settings(settings)
     bx = np.asarray(beta_exp, dtype=np.float64).ravel()
     by = np.asarray(beta_out, dtype=np.float64).ravel()
     sy = np.asarray(se_out, dtype=np.float64).ravel()
@@ -96,8 +106,10 @@ def mr_egger(
     beta_exp: Sequence[float] | np.ndarray,
     beta_out: Sequence[float] | np.ndarray,
     se_out: Sequence[float] | np.ndarray,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict[str, float]:
     """Coding-invariant MR-Egger regression (orients all `beta_exp >= 0` prior to WLS)."""
+    _validate_settings(settings)
     bx = np.asarray(beta_exp, dtype=np.float64).ravel()
     by = np.asarray(beta_out, dtype=np.float64).ravel()
     sy = np.asarray(se_out, dtype=np.float64).ravel()
@@ -139,10 +151,16 @@ def weighted_median_mr(
     beta_out: Sequence[float] | np.ndarray,
     se_out: Sequence[float] | np.ndarray,
     se_exp: Sequence[float] | np.ndarray | None = None,
-    n_boot: int = 1000,
+    n_boot: int | None = None,
     seed: int = 42,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict[str, float]:
     """Bowden et al. (2016) Weighted Median MR estimator with parametric bootstrap SE."""
+    eff_settings = _validate_settings(settings)
+    n_boot_val = 1000 if n_boot is None else int(n_boot)
+    if n_boot_val < 2:
+        raise ValueError(f"n_boot must be >= 2; got {n_boot!r}.")
+
     bx = np.asarray(beta_exp, dtype=np.float64).ravel()
     by = np.asarray(beta_out, dtype=np.float64).ravel()
     sy = np.asarray(se_out, dtype=np.float64).ravel()
@@ -165,7 +183,12 @@ def weighted_median_mr(
     by_pos = by * signs
 
     ratios = by_pos / bx_pos
-    weights = (bx_pos**2) / (sy**2)
+    if eff_settings == "R_default" and sx is not None:
+        # 2nd-order delta-method inverse-variance weights (MRCIEU/TwoSampleMR::mr_weighted_median)
+        vbj = (sy / bx_pos) ** 2 + (ratios * (sx / bx_pos)) ** 2
+        weights = 1.0 / vbj
+    else:
+        weights = (bx_pos**2) / (sy**2)
     weights = weights / np.sum(weights)
 
     order = np.argsort(ratios, kind="mergesort")
@@ -173,8 +196,8 @@ def weighted_median_mr(
     beta_wm = float(np.interp(0.5, cum_w, ratios[order]))
 
     rng = np.random.default_rng(seed)
-    boot_ests = np.empty(n_boot, dtype=np.float64)
-    for b in range(n_boot):
+    boot_ests = np.empty(n_boot_val, dtype=np.float64)
+    for b in range(n_boot_val):
         if sx is not None:
             bx_sim = rng.normal(bx_pos, sx)
             bx_sim = np.where(bx_sim == 0.0, 1e-15, bx_sim)
@@ -186,7 +209,10 @@ def weighted_median_mr(
         cw_sim = np.cumsum(weights[ord_sim]) - 0.5 * weights[ord_sim]
         boot_ests[b] = float(np.interp(0.5, cw_sim, r_sim[ord_sim]))
 
-    se_wm = float(np.std(boot_ests, ddof=1) + 1e-12)
+    if eff_settings == "R_default":
+        se_wm = max(float(np.std(boot_ests, ddof=1)), 1e-300)
+    else:
+        se_wm = float(np.std(boot_ests, ddof=1) + 1e-12)
     pval_wm = float(2.0 * stats.norm.sf(abs(beta_wm / se_wm)))
     return {"beta": beta_wm, "se": se_wm, "pval": pval_wm}
 
@@ -198,8 +224,10 @@ def multivariable_mr(
     beta_out: Sequence[float] | np.ndarray,
     se_out: Sequence[float] | np.ndarray,
     se_exp_covariates: np.ndarray | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict[str, float | np.ndarray]:
     """Multivariable MR (`MVMR`) + Sanderson-Windmeijer conditional F-statistic for primary exposure."""
+    eff_settings = _validate_settings(settings)
     bx = np.asarray(beta_exp_primary, dtype=np.float64).ravel()
     sx = np.asarray(se_exp_primary, dtype=np.float64).ravel()
     by = np.asarray(beta_out, dtype=np.float64).ravel()
@@ -232,26 +260,40 @@ def multivariable_mr(
     theta = xtwx_inv @ (x_mvmr.T @ (w * by))
     resid = by - x_mvmr @ theta
     df_mvmr = k - p_exp
-    s2 = max(1.0, float(np.sum(w * (resid**2)) / df_mvmr))
-    se_vec = np.sqrt(np.maximum(s2 * np.diag(xtwx_inv), 1e-12))
+    raw_s2 = float(np.sum(w * (resid**2)) / df_mvmr)
+    if eff_settings == "R_default":
+        # Upstream WSpiller/MVMR::ivw_mvmr uses un-clamped residual variance and Student-t_{K-P} p-values
+        s2 = raw_s2
+        se_vec = np.sqrt(np.maximum(s2 * np.diag(xtwx_inv), 1e-300))
+    else:
+        s2 = max(1.0, raw_s2)
+        se_vec = np.sqrt(np.maximum(s2 * np.diag(xtwx_inv), 1e-12))
     all_pvals = 2.0 * stats.t.sf(np.abs(theta / se_vec), df=df_mvmr)
 
-    # Sanderson-Windmeijer (2019/2021) conditional F for primary exposure given secondary exposures,
-    # weighting by exposure measurement-error variance sx_1^2 + sum_{m=2}^P delta_m^2 sx_m^2
-    w_x0 = 1.0 / (sx**2)
-    delta_hat = np.linalg.pinv(c_mat.T @ (c_mat * w_x0[:, None])) @ (c_mat.T @ (w_x0 * bx))
-    if sc_mat is not None:
-        for _ in range(25):
+    if eff_settings == "R_default":
+        # Upstream WSpiller/MVMR::strength_mvmr estimates delta via unweighted OLS
+        delta_hat = np.linalg.pinv(c_mat.T @ c_mat) @ (c_mat.T @ bx)
+        if sc_mat is not None:
             var_cond = sx**2 + (sc_mat**2) @ (delta_hat**2)
-            w_cond = 1.0 / np.maximum(var_cond, 1e-30)
-            delta_new = np.linalg.pinv(c_mat.T @ (c_mat * w_cond[:, None])) @ (c_mat.T @ (w_cond * bx))
-            if np.max(np.abs(delta_new - delta_hat)) < 1e-10:
-                delta_hat = delta_new
-                break
-            delta_hat = delta_new
-        var_cond = sx**2 + (sc_mat**2) @ (delta_hat**2)
+        else:
+            var_cond = sx**2
     else:
-        var_cond = sx**2
+        # Sanderson-Windmeijer (2019/2021) conditional F for primary exposure given secondary exposures,
+        # weighting by exposure measurement-error variance sx_1^2 + sum_{m=2}^P delta_m^2 sx_m^2
+        w_x0 = 1.0 / (sx**2)
+        delta_hat = np.linalg.pinv(c_mat.T @ (c_mat * w_x0[:, None])) @ (c_mat.T @ (w_x0 * bx))
+        if sc_mat is not None:
+            for _ in range(25):
+                var_cond = sx**2 + (sc_mat**2) @ (delta_hat**2)
+                w_cond = 1.0 / np.maximum(var_cond, 1e-30)
+                delta_new = np.linalg.pinv(c_mat.T @ (c_mat * w_cond[:, None])) @ (c_mat.T @ (w_cond * bx))
+                if np.max(np.abs(delta_new - delta_hat)) < 1e-10:
+                    delta_hat = delta_new
+                    break
+                delta_hat = delta_new
+            var_cond = sx**2 + (sc_mat**2) @ (delta_hat**2)
+        else:
+            var_cond = sx**2
 
     bx_resid = bx - c_mat @ delta_hat
     df_cond = max(k - c_mat.shape[1], 1)
@@ -280,10 +322,12 @@ def run_mr_suite(
     covariate_exp_ses: np.ndarray | None = None,
     exposure_name: str = "exposure",
     outcome_name: str = "outcome",
-    n_boot: int = 1000,
+    n_boot: int | None = None,
     seed: int = 42,
+    settings: Literal["default", "R_default"] = "default",
 ) -> MRSummaryResult:
     """Run IVW, coding-invariant MR-Egger, Weighted Median, and optional MVMR in one call."""
+    eff_settings = _validate_settings(settings)
     bx = np.asarray(beta_exp, dtype=np.float64).ravel()
     sx = np.asarray(se_exp, dtype=np.float64).ravel()
     by = np.asarray(beta_out, dtype=np.float64).ravel()
@@ -292,12 +336,20 @@ def run_mr_suite(
         raise ValueError("run_mr_suite requires at least K >= 3 instruments.")
 
     mean_f = float(np.mean((bx / sx) ** 2))
-    ivw = ivw_mr(bx, by, sy)
-    egger = mr_egger(bx, by, sy)
-    wm = weighted_median_mr(bx, by, sy, se_exp=sx, n_boot=n_boot, seed=seed)
+    ivw = ivw_mr(bx, by, sy, settings=eff_settings)
+    egger = mr_egger(bx, by, sy, settings=eff_settings)
+    wm = weighted_median_mr(bx, by, sy, se_exp=sx, n_boot=n_boot, seed=seed, settings=eff_settings)
 
     if covariate_exp_betas is not None:
-        mv = multivariable_mr(bx, sx, covariate_exp_betas, by, sy, se_exp_covariates=covariate_exp_ses)
+        mv = multivariable_mr(
+            bx,
+            sx,
+            covariate_exp_betas,
+            by,
+            sy,
+            se_exp_covariates=covariate_exp_ses,
+            settings=eff_settings,
+        )
         b_mv, s_mv, p_mv = float(mv["beta_primary"]), float(mv["se_primary"]), float(mv["pval_primary"])
         f_cond = float(mv["conditional_f_stat"])
     else:

@@ -135,3 +135,120 @@ def test_palindromic_nan_filter_clumping_and_harmonise_mr_data():
 
     with pytest.raises(ValueError):
         harmonise_mr_data(exp_df, out_df, action=99)
+
+
+def test_r_default_settings():
+    # 1. Strict settings validation across all entrypoints
+    bx = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
+    sx = np.array([0.01, 0.08, 0.01, 0.09, 0.01])
+    by = np.array([0.02, 0.18, 0.06, 0.35, 0.10])
+    sy = np.array([0.02, 0.01, 0.02, 0.01, 0.02])
+    cov_b = np.array([0.05, -0.10, 0.12, -0.08, 0.15])
+
+    for bad in ("invalid", "r_default", "", None):
+        with pytest.raises(ValueError, match="Unknown settings"):
+            ivw_mr(bx, by, sy, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            mr_egger(bx, by, sy, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            weighted_median_mr(bx, by, sy, se_exp=sx, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            multivariable_mr(bx, sx, cov_b, by, sy, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            run_mr_suite(bx, sx, by, sy, settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            select_mr_instruments(pd.DataFrame({"pval_exp": [1e-10]}), settings=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Unknown settings"):
+            harmonise_mr_data(pd.DataFrame(), pd.DataFrame(), settings=bad)  # type: ignore[arg-type]
+
+    # 2. weighted_median_mr: 2nd-order delta-method weights + default n_boot=1000
+    wm_def = weighted_median_mr(bx, by, sy, se_exp=sx, seed=99, settings="default")
+    wm_r = weighted_median_mr(bx, by, sy, se_exp=sx, seed=99, settings="R_default")
+    wm_r_1000 = weighted_median_mr(bx, by, sy, se_exp=sx, n_boot=1000, seed=99, settings="R_default")
+    wm_r_200 = weighted_median_mr(bx, by, sy, se_exp=sx, n_boot=200, seed=99, settings="R_default")
+
+    ratios = by / bx
+    w1 = (bx**2) / (sy**2)
+    w1 /= np.sum(w1)
+    w2 = 1.0 / ((sy**2) / (bx**2) + (by**2) * (sx**2) / (bx**4))
+    w2 /= np.sum(w2)
+    ord_r = np.argsort(ratios, kind="mergesort")
+    expected_beta_def = float(np.interp(0.5, np.cumsum(w1[ord_r]) - 0.5 * w1[ord_r], ratios[ord_r]))
+    expected_beta_r = float(np.interp(0.5, np.cumsum(w2[ord_r]) - 0.5 * w2[ord_r], ratios[ord_r]))
+
+    np.testing.assert_allclose(wm_def["beta"], expected_beta_def, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(wm_r["beta"], expected_beta_r, rtol=1e-12, atol=1e-12)
+    assert abs(wm_r["beta"] - wm_def["beta"]) > 0.05
+    np.testing.assert_allclose(wm_r["se"], wm_r_1000["se"], rtol=1e-13, atol=1e-13)
+    assert wm_r["se"] != wm_r_200["se"]
+
+    # 3. multivariable_mr: unweighted OLS delta_hat + un-clamped residual variance + Student-t_{K-P} p-values
+    rng = np.random.default_rng(2027)
+    k = 18
+    c_mat = rng.normal(0.0, 0.2, size=(k, 2))
+    # Heteroskedastic sx creates divergence between unweighted OLS delta_hat and WLS/IRLS delta_hat
+    sx_mv = np.concatenate([np.full(k // 2, 0.005), np.full(k - k // 2, 0.08)])
+    sc_mv = rng.uniform(0.01, 0.03, size=(k, 2))
+    bx_mv = c_mat @ np.array([1.1, -0.7]) + np.concatenate(
+        [rng.normal(0.0, 0.02, k // 2), rng.normal(0.25, 0.05, k - k // 2)]
+    )
+    sy_mv = np.full(k, 0.10)
+    # Small residual noise so raw_s2 = rss / (K - P) < 1.0 (underdispersed)
+    by_mv = 0.50 * bx_mv - 0.25 * c_mat[:, 0] + 0.15 * c_mat[:, 1] + rng.normal(0.0, 0.03, size=k)
+
+    mv_def = multivariable_mr(bx_mv, sx_mv, c_mat, by_mv, sy_mv, se_exp_covariates=sc_mv, settings="default")
+    mv_r = multivariable_mr(bx_mv, sx_mv, c_mat, by_mv, sy_mv, se_exp_covariates=sc_mv, settings="R_default")
+
+    # Verify exact WSpiller/MVMR equations
+    x_mat = np.column_stack([bx_mv, c_mat])
+    w_out = 1.0 / (sy_mv**2)
+    xtwx_inv = np.linalg.pinv(x_mat.T @ (x_mat * w_out[:, None]))
+    theta_hat = xtwx_inv @ (x_mat.T @ (w_out * by_mv))
+    df_mvmr = k - 3
+    raw_s2 = float(np.sum(w_out * ((by_mv - x_mat @ theta_hat) ** 2)) / df_mvmr)
+    assert raw_s2 < 0.5  # strictly < 1.0 so un-clamped SE differs from clamped SE
+
+    expected_se_r = np.sqrt(raw_s2 * np.diag(xtwx_inv))
+    expected_p_r = 2.0 * stats.t.sf(np.abs(theta_hat / expected_se_r), df=df_mvmr)
+    np.testing.assert_allclose(mv_r["all_betas"], theta_hat, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(mv_r["all_ses"], expected_se_r, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(mv_r["all_pvals"], expected_p_r, rtol=1e-12, atol=1e-12)
+    assert mv_r["se_primary"] < mv_def["se_primary"] * 0.75
+
+    delta_ols = np.linalg.pinv(c_mat.T @ c_mat) @ (c_mat.T @ bx_mv)
+    var_cond_ols = sx_mv**2 + (sc_mv**2) @ (delta_ols**2)
+    expected_f_r = float(np.sum(((bx_mv - c_mat @ delta_ols) ** 2) / var_cond_ols) / (k - 2))
+    np.testing.assert_allclose(mv_r["conditional_f_stat"], expected_f_r, rtol=1e-12, atol=1e-12)
+    assert not np.isclose(mv_r["conditional_f_stat"], mv_def["conditional_f_stat"], rtol=1e-3)
+
+    # Verify run_mr_suite forwards settings="R_default"
+    suite_r = run_mr_suite(
+        bx_mv, sx_mv, by_mv, sy_mv, covariate_exp_betas=c_mat, covariate_exp_ses=sc_mv, seed=42, settings="R_default"
+    )
+    np.testing.assert_allclose(suite_r.se_mvmr, mv_r["se_primary"], rtol=1e-12)
+    np.testing.assert_allclose(suite_r.conditional_f_stat, mv_r["conditional_f_stat"], rtol=1e-12)
+
+    # 4. select_mr_instruments: default r2_threshold = 0.001 in R_default vs 0.01 in default
+    df_clump = pd.DataFrame(
+        {
+            "snp": ["rs_lead", "rs_mid_ld", "rs_indep"],
+            "ref": ["A", "C", "G"],
+            "alt": ["G", "T", "A"],
+            "eaf": [0.30, 0.25, 0.40],
+            "pval_exp": [1e-15, 1e-10, 1e-9],
+        }
+    )
+    r2_mat = np.array(
+        [
+            [1.0, 0.005, 0.0002],
+            [0.005, 1.0, 0.0001],
+            [0.0002, 0.0001, 1.0],
+        ]
+    )
+    sel_def = select_mr_instruments(df_clump, r2_matrix=r2_mat, settings="default")
+    sel_r = select_mr_instruments(df_clump, r2_matrix=r2_mat, settings="R_default")
+    sel_r_override = select_mr_instruments(df_clump, r2_matrix=r2_mat, r2_threshold=0.02, settings="R_default")
+    assert list(sel_def["snp"]) == ["rs_lead", "rs_mid_ld", "rs_indep"]
+    assert list(sel_r["snp"]) == ["rs_lead", "rs_indep"]
+    assert list(sel_r_override["snp"]) == ["rs_lead", "rs_mid_ld", "rs_indep"]
+

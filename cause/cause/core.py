@@ -33,6 +33,9 @@ class CauseParams:
     log_likelihood: float
     converged: bool
     n_iter: int
+    grid_S1: np.ndarray | None = None
+    grid_S2: np.ndarray | None = None
+    settings: str = "default"
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return active bivariate mixture grid `(S1, S2, pi)` sorted by descending `pi`."""
@@ -143,6 +146,8 @@ class CauseResult:
     causal: CauseModelFit
     loo_null: PSISLOOResult
     elpd_table: pd.DataFrame
+    n_samples: int = 2000
+    settings: str = "default"
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return pairwise ELPD model comparison table (`model1`, `model2`, `delta_elpd`, `se_delta_elpd`, `z`, `p_value`)."""
@@ -272,11 +277,19 @@ def _estimate_rho_trunc_mle(
     return float(opt.x), n0
 
 
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+    return settings  # type: ignore[return-value]
+
+
 def _build_1d_var_grid(
     beta: np.ndarray,
     se: np.ndarray,
     grid_mult: float,
     max_grid_1d: int,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> np.ndarray:
     """Construct `ash`-style unimodal 1D variance grid `{0} U {sigma_r^2}`."""
     sigma_min = max(float(np.median(se)) / 10.0, 1e-12)
@@ -291,6 +304,11 @@ def _build_1d_var_grid(
     sigmas = np.concatenate(
         ([0.0], sigma_min * (mult ** np.arange(n_pos, dtype=np.float64)))
     )
+    if settings == "R_default":
+        s_top = float(sigmas[-1])
+        sigmas = np.concatenate(
+            (sigmas, np.array([2.0 * s_top, 4.0 * s_top], dtype=np.float64))
+        )
     return sigmas * sigmas
 
 
@@ -313,6 +331,7 @@ def est_cause_params(
     tol: float = 1e-6,
     weight_prune_thresh: float = 1e-10,
     seed: int | np.random.Generator | None = 0,
+    settings: Literal["default", "R_default"] = "default",
 ) -> CauseParams:
     """Estimate CAUSE genome-wide nuisance parameters (`rho` and bivariate `ash` mixture).
 
@@ -334,10 +353,14 @@ def est_cause_params(
     max_variants : int, default 1_000_000
         Maximum number of SNPs to use; larger inputs are subsampled deterministically.
     rho : float, optional
-        Optional fixed sample-overlap correlation in `(-1, 1)`. If `None`, estimated via MLE.
+        Optional fixed sample-overlap correlation in `(-1, 1)`. If `None`, estimated via MLE
+        (or joint MAP with `arctanh(rho) ~ N(0, 0.5^2)` under `settings='R_default'`).
     seed : int or np.random.Generator or None, default 0
         Random seed used only if `N > max_variants` subsampling is triggered.
+    settings : {'default', 'R_default'}, default 'default'
+        Estimation mode (`'default'` or `'R_default'` matching upstream `jean997/cause`).
     """
+    mode_settings = _validate_settings(settings)
     if not (0.0 < null_p_thresh < 1.0):
         raise ValueError(f"null_p_thresh must be in (0, 1) (got {null_p_thresh!r}).")
     if null_wt < 1.0:
@@ -384,109 +407,236 @@ def est_cause_params(
 
     b1, b2 = _canonicalize_signs(b1, b2)
 
-    if rho is not None:
-        rho_val = float(rho)
-        if not np.isfinite(rho_val) or not (-1.0 < rho_val < 1.0):
-            raise ValueError(f"rho must lie strictly in (-1, 1) (got {rho!r}).")
-        rho_hat = rho_val
-        n_null_rho = n_snps
-    else:
-        z1 = b1 / s1
-        z2 = b2 / s2
-        rho_hat, n_null_rho = _estimate_rho_trunc_mle(z1, z2, null_p_thresh)
-
-    var1 = _build_1d_var_grid(b1, s1, grid_mult=grid_mult, max_grid_1d=max_grid_1d)
-    var2 = _build_1d_var_grid(b2, s2, grid_mult=grid_mult, max_grid_1d=max_grid_1d)
+    var1 = _build_1d_var_grid(
+        b1, s1, grid_mult=grid_mult, max_grid_1d=max_grid_1d, settings=mode_settings
+    )
+    var2 = _build_1d_var_grid(
+        b2, s2, grid_mult=grid_mult, max_grid_1d=max_grid_1d, settings=mode_settings
+    )
     s1_grid, s2_grid = np.meshgrid(var1, var2, indexing="ij")
     s1_flat = s1_grid.ravel()
     s2_flat = s2_grid.ravel()
     n_comp = s1_flat.size
 
-    # Cancellation-free log-likelihood matrix (N, K)
+    # Precompute per-SNP sufficient terms
     s1_sq = (s1 * s1)[:, None]
     s2_sq = (s2 * s2)[:, None]
     b1_sq = (b1 * b1)[:, None]
     b2_sq = (b2 * b2)[:, None]
     b1_b2_s1_s2 = (s1 * s2 * b1 * b2)[:, None]
 
-    det = (
-        s1_sq * s2_sq * (1.0 - rho_hat * rho_hat)
-        + s1_flat[None, :] * s2_sq
-        + s2_flat[None, :] * s1_sq
-        + (s1_flat * s2_flat)[None, :]
-    )
-    det = np.maximum(det, 1e-300)
-
-    quad = (
-        (s2_flat[None, :] + s2_sq) * b1_sq
-        - 2.0 * rho_hat * b1_b2_s1_s2
-        + (s1_flat[None, :] + s1_sq) * b2_sq
-    ) / det
-
-    log_l = -np.log(2.0 * np.pi) - 0.5 * np.log(det) - 0.5 * quad
-    row_max = np.max(log_l, axis=1, keepdims=True)
-    l_tilde = np.exp(log_l - row_max)
-    row_max_1d = row_max[:, 0]
-
-    # EM with SQUAREM acceleration and monotone fallback
-    pi = np.full(n_comp, 0.5 / max(n_comp - 1, 1), dtype=np.float64)
-    pi[0] = 0.5
-    pi /= np.sum(pi)
-
     denom_const = float(n_snps) + (null_wt - 1.0)
 
-    def _em_step(pi_cur: np.ndarray) -> np.ndarray:
-        denom = np.maximum(l_tilde @ pi_cur, 1e-300)
-        resp_sum = (l_tilde.T @ (1.0 / denom)) * pi_cur
-        resp_sum[0] += null_wt - 1.0
-        pi_new = np.maximum(resp_sum, 0.0) / denom_const
-        pi_new /= np.sum(pi_new)
-        return pi_new
+    def _build_likelihood_matrix(rho_val: float) -> tuple[np.ndarray, np.ndarray]:
+        det = (
+            s1_sq * s2_sq * (1.0 - rho_val * rho_val)
+            + s1_flat[None, :] * s2_sq
+            + s2_flat[None, :] * s1_sq
+            + (s1_flat * s2_flat)[None, :]
+        )
+        det = np.maximum(det, 1e-300)
+        quad = (
+            (s2_flat[None, :] + s2_sq) * b1_sq
+            - 2.0 * rho_val * b1_b2_s1_s2
+            + (s1_flat[None, :] + s1_sq) * b2_sq
+        ) / det
+        log_l = -np.log(2.0 * np.pi) - 0.5 * np.log(det) - 0.5 * quad
+        row_max = np.max(log_l, axis=1, keepdims=True)
+        return np.exp(log_l - row_max), row_max[:, 0]
 
-    def _objective(pi_cur: np.ndarray) -> float:
-        ll = float(np.sum(np.log(np.maximum(l_tilde @ pi_cur, 1e-300)) + row_max_1d))
-        if null_wt > 1.0:
-            ll += (null_wt - 1.0) * float(np.log(max(pi_cur[0], 1e-300)))
-        return ll
+    def _solve_pi_squarem(
+        l_tilde: np.ndarray,
+        row_max_1d: np.ndarray,
+        pi_init: np.ndarray,
+        max_em_iter: int,
+    ) -> tuple[np.ndarray, bool, int, float]:
+        pi_cur = pi_init.copy()
 
-    converged = False
-    n_iter = 0
-    obj_cur = _objective(pi)
-    for it in range(1, max_iter + 1):
-        n_iter = it
-        p1 = _em_step(pi)
-        if float(np.max(np.abs(p1 - pi))) < tol:
-            pi = p1
-            converged = True
-            break
-        p2 = _em_step(p1)
-        obj_p2 = _objective(p2)
-        r_vec = p1 - pi
-        v_vec = (p2 - p1) - r_vec
-        v_norm2 = float(np.dot(v_vec, v_vec))
-        p_next = p2
-        obj_next = obj_p2
-        if v_norm2 > 1e-30:
-            r_norm2 = float(np.dot(r_vec, r_vec))
-            alpha = -np.sqrt(r_norm2 / v_norm2)
-            alpha = min(-1.0, max(alpha, -50.0))
-            p_cand = np.maximum(pi - 2.0 * alpha * r_vec + (alpha * alpha) * v_vec, 0.0)
-            cand_sum = float(np.sum(p_cand))
-            if cand_sum > 0.0:
-                p_cand /= cand_sum
-                p_cand = _em_step(p_cand)
-                obj_cand = _objective(p_cand)
-                if obj_cand >= obj_p2:
-                    p_next = p_cand
-                    obj_next = obj_cand
-        if abs(obj_next - obj_cur) / float(n_snps) < tol or float(np.max(np.abs(p_next - pi))) < tol:
-            pi = p_next
-            converged = True
-            break
-        pi = p_next
-        obj_cur = obj_next
+        def _em_step(p_vec: np.ndarray) -> np.ndarray:
+            denom = np.maximum(l_tilde @ p_vec, 1e-300)
+            resp_sum = (l_tilde.T @ (1.0 / denom)) * p_vec
+            resp_sum[0] += null_wt - 1.0
+            pi_new = np.maximum(resp_sum, 0.0) / denom_const
+            pi_new /= np.sum(pi_new)
+            return pi_new
 
-    ll_final = float(np.sum(np.log(np.maximum(l_tilde @ pi, 1e-300)) + row_max_1d))
+        def _objective(p_vec: np.ndarray) -> float:
+            ll = float(np.sum(np.log(np.maximum(l_tilde @ p_vec, 1e-300)) + row_max_1d))
+            if null_wt > 1.0:
+                ll += (null_wt - 1.0) * float(np.log(max(p_vec[0], 1e-300)))
+            return ll
+
+        conv = False
+        it_used = 0
+        obj_cur = _objective(pi_cur)
+        for it in range(1, max_em_iter + 1):
+            it_used = it
+            p1 = _em_step(pi_cur)
+            if float(np.max(np.abs(p1 - pi_cur))) < tol:
+                pi_cur = p1
+                conv = True
+                break
+            p2 = _em_step(p1)
+            obj_p2 = _objective(p2)
+            r_vec = p1 - pi_cur
+            v_vec = (p2 - p1) - r_vec
+            v_norm2 = float(np.dot(v_vec, v_vec))
+            p_next = p2
+            obj_next = obj_p2
+            if v_norm2 > 1e-30:
+                r_norm2 = float(np.dot(r_vec, r_vec))
+                alpha = -np.sqrt(r_norm2 / v_norm2)
+                alpha = min(-1.0, max(alpha, -50.0))
+                p_cand = np.maximum(pi_cur - 2.0 * alpha * r_vec + (alpha * alpha) * v_vec, 0.0)
+                cand_sum = float(np.sum(p_cand))
+                if cand_sum > 0.0:
+                    p_cand /= cand_sum
+                    p_cand = _em_step(p_cand)
+                    obj_cand = _objective(p_cand)
+                    if obj_cand >= obj_p2:
+                        p_next = p_cand
+                        obj_next = obj_cand
+            if abs(obj_next - obj_cur) / float(n_snps) < tol or float(np.max(np.abs(p_next - pi_cur))) < tol:
+                pi_cur = p_next
+                conv = True
+                break
+            pi_cur = p_next
+            obj_cur = obj_next
+
+        ll_val = float(np.sum(np.log(np.maximum(l_tilde @ pi_cur, 1e-300)) + row_max_1d))
+        return pi_cur, conv, it_used, ll_val
+
+    pi_init = np.full(n_comp, 0.5 / max(n_comp - 1, 1), dtype=np.float64)
+    pi_init[0] = 0.5
+    pi_init /= np.sum(pi_init)
+
+    if rho is not None:
+        rho_val = float(rho)
+        if not np.isfinite(rho_val) or not (-1.0 < rho_val < 1.0):
+            raise ValueError(f"rho must lie strictly in (-1, 1) (got {rho!r}).")
+        rho_hat = rho_val
+        n_null_rho = n_snps
+        l_tilde, row_max_1d = _build_likelihood_matrix(rho_hat)
+        pi, converged, n_iter, ll_final = _solve_pi_squarem(l_tilde, row_max_1d, pi_init, max_iter)
+    elif mode_settings == "default":
+        z1 = b1 / s1
+        z2 = b2 / s2
+        rho_hat, n_null_rho = _estimate_rho_trunc_mle(z1, z2, null_p_thresh)
+        l_tilde, row_max_1d = _build_likelihood_matrix(rho_hat)
+        pi, converged, n_iter, ll_final = _solve_pi_squarem(l_tilde, row_max_1d, pi_init, max_iter)
+    else:
+        # Upstream `jean997/cause`: joint MAP optimization over (pi, rho) with arctanh(rho) ~ N(0, 0.5^2)
+        z1 = b1 / s1
+        z2 = b2 / s2
+        rho_init, _ = _estimate_rho_trunc_mle(z1, z2, null_p_thresh)
+        z_init = float(np.arctanh(np.clip(rho_init, -0.95, 0.95)))
+        total_iter = 0
+        warm_state: list[np.ndarray] = [pi_init.copy()]
+
+        def _solve_pi_tight(
+            l_tilde_m: np.ndarray,
+            row_max_m: np.ndarray,
+            p_start: np.ndarray,
+            max_em: int,
+        ) -> tuple[np.ndarray, bool, int, float]:
+            p_cur = p_start.copy()
+            tight_tol = min(tol * 0.1, 1e-7)
+
+            def _em_one(p_vec: np.ndarray) -> np.ndarray:
+                denom = np.maximum(l_tilde_m @ p_vec, 1e-300)
+                resp_sum = (l_tilde_m.T @ (1.0 / denom)) * p_vec
+                resp_sum[0] += null_wt - 1.0
+                p_new = np.maximum(resp_sum, 0.0) / denom_const
+                p_new /= np.sum(p_new)
+                return p_new
+
+            def _obj_one(p_vec: np.ndarray) -> float:
+                ll = float(np.sum(np.log(np.maximum(l_tilde_m @ p_vec, 1e-300)) + row_max_m))
+                if null_wt > 1.0:
+                    ll += (null_wt - 1.0) * float(np.log(max(p_vec[0], 1e-300)))
+                return ll
+
+            conv_t = False
+            it_t = 0
+            obj_c = _obj_one(p_cur)
+            for it in range(1, max_em + 1):
+                it_t = it
+                p1 = _em_one(p_cur)
+                if float(np.max(np.abs(p1 - p_cur))) < tight_tol:
+                    p_cur = p1
+                    conv_t = True
+                    break
+                p2 = _em_one(p1)
+                obj_p2 = _obj_one(p2)
+                r_vec = p1 - p_cur
+                v_vec = (p2 - p1) - r_vec
+                v_norm2 = float(np.dot(v_vec, v_vec))
+                p_next = p2
+                obj_next = obj_p2
+                if v_norm2 > 1e-30:
+                    r_norm2 = float(np.dot(r_vec, r_vec))
+                    alpha = min(-1.0, max(-np.sqrt(r_norm2 / v_norm2), -50.0))
+                    p_cand = np.maximum(p_cur - 2.0 * alpha * r_vec + (alpha * alpha) * v_vec, 0.0)
+                    cand_sum = float(np.sum(p_cand))
+                    if cand_sum > 0.0:
+                        p_cand /= cand_sum
+                        p_cand = _em_one(p_cand)
+                        obj_cand = _obj_one(p_cand)
+                        if obj_cand >= obj_p2:
+                            p_next = p_cand
+                            obj_next = obj_cand
+                if abs(obj_next - obj_c) < 1e-7 or float(np.max(np.abs(p_next - p_cur))) < tight_tol:
+                    p_cur = p_next
+                    conv_t = True
+                    break
+                p_cur = p_next
+                obj_c = obj_next
+
+            ll_v = float(np.sum(np.log(np.maximum(l_tilde_m @ p_cur, 1e-300)) + row_max_m))
+            return p_cur, conv_t, it_t, ll_v
+
+        def _neg_profile_map(z_val: float) -> float:
+            nonlocal total_iter
+            r_val = float(np.tanh(z_val))
+            lt, rm = _build_likelihood_matrix(r_val)
+            p_start = np.maximum(warm_state[0], 1e-6 / float(n_comp))
+            p_start /= np.sum(p_start)
+            p_opt, _, it_used, ll_v = _solve_pi_tight(lt, rm, p_start, max_iter)
+            total_iter += it_used
+            warm_state[0] = p_opt
+            obj = ll_v + float(stats.norm.logpdf(z_val, loc=0.0, scale=0.5))
+            if null_wt > 1.0:
+                obj += (null_wt - 1.0) * float(np.log(max(p_opt[0], 1e-300)))
+            return -obj
+
+        z_lo = max(-2.5, z_init - 0.75)
+        z_hi = min(2.5, z_init + 0.75)
+        opt_prof = optimize.minimize_scalar(
+            _neg_profile_map,
+            bounds=(z_lo, z_hi),
+            method="bounded",
+            options={"xatol": max(tol, 1e-5)},
+        )
+        z_best = float(opt_prof.x)
+        if (z_best - z_lo < 0.02 and z_lo > -2.5) or (z_hi - z_best < 0.02 and z_hi < 2.5):
+            opt_prof = optimize.minimize_scalar(
+                _neg_profile_map,
+                bounds=(-2.5, 2.5),
+                method="bounded",
+                options={"xatol": max(tol, 1e-5)},
+            )
+            z_best = float(opt_prof.x)
+
+        rho_hat = float(np.tanh(z_best))
+        l_tilde, row_max_1d = _build_likelihood_matrix(rho_hat)
+        p_final_start = np.maximum(warm_state[0], 1e-8 / float(n_comp))
+        p_final_start /= np.sum(p_final_start)
+        pi, converged, it_final, ll_final = _solve_pi_tight(
+            l_tilde, row_max_1d, p_final_start, max_iter
+        )
+        total_iter += it_final
+        n_null_rho = n_snps
+        n_iter = total_iter
 
     keep_comp = pi >= weight_prune_thresh
     if pi[0] > 0.0:
@@ -509,6 +659,9 @@ def est_cause_params(
         log_likelihood=ll_final,
         converged=converged,
         n_iter=n_iter,
+        grid_S1=var1.copy(),
+        grid_S2=var2.copy(),
+        settings=mode_settings,
     )
 
 
@@ -585,8 +738,9 @@ def cause(
     n_q: int = 21,
     refine_factor: int = 5,
     refine_mass_thresh: float = 1e-5,
-    n_samples: int = 2000,
+    n_samples: int | None = None,
     seed: int | np.random.Generator | None = 0,
+    settings: Literal["default", "R_default"] = "default",
 ) -> CauseResult:
     """Fit CAUSE sharing vs causal Bayesian models and compare via PSIS-LOO.
 
@@ -608,7 +762,8 @@ def cause(
         Upper bound for quadrature integration over `q in (0, max_q]`.
     sigma_g : float, optional
         Prior SD for `gamma` and `eta`. If `None`, chosen scale-equivariantly from
-        strong-instrument effect ratios.
+        strong-instrument effect ratios (or `P(|N(0, sigma_g)| > max(|b2/b1|)) = 0.05`
+        across SNPs with `p1 < 1e-3` under `settings='R_default'`).
     n_grid : int, default 31
         Coarse 1D grid points for `gamma` and `eta` (coerced to odd >= 11 so `0` is centered).
     n_q : int, default 21
@@ -617,15 +772,24 @@ def cause(
         Stage-2 adaptive subdivision factor per selected coarse cell (coerced to odd >= 3).
     refine_mass_thresh : float, default 1e-5
         Coarse cell posterior mass threshold triggering adaptive subdivision.
-    n_samples : int, default 2000
-        Number of systematic posterior draws used to compute PSIS-LOO ELPDs.
+    n_samples : int, optional
+        Number of systematic posterior draws used to compute PSIS-LOO ELPDs
+        (defaults to `2000` under `settings='default'` and `1000` under `settings='R_default'`).
     seed : int or np.random.Generator or None, default 0
         Random seed controlling systematic resampling offset and nuisance subsampling.
+    settings : {'default', 'R_default'}, default 'default'
+        Estimation mode (`'default'` or `'R_default'` matching upstream `jean997/cause`).
 
     Returns
     -------
     CauseResult
     """
+    mode_settings = _validate_settings(settings)
+    n_samples_val = (
+        (1000 if mode_settings == "R_default" else 2000)
+        if n_samples is None
+        else int(n_samples)
+    )
     if qalpha <= 0.0 or qbeta <= 0.0:
         raise ValueError(f"qalpha and qbeta must be > 0 (got {qalpha!r}, {qbeta!r}).")
     if not (0.0 < max_q <= 1.0):
@@ -636,7 +800,7 @@ def cause(
         raise ValueError(f"n_q must be >= 5 (got {n_q!r}).")
     if refine_factor < 3:
         raise ValueError(f"refine_factor must be >= 3 (got {refine_factor!r}).")
-    if n_samples < 50:
+    if n_samples_val < 50:
         raise ValueError(f"n_samples must be >= 50 (got {n_samples!r}).")
     if pval_thresh is not None and not (0.0 < pval_thresh <= 1.0):
         raise ValueError(f"pval_thresh must be in (0, 1] (got {pval_thresh!r}).")
@@ -663,6 +827,7 @@ def cause(
             seb2=s2_all,
             snp=snp_ids_all,
             seed=seed,
+            settings=mode_settings,
         )
 
     keep = np.ones(b1_all.size, dtype=bool)
@@ -698,11 +863,31 @@ def cause(
     r_ratios = np.abs(b2[inf_mask]) / np.maximum(np.abs(b1[inf_mask]), s1[inf_mask])
 
     if sigma_g is None:
-        sigma_g_val = max(
-            float(np.quantile(r_ratios, 0.80)) / 0.6745,
-            0.5 * float(np.median(s2 / s1)),
-            1e-12,
-        )
+        if mode_settings == "R_default":
+            p1_inst = 2.0 * stats.norm.sf(z1)
+            strong_mask = (p1_inst < 1e-3) & (np.abs(b1) > 0.0)
+            z_975 = float(stats.norm.ppf(0.975))
+            if np.any(strong_mask):
+                max_ratio = float(np.max(np.abs(b2[strong_mask] / b1[strong_mask])))
+                sigma_g_val = (
+                    max_ratio / z_975
+                    if max_ratio > 0.0
+                    else max(0.5 * float(np.median(s2 / s1)), 1e-12)
+                )
+            else:
+                fallback_ratios = np.abs(b2) / np.maximum(np.abs(b1), s1)
+                sigma_g_val = max(
+                    float(np.max(fallback_ratios)) / z_975,
+                    0.5 * float(np.median(s2 / s1)),
+                    1e-12,
+                )
+            sigma_g_val = max(float(sigma_g_val), 1e-12)
+        else:
+            sigma_g_val = max(
+                float(np.quantile(r_ratios, 0.80)) / 0.6745,
+                0.5 * float(np.median(s2 / s1)),
+                1e-12,
+            )
     else:
         sigma_g_val = float(sigma_g)
         if not np.isfinite(sigma_g_val) or sigma_g_val <= 0.0:
@@ -981,14 +1166,14 @@ def cause(
     # ------------------------------------------------------------------
     rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
 
-    draw_idx_sh = _systematic_resample(w_sh_flat, n_samples, rng)
+    draw_idx_sh = _systematic_resample(w_sh_flat, n_samples_val, rng)
     sh_cell_idx, sh_q_idx = np.divmod(draw_idx_sh, n_q)
     ll_draws_sh = np.logaddexp(
         log_1m_q[sh_q_idx, None] + ll_0[None, :],
         log_q[sh_q_idx, None] + ll_eta_sh[sh_cell_idx],
     )
 
-    draw_idx_ca = _systematic_resample(w_ca_flat, n_samples, rng)
+    draw_idx_ca = _systematic_resample(w_ca_flat, n_samples_val, rng)
     ca_cell_idx, ca_q_idx = np.divmod(draw_idx_ca, n_q)
     ll_g_draws = np.stack([slope_cache[int(ca_gam_keys[i])] for i in ca_cell_idx], axis=0)
     ll_s_draws = np.stack([slope_cache[int(ca_sum_keys[i])] for i in ca_cell_idx], axis=0)
@@ -1073,4 +1258,6 @@ def cause(
         causal=causal_fit,
         loo_null=loo_null,
         elpd_table=elpd_table,
+        n_samples=n_samples_val,
+        settings=mode_settings,
     )

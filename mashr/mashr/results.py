@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,7 @@ class MashResult:
     converged: bool
     n_iter: int
     kkt_gap: float
+    settings: Literal["default", "R_default"] = "default"
 
     def to_dataframe(self, sort_by_lfsr: bool = False) -> pd.DataFrame:
         """Return tidy per-(feature, condition) posterior summary as a pandas DataFrame."""

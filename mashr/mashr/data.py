@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
+from scipy import stats
+from scipy.special import ndtri_exp
 
 from ._linalg import symmetrize
+
+
+class _DefaultSettings(str):
+    """String sentinel equal to ``'default'`` that tracks omitted `settings`."""
+
+
+_DEFAULT_SETTINGS: Literal["default", "R_default"] = _DefaultSettings("default")  # type: ignore[assignment]
+
+
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if not isinstance(settings, str) or settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unknown settings {settings!r}; expected 'default' or 'R_default'."
+        )
+    return "R_default" if settings == "R_default" else "default"
 
 
 @dataclass(frozen=True)
@@ -26,6 +43,7 @@ class MashData:
     alpha: float
     feature_names: list[str]
     condition_names: list[str]
+    settings: Literal["default", "R_default"] = "default"
 
     @property
     def n_effects(self) -> int:
@@ -120,6 +138,8 @@ def mash_set_data(
     feature_names: Sequence[str] | None = None,
     condition_names: Sequence[str] | None = None,
     zero_shat_reset: float | None = None,
+    df: np.ndarray | pd.DataFrame | float | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> MashData:
     """Create and validate an immutable :class:`MashData` container.
 
@@ -142,7 +162,14 @@ def mash_set_data(
     zero_shat_reset : float, optional
         If provided and positive, entries where ``Shat == 0`` (and ``Bhat == 0``)
         are reset to this value instead of raising ``ValueError``.
+    df : float, array-like, or DataFrame, optional
+        Degrees of freedom for Student-t summary statistics (defaults to ``None`` / ``Inf``).
+        When finite, converts ``Shat`` via two-sided tail probability matching as in
+        ``stephenslab/mashr::mash_set_data``.
+    settings : {"default", "R_default"}, default="default"
+        Execution mode stored on the returned :class:`MashData`.
     """
+    eff_settings = _validate_settings(settings)
     b_arr, b_rows, b_cols, b_is_df = _extract_matrix_and_names(Bhat, "Bhat")
     if b_arr.ndim != 2:
         raise ValueError(f"Bhat must be a 2D array of shape (J, R); got ndim={b_arr.ndim}.")
@@ -189,6 +216,24 @@ def mash_set_data(
 
     if not np.all(s_arr > 0.0):
         raise ValueError("Shat must be strictly positive (> 0).")
+
+    if df is not None:
+        if np.ndim(df) == 0:
+            df_scalar = float(df)
+            if np.isnan(df_scalar) or df_scalar <= 0.0:
+                raise ValueError(f"df must be > 0; got {df!r}.")
+            df_arr = np.full((J, R), df_scalar, dtype=np.float64)
+        else:
+            df_arr, _, _, _ = _extract_matrix_and_names(df, "df")  # type: ignore[arg-type]
+            if df_arr.shape != (J, R):
+                raise ValueError(f"df shape {df_arr.shape} does not match Bhat shape {(J, R)}.")
+            if np.any(np.isnan(df_arr)) or np.any(df_arr <= 0.0):
+                raise ValueError("df must not contain NaN or non-positive values.")
+        finite_b_mask = np.isfinite(df_arr) & (b_arr != 0.0)
+        if np.any(finite_b_mask):
+            abs_t = np.abs(b_arr[finite_b_mask] / s_arr[finite_b_mask])
+            z_eq = -ndtri_exp(stats.t.logsf(abs_t, df=df_arr[finite_b_mask]))
+            s_arr[finite_b_mask] = np.abs(b_arr[finite_b_mask]) / z_eq
 
     if feature_names is not None:
         feat_list = [str(x) for x in feature_names]
@@ -238,6 +283,7 @@ def mash_set_data(
         alpha=alpha_val,
         feature_names=feat_list,
         condition_names=cond_list,
+        settings=eff_settings,
     )
 
 
@@ -245,10 +291,14 @@ def mash_update_data(
     data: MashData,
     V: np.ndarray | pd.DataFrame | None = None,
     alpha: float | None = None,
+    settings: Literal["default", "R_default"] = _DEFAULT_SETTINGS,
 ) -> MashData:
-    """Return a new :class:`MashData` with updated ``V`` and/or ``alpha``."""
+    """Return a new :class:`MashData` with updated ``V``, ``alpha``, and/or ``settings``."""
+    eff_settings = _validate_settings(settings)
     if not isinstance(data, MashData):
         raise TypeError("data must be a MashData instance.")
+    if isinstance(settings, _DefaultSettings):
+        eff_settings = data.settings
     new_v = data.V if V is None else V
     new_alpha = data.alpha if alpha is None else alpha
     return mash_set_data(
@@ -258,6 +308,7 @@ def mash_update_data(
         V=new_v,
         feature_names=data.feature_names,
         condition_names=data.condition_names,
+        settings=eff_settings,
     )
 
 

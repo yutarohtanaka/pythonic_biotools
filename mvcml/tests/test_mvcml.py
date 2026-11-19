@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-from mvcml import adjusted_variances, cml_ma, make_corr, mvcml_adjust, mvcml_dp
+import pytest
+from mvcml import adjusted_variances, cml_ma, make_corr, mvcml_adjust, mvcml_bic, mvcml_dp
 
 
 def test_mvcml_adjust_multivariable_and_bic_ma_weights():
@@ -113,3 +114,83 @@ def test_mvcml_dp_data_perturbation():
 
     adj_dp = mvcml_adjust(bx, sx, byc, sy, N=30_000, iv_p_thresh=1.0, dp=True, num_pert=30, seed=42)
     assert np.allclose(adj_dp["b"], b_true, atol=0.10)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(909)
+    m, p = 24, 2
+    b_true = np.array([0.45, -0.30])
+    bx_true = rng.normal(0.0, 0.14, (m, p))
+    sx = np.column_stack([np.full(m, 0.011), np.full(m, 0.023)])
+    sy = np.full(m, 0.041)
+    pleio = np.zeros(m)
+    pleio[:2] = np.array([0.24, -0.20])
+
+    rho_yx = np.array([0.32, -0.24])
+    rho_xx = np.array([[1.0, 0.28], [0.28, 1.0]])
+
+    # Build covariance in default [Y, X1, X2] order AND in R_default [X1, X2, Y] order
+    R_def = make_corr(p, rho_yx=rho_yx, rho_xx=rho_xx, settings="default")
+    R_up = make_corr(p, rho_yx=rho_yx, rho_xx=rho_xx, settings="R_default")
+    np.testing.assert_allclose(R_up[:p, :p], rho_xx)
+    np.testing.assert_allclose(R_up[:p, p], rho_yx)
+    np.testing.assert_allclose(R_up[p, :p], rho_yx)
+
+    D_def = np.concatenate([sy[:, None], sx], axis=1)
+    D_up = np.concatenate([sx, sy[:, None]], axis=1)
+    SIG_def = D_def[:, :, None] * R_def[None] * D_def[:, None, :]
+    SIG_up = D_up[:, :, None] * R_up[None] * D_up[:, None, :]
+
+    bx = np.empty_like(bx_true)
+    byc = np.empty(m)
+    for i in range(m):
+        e = rng.multivariate_normal(np.zeros(p + 1), SIG_def[i])
+        byc[i] = bx_true[i] @ b_true + pleio[i] + e[0]
+        bx[i] = bx_true[i] + e[1:]
+
+    # 1. Invalid settings raises ValueError across all entrypoints
+    with pytest.raises(ValueError, match="Unknown settings"):
+        cml_ma(30_000, bx, byc, SIG_def, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mvcml_bic(30_000, bx, byc, SIG_def, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mvcml_dp(30_000, bx, byc, SIG_def, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mvcml_adjust(bx, sx, byc, sy, N=30_000, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        make_corr(p, settings="invalid")  # type: ignore[arg-type]
+
+    # 2. SIG ordering [X1, ..., Xp, Y] in R_default matches [Y, X1, ..., Xp] in default at tight tolerance
+    bic_def = mvcml_bic(30_000, bx, byc, SIG_def, threshold=1e-9, settings="default")
+    bic_up = mvcml_bic(30_000, bx, byc, SIG_up, threshold=1e-9, settings="R_default")
+    np.testing.assert_allclose(bic_up["b"], bic_def["b"], atol=1e-5)
+    assert np.allclose(bic_up["b"], b_true, atol=0.10)
+
+    # 3. Single outer iteration (maxit=1) verifies betaxest = b_exp.copy() initialization vs zeros
+    one_def = mvcml_bic(30_000, bx, byc, SIG_def, maxit=1, settings="default")
+    one_up = mvcml_bic(30_000, bx, byc, SIG_up, maxit=1, settings="R_default")
+    assert not np.allclose(one_def["btotal"], one_up["btotal"], atol=1e-9)
+
+    # Default threshold=1e-4 L2 norm in R_default vs threshold=1e-6 L1 norm in default
+    fit_up_default_tol = mvcml_bic(30_000, bx, byc, SIG_up, settings="R_default")
+    fit_up_explicit_tol = mvcml_bic(30_000, bx, byc, SIG_up, threshold=1e-4, settings="R_default")
+    np.testing.assert_allclose(fit_up_default_tol["btotal"], fit_up_explicit_tol["btotal"], rtol=0.0, atol=0.0)
+
+    # 4. mvcml_dp in R_default reports b_bic_dp as primary b, b_se, pval, Covb (vs b_ma_dp in default)
+    dp_def = mvcml_dp(30_000, bx, byc, SIG_def, num_pert=30, seed=17, settings="default")
+    dp_up = mvcml_dp(30_000, bx, byc, SIG_up, num_pert=30, seed=17, settings="R_default")
+    np.testing.assert_allclose(dp_def["b"], dp_def["b_ma_dp"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(dp_up["b"], dp_up["b_bic_dp"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(dp_up["b_se"], dp_up["se_bic_dp"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(dp_up["pval"], dp_up["pval_bic_dp"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(dp_up["Covb"], dp_up["Covb_bic_dp"], rtol=0.0, atol=0.0)
+    assert np.allclose(dp_up["b"], b_true, atol=0.12)
+
+    # mvcml_adjust end-to-end with settings="R_default" and LD
+    idx = np.arange(m)
+    ld_mat = 0.5 ** np.abs(idx[:, None] - idx[None, :])
+    adj_up = mvcml_adjust(
+        bx, sx, byc, sy, N=30_000, iv_p_thresh=1.0, rho_yx=rho_yx, rho_xx=rho_xx, ld=ld_mat, dp=True, num_pert=25, seed=17, settings="R_default"
+    )
+    assert np.allclose(adj_up["b"], b_true, atol=0.12)
+    assert adj_up["yse_adj_ld"] is not None and np.all(adj_up["yse_adj_ld"] > 0.0)

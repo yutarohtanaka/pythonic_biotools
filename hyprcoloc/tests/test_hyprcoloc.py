@@ -316,3 +316,78 @@ def test_invalid_inputs_raise_value_error():
         hyprcoloc(betas, ses, prior_1=0.0)
     with pytest.raises(ValueError, match="reg_thresh"):
         hyprcoloc(betas, ses, reg_thresh=1.0)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(2026)
+    m_snps, q_traits = 80, 4
+    ses = rng.uniform(0.04, 0.08, size=(m_snps, q_traits))
+    betas = rng.normal(0.0, ses * 0.5)
+    betas[22, :3] += np.array([0.42, 0.45, -0.40])
+
+    # 1. Invalid settings raises ValueError across entrypoints
+    for fn in (hyprcoloc, subset_coloc, sensitivity_analysis, log_abf):
+        with pytest.raises(ValueError, match="Unknown settings 'bad'"):
+            fn(betas, ses, settings="bad")  # type: ignore[arg-type]
+
+    # 2. Default thresholds: 0.5 in "default", 0.7 in "R_default", override respected
+    res_def = hyprcoloc(betas, ses)
+    res_r = hyprcoloc(betas, ses, settings="R_default")
+    res_r_override = hyprcoloc(betas, ses, reg_thresh=0.6, align_thresh=0.65, settings="R_default")
+    assert res_def.reg_thresh == 0.5 and res_def.align_thresh == 0.5
+    assert res_r.reg_thresh == 0.7 and res_r.align_thresh == 0.7
+    assert res_r_override.reg_thresh == 0.6 and res_r_override.align_thresh == 0.65
+    assert res_r.clusters[0].traits == ["T1", "T2", "T3"]
+
+    # 3. Exact m = 2 rapid.hyprcoloc regional probability with 0.25 subset constant
+    b2 = betas[:, :2]
+    s2 = ses[:, :2]
+    p1, pc = 1e-4, 0.02
+    lbf2 = log_abf(b2, s2)
+    pi_1 = p1
+    pi_2 = p1 * pc
+    i_all_2 = pi_2 * float(np.sum(np.exp(lbf2[:, 0] + lbf2[:, 1])))
+    i_sub_2 = 0.25 * pi_1 * float(np.sum(np.exp(lbf2[:, 0])) + np.sum(np.exp(lbf2[:, 1])))
+    expected_pr_2 = i_all_2 / (1.0 + i_sub_2 + i_all_2)
+
+    sub2_r = subset_coloc(b2, s2, prior_1=p1, prior_c=pc, settings="R_default")
+    sub2_def = subset_coloc(b2, s2, prior_1=p1, prior_c=pc, settings="default")
+    assert np.isclose(sub2_r.regional_prob, expected_pr_2, rtol=1e-13, atol=1e-15)
+    assert not np.isclose(sub2_r.regional_prob, sub2_def.regional_prob, rtol=1e-4)
+
+    # 4. Exact m = 4 1-step regional subset (m - 1 only, P_R = I_all / (1 + I_{m-1} + I_all))
+    lbf4 = log_abf(betas, ses)
+    gamma = 1.0 - pc
+    pis = [1.0, p1]
+    for k in range(2, q_traits + 1):
+        pis.append(pis[-1] * (1.0 - gamma ** (k - 1)))
+    shift = float(np.max(np.sum(lbf4, axis=1)))
+    i_all_4_scaled = pis[4] * float(np.sum(np.exp(np.sum(lbf4, axis=1) - shift)))
+    i_3_scaled = pis[3] * sum(
+        float(np.sum(np.exp(np.sum(np.delete(lbf4, q, axis=1), axis=1) - shift)))
+        for q in range(q_traits)
+    )
+    expected_pr_4 = i_all_4_scaled / (np.exp(-shift) + i_3_scaled + i_all_4_scaled)
+    sub4_r = subset_coloc(betas, ses, prior_1=p1, prior_c=pc, settings="R_default")
+    assert np.isclose(sub4_r.regional_prob, expected_pr_4, rtol=1e-13, atol=1e-15)
+
+    # Explicit reg_steps=2 override adds the m - 2 term in R_default
+    sub4_r_step2 = subset_coloc(betas, ses, prior_1=p1, prior_c=pc, reg_steps=2, settings="R_default")
+    assert sub4_r_step2.regional_prob < sub4_r.regional_prob
+
+    # 5. uniform_priors=True scales SNP-level priors by 1 / Q (prior_1 / M_snps)
+    p1_unif = p1 / float(m_snps)
+    i_all_unif_scaled = p1_unif * float(np.sum(np.exp(np.sum(lbf4, axis=1) - shift)))
+    i_3_unif_scaled = p1_unif * sum(
+        float(np.sum(np.exp(np.sum(np.delete(lbf4, q, axis=1), axis=1) - shift)))
+        for q in range(q_traits)
+    )
+    expected_pr_unif = i_all_unif_scaled / (np.exp(-shift) + i_3_unif_scaled + i_all_unif_scaled)
+    sub_unif_r = subset_coloc(betas, ses, prior_1=p1, uniform_priors=True, settings="R_default")
+    sub_unif_def = subset_coloc(betas, ses, prior_1=p1, uniform_priors=True, settings="default")
+    assert np.isclose(sub_unif_r.regional_prob, expected_pr_unif, rtol=1e-13, atol=1e-15)
+    assert sub_unif_r.regional_prob < sub_unif_def.regional_prob
+
+    res_unif_r = hyprcoloc(betas, ses, uniform_priors=True, settings="R_default")
+    assert len(res_unif_r.clusters) == 1
+    assert res_unif_r.clusters[0].traits == ["T1", "T2", "T3"]

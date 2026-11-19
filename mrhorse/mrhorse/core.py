@@ -6,8 +6,16 @@ horizontal pleiotropy without requiring external JAGS installation.
 """
 from __future__ import annotations
 
+from typing import Literal
 import numpy as np
 from scipy import special, stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 GRID = 200
 _TP_FLOOR = 1e-60
@@ -64,15 +72,21 @@ def _trunc_norm(mean: float, sd: float, lo: float, hi: float, rng: np.random.Gen
 
 
 class _Chain:
-    def __init__(self, by, sy, bx, sx, rng: np.random.Generator):
+    def __init__(self, by, sy, bx, sx, rng: np.random.Generator, shared_rho: bool = False):
         self.by, self.sy, self.bx, self.sx, self.rng = by, sy, bx, sx, rng
+        self.shared_rho = shared_rho
         N, K = bx.shape
         self.N, self.K = N, K
         self.theta = rng.normal(0, 0.5, K)
         self.bx0 = bx.copy()
         self.alpha = np.zeros(N)
         init_r = 0.2 / np.sqrt(K)
-        self.rho = rng.uniform(-init_r, init_r, (N, K))
+        if shared_rho:
+            init_r = min(init_r, 0.5 * max(1.0 / np.sqrt(K) - 1e-6, 1e-8))
+            rho0 = rng.uniform(-init_r, init_r, N)
+            self.rho = np.repeat(rho0[:, None], K, axis=1)
+        else:
+            self.rho = rng.uniform(-init_r, init_r, (N, K))
         self.phi = np.maximum(np.exp(rng.normal(0, 0.3, N)), _TP_FLOOR)
         self.tau = float(max(np.exp(rng.normal(np.log(0.1), 0.5)), _TP_FLOOR))
         self.vx0 = np.maximum(bx.var(0), 1e-8) * np.exp(rng.normal(0, 0.3, K))
@@ -127,26 +141,20 @@ class _Chain:
         Lm = np.linalg.cholesky(prec_m)
         self.mx = np.linalg.solve(prec_m, rhs_m) + np.linalg.solve(Lm.T, rng.normal(size=K))
 
-        # Per-exposure rho[:, k] Gibbs updates respecting positive-definite correlation Cholesky ||rho_i||_2 < 1
+        # Gibbs updates for rho: shared scalar per SNP in R_default, per-exposure vector in default
         G = GRID
         a_vec = self.alpha / tp
         d_tilde = (self.bx0 - self.mx[None, :]) / s[None, :]
-        for k in range(K):
-            s_other = np.sum(self.rho ** 2, axis=1) - self.rho[:, k] ** 2
-            r_max = np.sqrt(np.maximum(1.0 - 1e-6 - s_other, 1e-8))
-            g_mat = r_max[:, None] * self.rho_grid[None, :]
-
-            z_cur = d_tilde - a_vec[:, None] * self.rho
-            norm_z_other = np.sum(z_cur ** 2, axis=1) - z_cur[:, k] ** 2
-            rz_other = np.sum(self.rho * z_cur, axis=1) - self.rho[:, k] * z_cur[:, k]
-
-            zk_grid = d_tilde[:, k : k + 1] - a_vec[:, None] * g_mat
-            norm_z2 = norm_z_other[:, None] + zk_grid ** 2
-            dot_rz = rz_other[:, None] + g_mat * zk_grid
-            one_minus_r2 = np.maximum((1.0 - s_other)[:, None] - g_mat ** 2, 1e-12)
-            q = norm_z2 + (dot_rz ** 2) / one_minus_r2
-
-            lp = 9.0 * np.log(np.maximum(1.0 - g_mat ** 2, 1e-30)) - 0.5 * np.log(one_minus_r2) - 0.5 * q
+        if self.shared_rho:
+            r_max = 1.0 / np.sqrt(K) - 1e-6
+            g = r_max * self.rho_grid
+            one_minus_r2 = np.maximum(1.0 - K * (g ** 2), 1e-12)
+            s_d = np.sum(d_tilde, axis=1)
+            lp = (
+                9.0 * np.log(np.maximum(1.0 - g[None, :] ** 2, 1e-30))
+                - 0.5 * np.log(one_minus_r2[None, :])
+                - 0.5 * ((a_vec[:, None] - s_d[:, None] * g[None, :]) ** 2) / one_minus_r2[None, :]
+            )
             lp -= lp.max(axis=1, keepdims=True)
             pr = np.exp(lp)
             pr /= pr.sum(axis=1, keepdims=True)
@@ -154,7 +162,33 @@ class _Chain:
             u = rng.uniform(size=N)
             idx = np.minimum((cdf < u[:, None]).sum(axis=1), G - 1)
             u_jit = np.clip((idx + rng.uniform(-0.5, 0.5, N) + 0.5) / G, 0.5 / G, 1.0 - 0.5 / G)
-            self.rho[:, k] = r_max * (2.0 * u_jit - 1.0)
+            rho_s = r_max * (2.0 * u_jit - 1.0)
+            self.rho[:, :] = rho_s[:, None]
+        else:
+            for k in range(K):
+                s_other = np.sum(self.rho ** 2, axis=1) - self.rho[:, k] ** 2
+                r_max_k = np.sqrt(np.maximum(1.0 - 1e-6 - s_other, 1e-8))
+                g_mat = r_max_k[:, None] * self.rho_grid[None, :]
+
+                z_cur = d_tilde - a_vec[:, None] * self.rho
+                norm_z_other = np.sum(z_cur ** 2, axis=1) - z_cur[:, k] ** 2
+                rz_other = np.sum(self.rho * z_cur, axis=1) - self.rho[:, k] * z_cur[:, k]
+
+                zk_grid = d_tilde[:, k : k + 1] - a_vec[:, None] * g_mat
+                norm_z2 = norm_z_other[:, None] + zk_grid ** 2
+                dot_rz = rz_other[:, None] + g_mat * zk_grid
+                one_minus_r2 = np.maximum((1.0 - s_other)[:, None] - g_mat ** 2, 1e-12)
+                q = norm_z2 + (dot_rz ** 2) / one_minus_r2
+
+                lp = 9.0 * np.log(np.maximum(1.0 - g_mat ** 2, 1e-30)) - 0.5 * np.log(one_minus_r2) - 0.5 * q
+                lp -= lp.max(axis=1, keepdims=True)
+                pr = np.exp(lp)
+                pr /= pr.sum(axis=1, keepdims=True)
+                cdf = np.cumsum(pr, axis=1)
+                u = rng.uniform(size=N)
+                idx = np.minimum((cdf < u[:, None]).sum(axis=1), G - 1)
+                u_jit = np.clip((idx + rng.uniform(-0.5, 0.5, N) + 0.5) / G, 0.5 / G, 1.0 - 0.5 / G)
+                self.rho[:, k] = r_max_k * (2.0 * u_jit - 1.0)
 
         def logt_phi(phi):
             tp_p = np.maximum(self.tau * phi, _TP_FLOOR)
@@ -251,16 +285,25 @@ def horse(
     n_chains: int = 3,
     n_iter: int = 10000,
     n_burnin: int = 10000,
+    n_thin: int | None = None,
     seed: int | None = None,
     save: tuple[str, ...] = ("theta",),
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Run MR-Horse (`K = 1`) or MVMR-Horse (`K > 1`)."""
+    _validate_settings(settings)
     by_a, sy_a = np.asarray(by, dtype=float), np.asarray(sy, dtype=float)
     bx_a = np.asarray(bx, dtype=float).reshape(len(by_a), -1)
     sx_a = np.asarray(sx, dtype=float).reshape(bx_a.shape)
     _, K = bx_a.shape
-    thin = max(1, n_iter // 1000)
+    if n_thin is None:
+        thin = 1 if settings == "R_default" else max(1, n_iter // 1000)
+    else:
+        if n_thin < 1:
+            raise ValueError("n_thin must be >= 1.")
+        thin = int(n_thin)
+    shared_rho = settings == "R_default"
     ss = np.random.SeedSequence(seed)
     names = [f"theta[{k + 1}]" for k in range(K)]
     out: dict[str, list[np.ndarray]] = {nm: [] for nm in names}
@@ -271,7 +314,7 @@ def horse(
     extra: dict[str, list[np.ndarray]] = {key: [] for key in save if key != "theta"}
 
     for c, child in enumerate(ss.spawn(n_chains)):
-        ch = _Chain(by_a, sy_a, bx_a, sx_a, np.random.default_rng(child))
+        ch = _Chain(by_a, sy_a, bx_a, sx_a, np.random.default_rng(child), shared_rho=shared_rho)
         keep: dict[str, list[float]] = {nm: [] for nm in names}
         ek: dict[str, list[np.ndarray]] = {key: [] for key in extra}
         for it in range(n_burnin + n_iter):
@@ -315,11 +358,65 @@ def horse(
     return dict(estimate=est, samples=out, extra=extra, thin=thin)
 
 
-def mr_horse(betaY: np.ndarray, betaYse: np.ndarray, betaX: np.ndarray, betaXse: np.ndarray, **kw) -> dict:
+def mr_horse(
+    betaY: np.ndarray,
+    betaYse: np.ndarray,
+    betaX: np.ndarray,
+    betaXse: np.ndarray,
+    n_chains: int = 3,
+    n_iter: int = 10000,
+    n_burnin: int = 10000,
+    n_thin: int | None = None,
+    seed: int | None = None,
+    save: tuple[str, ...] = ("theta",),
+    verbose: bool = False,
+    settings: SettingsMode = "default",
+) -> dict:
     """Univariable Bayesian Horseshoe Mendelian Randomization (`mr_horse`)."""
-    return horse(betaY, betaYse, np.asarray(betaX)[:, None], np.asarray(betaXse)[:, None], **kw)
+    _validate_settings(settings)
+    return horse(
+        betaY,
+        betaYse,
+        np.asarray(betaX)[:, None],
+        np.asarray(betaXse)[:, None],
+        n_chains=n_chains,
+        n_iter=n_iter,
+        n_burnin=n_burnin,
+        n_thin=n_thin,
+        seed=seed,
+        save=save,
+        verbose=verbose,
+        settings=settings,
+    )
 
 
-def mvmr_horse(betaY: np.ndarray, betaYse: np.ndarray, betaX: np.ndarray, betaXse: np.ndarray, **kw) -> dict:
+def mvmr_horse(
+    betaY: np.ndarray,
+    betaYse: np.ndarray,
+    betaX: np.ndarray,
+    betaXse: np.ndarray,
+    n_chains: int = 3,
+    n_iter: int = 10000,
+    n_burnin: int = 10000,
+    n_thin: int | None = None,
+    seed: int | None = None,
+    save: tuple[str, ...] = ("theta",),
+    verbose: bool = False,
+    settings: SettingsMode = "default",
+) -> dict:
     """Multivariable Bayesian Horseshoe Mendelian Randomization (`mvmr_horse`, `betaX` shape `(N, K)`)."""
-    return horse(betaY, betaYse, betaX, betaXse, **kw)
+    _validate_settings(settings)
+    return horse(
+        betaY,
+        betaYse,
+        betaX,
+        betaXse,
+        n_chains=n_chains,
+        n_iter=n_iter,
+        n_burnin=n_burnin,
+        n_thin=n_thin,
+        seed=seed,
+        save=save,
+        verbose=verbose,
+        settings=settings,
+    )

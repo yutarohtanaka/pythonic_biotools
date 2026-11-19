@@ -7,12 +7,22 @@ Instrument QC and allele harmonisation helpers for Mendelian Randomization:
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 from scipy import stats
 
 _COMP = {"A": "T", "T": "A", "C": "G", "G": "C"}
 _PALINDROMIC = {"AT", "TA", "CG", "GC"}
+
+
+def _validate_settings(settings: str) -> Literal["default", "R_default"]:
+    if not isinstance(settings, str) or settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unknown settings {settings!r}; expected 'default' or 'R_default'."
+        )
+    return "R_default" if settings == "R_default" else "default"
 
 
 def _pick_col(df: pd.DataFrame, preferred: str | None, candidates: tuple[str, ...], required: bool = True) -> str | None:
@@ -39,6 +49,7 @@ def harmonise_mr_data(
     eaf_col: str = "eaf",
     pval_col: str = "pval",
     palindromic_eaf_window: tuple[float, float] = (0.42, 0.58),
+    settings: Literal["default", "R_default"] = "default",
 ) -> pd.DataFrame:
     """Harmonise exposure and outcome GWAS summary tables (`TwoSampleMR::harmonise_data`).
 
@@ -52,7 +63,10 @@ def harmonise_mr_data(
         2: Infer positive strand via complementation for non-palindromic SNPs and via EAF for
            palindromic SNPs; drop palindromic SNPs with missing or intermediate EAF in `palindromic_eaf_window`.
         3: Correct strand for non-palindromic SNPs and drop all palindromic SNPs regardless of EAF.
+    settings : {"default", "R_default"}, default "default"
+        Execution mode (`"default"` or upstream R `"R_default"`).
     """
+    _validate_settings(settings)
     if action not in (1, 2, 3):
         raise ValueError(f"action must be 1, 2, or 3 (got {action!r}).")
 
@@ -232,8 +246,9 @@ def select_mr_instruments(
     alt_col: str = "alt",
     eaf_col: str = "eaf",
     pval_threshold: float = 5e-8,
-    r2_threshold: float = 0.01,
+    r2_threshold: float | None = None,
     palindromic_eaf_window: tuple[float, float] = (0.42, 0.58),
+    settings: Literal["default", "R_default"] = "default",
 ) -> pd.DataFrame:
     """Filter ambiguous palindromic SNPs, threshold by exposure p-value, and clump by LD `r^2`.
 
@@ -243,7 +258,20 @@ def select_mr_instruments(
         Summary statistics table indexed 0..M-1 matching rows/columns of `r2_matrix` (if supplied).
     r2_matrix : optional (M, M) ndarray
         Pairwise squared LD correlation matrix aligned to `df` row positions.
+    r2_threshold : float, optional
+        LD `r^2` clumping threshold (`0.01` under `"default"`, `0.001` under `"R_default"`
+        matching `TwoSampleMR::clump_data`).
+    settings : {"default", "R_default"}, default "default"
+        Execution mode (`"default"` or upstream R `"R_default"`).
     """
+    eff_settings = _validate_settings(settings)
+    if r2_threshold is None:
+        r2_thresh = 0.001 if eff_settings == "R_default" else 0.01
+    else:
+        r2_thresh = float(r2_threshold)
+    if not np.isfinite(r2_thresh) or r2_thresh <= 0.0:
+        raise ValueError(f"r2_threshold must be finite and > 0; got {r2_threshold!r}.")
+
     work = df.reset_index(drop=True).copy()
     keep_mask = np.ones(len(work), dtype=bool)
 
@@ -280,7 +308,7 @@ def select_mr_instruments(
 
     kept: list[int] = []
     for pos in order:
-        if all(r2[pos, k] < r2_threshold for k in kept):
+        if all(r2[pos, k] < r2_thresh for k in kept):
             kept.append(int(pos))
 
     return work.iloc[kept].reset_index(drop=True)

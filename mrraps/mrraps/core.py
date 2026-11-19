@@ -6,9 +6,17 @@ and idiosyncratic pleiotropic outliers via L2, Huber, or Tukey biweight loss fun
 """
 from __future__ import annotations
 
+from typing import Literal
 import warnings
 import numpy as np
 from scipy import integrate, optimize, stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 EPS = np.finfo(float).eps
 TOL = EPS ** 0.5
@@ -84,7 +92,8 @@ def _prune_large_se(b_exp, b_out, se_exp, se_out):
     return b_exp[keep], b_out[keep], se_exp[keep], se_out[keep]
 
 
-def raps_simple(b_exp, b_out, se_exp, se_out) -> dict:
+def raps_simple(b_exp, b_out, se_exp, se_out, *, settings: SettingsMode = "default") -> dict:
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
 
     def ll(beta):
@@ -113,7 +122,10 @@ def raps_simple(b_exp, b_out, se_exp, se_out) -> dict:
     )
 
 
-def raps_simple_robust(b_exp, b_out, se_exp, se_out, loss: str = "huber", k: float | None = None) -> dict:
+def raps_simple_robust(
+    b_exp, b_out, se_exp, se_out, loss: str = "huber", k: float | None = None, *, settings: SettingsMode = "default"
+) -> dict:
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
     rho, _ = make_rho(loss, k)
     delta, c1, _, _ = loss_constants(rho)
@@ -144,7 +156,18 @@ def raps_simple_robust(b_exp, b_out, se_exp, se_out, loss: str = "huber", k: flo
     )
 
 
-def raps_overdispersed(b_exp, b_out, se_exp, se_out, pruning: bool = True, niter: int = 20, tol: float = TOL) -> dict:
+def raps_overdispersed(
+    b_exp,
+    b_out,
+    se_exp,
+    se_out,
+    pruning: bool = True,
+    niter: int = 20,
+    tol: float = TOL,
+    *,
+    settings: SettingsMode = "default",
+) -> dict:
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
     if pruning:
         b_exp, b_out, se_exp, se_out = _prune_large_se(b_exp, b_out, se_exp, se_out)
@@ -204,7 +227,10 @@ def raps_overdispersed_robust(
     pruning: bool = True,
     niter: int = 20,
     tol: float = TOL,
+    *,
+    settings: SettingsMode = "default",
 ) -> dict:
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
     rho, _ = make_rho(loss, k)
     if pruning:
@@ -281,15 +307,21 @@ def raps_mle(
     loss: str = "l2",
     k: float | None = None,
     pruning: bool = True,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Port of `mr.raps::mr.raps.mle`."""
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
     if loss == "l2":
-        return raps_overdispersed(b_exp, b_out, se_exp, se_out, pruning=pruning) if over_dispersion else raps_simple(b_exp, b_out, se_exp, se_out)
+        return (
+            raps_overdispersed(b_exp, b_out, se_exp, se_out, pruning=pruning, settings=settings)
+            if over_dispersion
+            else raps_simple(b_exp, b_out, se_exp, se_out, settings=settings)
+        )
     kk = DEFAULT_K[loss] if k is None else k
     if over_dispersion:
-        return raps_overdispersed_robust(b_exp, b_out, se_exp, se_out, loss, kk, pruning=pruning)
-    return raps_simple_robust(b_exp, b_out, se_exp, se_out, loss, kk)
+        return raps_overdispersed_robust(b_exp, b_out, se_exp, se_out, loss, kk, pruning=pruning, settings=settings)
+    return raps_simple_robust(b_exp, b_out, se_exp, se_out, loss, kk, settings=settings)
 
 
 def raps_shrinkage(
@@ -302,8 +334,10 @@ def raps_shrinkage(
     k: float | None = None,
     num_init: int = 10,
     rng=None,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Port of `mr.raps::mr.raps.shrinkage` (`shrinkage = FALSE` profile-score root finder)."""
+    _validate_settings(settings)
     b_exp, b_out, se_exp, se_out = (np.asarray(v, dtype=float) for v in (b_exp, b_out, se_exp, se_out))
     rng = np.random.default_rng(rng)
     rho, k = make_rho(loss, k)
@@ -382,6 +416,7 @@ def raps_shrinkage(
         init = np.concatenate([init, init[np.repeat([0, 1], num_init - 1)] + np.concatenate([pert1, pert2])])[:, None]
 
     max_tau2_s = float(np.median(sy_s ** 2)) * 100.0  # variance-scale upper bound (== 100 * median(se_out^2))
+    max_tau2_r_default = 10.0 * float(np.median(se_out))  # upstream mr.raps.shrinkage bound 10 * median(se_out)
     roots, betas = [], np.full(len(init), np.nan)
     for i, x0 in enumerate(init):
         with warnings.catch_warnings():
@@ -389,15 +424,19 @@ def raps_shrinkage(
             sol = optimize.root(psi, x0, method="hybr", tol=1e-9)
         roots.append(sol.x)
         ok = np.all(np.isfinite(sol.x)) and sol.success
-        if over_dispersion and ok and sol.x[1] > max_tau2_s:
-            ok = False
+        if over_dispersion and ok:
+            if settings == "R_default":
+                if sol.x[1] * tau2_scale > max_tau2_r_default:
+                    ok = False
+            elif sol.x[1] > max_tau2_s:
+                ok = False
         if ok:
             betas[i] = sol.x[0]
 
     beta_init_s = raps_mle(bx_s, by_s, sx_s, sy_s, over_dispersion, loss)["beta_hat"]
     if np.all(np.isnan(betas)):
         warnings.warn("Cannot find solution with finite overdispersion. Using tau2 = 0.")
-        return raps_shrinkage(b_exp, b_out, se_exp, se_out, False, loss, k, num_init, rng)
+        return raps_shrinkage(b_exp, b_out, se_exp, se_out, False, loss, k, num_init, rng, settings=settings)
     j = int(np.nanargmin(np.abs(betas - beta_init_s)))
     others_s = [
         float(b)
@@ -407,7 +446,7 @@ def raps_shrinkage(
     root = roots[j]
     if over_dispersion and root[1] < 0:
         warnings.warn("Estimated overdispersion is negative. Using tau2 = 0.")
-        return raps_shrinkage(b_exp, b_out, se_exp, se_out, False, loss, k, num_init, rng)
+        return raps_shrinkage(b_exp, b_out, se_exp, se_out, False, loss, k, num_init, rng, settings=settings)
 
     beta_s = float(root[0])
     tau2_s = float(root[1]) if over_dispersion else 0.0
@@ -447,6 +486,9 @@ def raps_shrinkage(
     )
 
 
+mr_raps_shrinkage = raps_shrinkage
+
+
 def mr_raps(
     b_exp: np.ndarray,
     b_out: np.ndarray,
@@ -458,10 +500,32 @@ def mr_raps(
     k: float | None = None,
     num_init: int = 10,
     seed: int | None = None,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Fit `mr.raps` on two-sample exposure `(b_exp, se_exp)` and outcome `(b_out, se_out)` summary statistics."""
+    _validate_settings(settings)
     if estimator == "shrinkage":
-        return raps_shrinkage(b_exp, b_out, se_exp, se_out, over_dispersion=over_dispersion, loss=loss_function, k=k, num_init=num_init, rng=seed)
+        return raps_shrinkage(
+            b_exp,
+            b_out,
+            se_exp,
+            se_out,
+            over_dispersion=over_dispersion,
+            loss=loss_function,
+            k=k,
+            num_init=num_init,
+            rng=seed,
+            settings=settings,
+        )
     if estimator == "mle":
-        return raps_mle(b_exp, b_out, se_exp, se_out, over_dispersion=over_dispersion, loss=loss_function, k=k)
+        return raps_mle(
+            b_exp,
+            b_out,
+            se_exp,
+            se_out,
+            over_dispersion=over_dispersion,
+            loss=loss_function,
+            k=k,
+            settings=settings,
+        )
     raise ValueError("estimator must be 'shrinkage' or 'mle'")
