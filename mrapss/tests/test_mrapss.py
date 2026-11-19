@@ -103,3 +103,56 @@ def test_mrapss_with_sample_overlap():
     assert abs(res["b"] - b_true) < 0.10
     assert res["p_lrt"] < 1e-4
     assert res["converged"]
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(909)
+    m = 2500
+    l2 = rng.uniform(1.0, 30.0, m)
+    omega_true = np.array([[0.025, 0.010], [0.010, 0.030]])
+    # Intercepts > 1.5 to verify R_default IRWLS does NOT clip to [0.8, 1.5]
+    c_true = np.array([[1.85, 0.35], [0.35, 1.75]])
+
+    z_raw = rng.normal(size=(m, 2))
+    zx = np.empty(m)
+    zy = np.empty(m)
+    for j in range(m):
+        L = np.linalg.cholesky(omega_true * l2[j] + c_true)
+        v = L @ z_raw[j]
+        zx[j], zy[j] = v[0], v[1]
+
+    bg_def = estimate_background_ldsc(zx, zy, ldscore=l2, settings="default")
+    bg_r = estimate_background_ldsc(zx, zy, ldscore=l2, settings="R_default")
+    assert bg_def["C"][0, 0] == 1.5
+    assert bg_def["C"][1, 1] == 1.5
+    assert bg_r["C"][0, 0] > 1.65
+    assert bg_r["C"][1, 1] > 1.58
+    assert abs(bg_r["Omega"][0, 1] - 0.010) < 0.015
+
+    b_true = 0.35
+    xse = np.full(m, 0.02)
+    yse = np.full(m, 0.02)
+    fg = np.zeros(m)
+    fg[:90] = rng.normal(0.0, 0.16, 90)
+    xb = fg + xse * zx
+    yb = b_true * fg + yse * zy
+
+    res_r = fit_mrapss(xb, xse, yb, yse, ldscore=l2, iv_p_thresh=1e-4, settings="R_default")
+    assert abs(res_r["b"] - b_true) < 0.12
+    assert res_r["pval"] == res_r["p_lrt"]
+    np.testing.assert_allclose(
+        res_r["b_se"],
+        abs(res_r["b"]) / np.sqrt(max(res_r["lrt_stat"], 1e-12)),
+        rtol=1e-12,
+    )
+
+    # Fallback when b == 0 exactly (zero outcome effects with zero overlap)
+    yb_zero = np.zeros(m)
+    res_zero = fit_mrapss(xb, xse, yb_zero, yse, iv_p_thresh=1e-4, rho_e=0.0, settings="R_default")
+    assert abs(res_zero["b"]) < 1e-6
+    assert np.isfinite(res_zero["b_se"]) and res_zero["b_se"] > 0.0
+
+    with pytest.raises(ValueError, match="Unknown settings"):
+        estimate_background_ldsc(zx, zy, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        fit_mrapss(xb, xse, yb, yse, settings="invalid")  # type: ignore[arg-type]
