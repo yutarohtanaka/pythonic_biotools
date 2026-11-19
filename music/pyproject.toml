@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "music"
+version = "0.2.0"
+description = "Python implementation of MuSiC, MuSiC2, and hierarchical MuSiC bulk RNA-seq deconvolution"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "anndata>=0.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["music*"]
