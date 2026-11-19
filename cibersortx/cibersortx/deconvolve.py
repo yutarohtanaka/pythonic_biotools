@@ -16,9 +16,11 @@ from sklearn.svm import NuSVR
 
 from ._io import (
     ExpressionInput,
+    SettingsInput,
     align_genes,
     parse_expression_matrix,
     parse_signature_matrix,
+    validate_settings,
 )
 
 
@@ -277,12 +279,14 @@ def deconvolve(
     svr_max_iter: int = -1,
     absolute_mode: bool = False,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> DeconvolutionResult:
     """
     Deconvolve bulk expression mixtures using linear nu-SVR (CIBERSORT /
     CIBERSORTx, Newman et al. 2015, 2019), with optional `B-mode` or `S-mode`
     ComBat batch alignment.
     """
+    validate_settings(settings)
     if n_permutations < 0:
         raise ValueError("`n_permutations` must be >= 0.")
     if permutation_mode not in ("per_sample", "pooled"):
@@ -317,6 +321,7 @@ def deconvolve(
             svr_max_iter=svr_max_iter,
             absolute_mode=absolute_mode,
             seed=seed,
+            settings=settings,
         )
 
     if mode_norm == "S":
@@ -347,6 +352,7 @@ def deconvolve(
             svr_max_iter=svr_max_iter,
             absolute_mode=absolute_mode,
             seed=seed,
+            settings=settings,
         )
 
     B_raw, sig_genes, cell_types = parse_signature_matrix(

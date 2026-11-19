@@ -16,11 +16,13 @@ import pandas as pd
 
 from ._io import (
     ExpressionInput,
+    SettingsInput,
     align_genes,
     parse_expression_matrix,
     parse_label_vector,
     parse_sc_reference_sparse_aware,
     parse_signature_matrix,
+    validate_settings,
 )
 
 if TYPE_CHECKING:
@@ -180,12 +182,14 @@ def combat_align(
     mean_only: bool = False,
     max_iter: int = 100,
     tol: float = 1e-4,
+    settings: SettingsInput = "default",
 ) -> BatchAlignmentResult:
     """
     Two-batch Empirical Bayes ComBat location-scale alignment in `log2(x + 1)`
     space mapping `target` `(G, N1)` onto `reference` `(G, N2)` (`space='reference'`)
     or both batches onto their pooled grand-mean space (`space='common'`).
     """
+    validate_settings(settings)
     if space not in ("reference", "common"):
         raise ValueError(f"Unsupported ComBat `space='{space}'`. Expected 'reference' or 'common'.")
     if max_iter < 1:
@@ -325,6 +329,7 @@ def b_mode_adjust(
     svr_max_iter: int = -1,
     absolute_mode: bool = False,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> DeconvolutionResult:
     """
     CIBERSORTx `B-mode` (Bulk-mode) cross-platform batch adjustment:
@@ -333,6 +338,7 @@ def b_mode_adjust(
     3. ComBat align observed bulk M -> M_tilde.
     4. Re-deconvolve adjusted bulk M_adj.
     """
+    validate_settings(settings)
     from .deconvolve import DeconvolutionResult, _deconvolve_core
 
     B_raw, sig_genes, cell_types = parse_signature_matrix(
@@ -411,6 +417,7 @@ def b_mode_adjust(
         pd.DataFrame(M_valid, index=shared_genes),
         pd.DataFrame(M_tilde, index=shared_genes),
         space=batch_space,
+        settings=settings,
     )
 
     M_adj = M_0.copy()
@@ -480,14 +487,16 @@ def s_mode_adjust(
     svr_max_iter: int = -1,
     absolute_mode: bool = False,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> DeconvolutionResult:
     """
     CIBERSORTx `S-mode` (Single-cell mode) cross-platform batch adjustment:
-    1. Generate `n_synthetic` Dirichlet pseudobulk mixtures from `sc_ref`.
-    2. Rescale synthetic mixtures to match library size of `signature` B_S.
-    3. ComBat align synthetic mixtures (sc batch) -> bulk mixture M.
-    4. Transform signature B_S using learned ComBat parameters and deconvolve.
+    1. Generate `n_synthetic` synthetic mini-bulk mixtures by sampling single-cell barcodes from `sc_ref`.
+    2. ComBat align synthetic mixtures (sc batch) -> bulk mixture M.
+    3. Recover batch-adjusted signature B_adj (via NNLS over known mixing fractions under `settings='R_default'`,
+       or direct ComBat transform under `settings='default'`) and deconvolve.
     """
+    eff_mode = validate_settings(settings)
     from .deconvolve import DeconvolutionResult, _deconvolve_core
 
     if n_synthetic < 2:
@@ -564,11 +573,12 @@ def s_mode_adjust(
             )
         ct_indices.append(idx)
 
-    # Generate Dirichlet-weighted synthetic pseudobulk mixtures
+    # Generate synthetic pseudobulk mini-bulks by sampling single-cell barcodes
     rng = np.random.default_rng(seed)
     n_genes = len(shared_genes)
     n_types = len(cell_types)
     M_synth = np.empty((n_genes, n_synthetic), dtype=np.float64)
+    F_synth = np.empty((n_synthetic, n_types), dtype=np.float64)
 
     for m in range(n_synthetic):
         pi = rng.dirichlet(np.ones(n_types, dtype=np.float64))
@@ -581,27 +591,48 @@ def s_mode_adjust(
                 if counts[donor_k] > 1:
                     counts[donor_k] -= 1
                     counts[k_z] += 1
+        F_synth[m, :] = counts.astype(np.float64) / float(max(1, np.sum(counts)))
         chosen_cells: list[np.ndarray] = []
         for k_idx, cnt in enumerate(counts):
             if cnt > 0:
                 pool = ct_indices[k_idx]
-                chosen_cells.append(pool[rng.integers(0, len(pool), size=int(cnt))])
+                if eff_mode == "R_default":
+                    chosen_cells.append(
+                        rng.choice(pool, size=int(cnt), replace=(int(cnt) > len(pool)))
+                    )
+                else:
+                    chosen_cells.append(pool[rng.integers(0, len(pool), size=int(cnt))])
         all_chosen = np.concatenate(chosen_cells)
-        M_synth[:, m] = np.mean(S_dense[all_chosen, :], axis=0)
+        if eff_mode == "R_default":
+            # Sum sampled single-cell barcode transcriptomes into synthetic mini-bulk
+            mini_bulk = np.sum(S_dense[all_chosen, :], axis=0)
+            M_synth[:, m] = mini_bulk / float(len(all_chosen))
+        else:
+            M_synth[:, m] = np.mean(S_dense[all_chosen, :], axis=0)
 
-    # Rescale synthetic mixtures to match library sum of signature matrix B_0
-    med_b = float(np.median(np.sum(B_0, axis=0)))
+    # Rescale synthetic mixtures to match library sum of signature matrix B_0 (or bulk M_0 in R_default)
+    target_lib = (
+        float(np.median(np.sum(M_0, axis=0)))
+        if eff_mode == "R_default"
+        else float(np.median(np.sum(B_0, axis=0)))
+    )
     med_synth = float(np.median(np.sum(M_synth, axis=0)))
-    if med_b > 0.0 and med_synth > 0.0:
-        M_synth *= med_b / med_synth
+    if target_lib > 0.0 and med_synth > 0.0:
+        M_synth *= target_lib / med_synth
 
     align_res = combat_align(
         pd.DataFrame(M_synth, index=shared_genes),
         pd.DataFrame(M_0, index=shared_genes),
         space=batch_space,
+        settings=settings,
     )
 
-    B_adj = _apply_combat_transform_to_target(B_0, align_res, is_reference_batch=False)
+    if eff_mode == "R_default" and n_synthetic > n_types:
+        from .gep import _solve_batch_qr_nnls
+
+        B_adj = _solve_batch_qr_nnls(F_synth, align_res.adjusted_target)
+    else:
+        B_adj = _apply_combat_transform_to_target(B_0, align_res, is_reference_batch=False)
     if batch_space == "common":
         assert align_res.adjusted_reference is not None
         M_used = align_res.adjusted_reference

@@ -1,82 +1,64 @@
-# Pythonic BayesPrism
+# `bayesprism`: Bayesian Cell-Type & Expression Deconvolution
 
-Python implementation of **BayesPrism** (Chu et al., *Nature Cancer* 2022) for Bayesian cell-type fraction deconvolution and sample-specific gene expression reconstruction from bulk RNA-seq and spatial transcriptomics data, natively integrated with `AnnData` and `pandas`.
+Python implementation of **BayesPrism** (Chu et al., *Nature Cancer* 2022) for Bayesian cell-type fraction deconvolution, sample-specific gene expression reconstruction, spatial transcriptomics scaling, and *de novo* malignant program discovery, natively integrated with `AnnData` and `pandas`.
 
-## Installation
+## Citation
 
-```bash
-pip install ./bayesprism
-# With optional plotting utilities:
-pip install "./bayesprism[plots]"
-```
+- Chu, T., Wang, Z., Pe'er, D., & Danko, C. G. Cell type and gene expression deconvolution with BayesPrism enables Bayesian integrative analysis across bulk and single-cell RNA sequencing in oncology. *Nature Cancer* **3**, 505–517 (2022). https://doi.org/10.1038/s43018-022-00356-3
+- Upstream Danko Lab R package: https://github.com/Danko-Lab/BayesPrism
 
-## Quick Start
+## Statistical & Algorithmic Overview
+
+1. **Initial Collapsed/Blocked Gibbs Sampling**:
+   Samples latent read assignments $Z_{n,g,s} \sim \text{Multinomial}(X_{n,g}, \propto \theta_{n,s} \phi_{s,g})$ and cell-state fractions $\theta_n \sim \text{Dirichlet}(\sum_g Z_{n,g,\cdot} + \alpha)$, aggregating posterior cell-state profiles into canonical cell types.
+2. **MAP / MLE Reference Updating (`update_reference`)**:
+   Updates reference expression profiles ($\psi$) via sample-specific MLE for malignant cells (`key`) and L-BFGS-B MAP log-fold-change optimization ($\sigma = 2.0$) for non-malignant microenvironment cell types (or shared-$\gamma$ MLE across states in spatial transcriptomics `run_st`).
+3. **Final Gibbs Fraction Estimation & NMF Tumor Embedding (`learn_embedding_nmf`)**:
+   Re-estimates refined cell-type proportions $\theta_f$ (and posterior uncertainty `theta_cv`) and optionally decomposes sample-specific malignant expression `psi_mal` into $K$ latent tumor programs $(\eta, \omega)$ via EM initialized by NMF.
+
+## Quickstart
 
 ```python
-import anndata as ad
-from pythonic_bayesprism import Prism
-
-ref_adata = ad.read_h5ad("reference_scRNA.h5ad")
-mix_adata = ad.read_h5ad("mixture_bulk.h5ad")
+from pythonic_bayesprism import Prism, plot_bulk_vs_sc, plot_cor_phi
 
 bp = Prism(
     reference=ref_adata,
     mixture=mix_adata,
     cell_type_labels="cell_type",
     cell_state_labels="cell_state",
-    key="Tumor",  # Malignant cell type key (or None for non-tumor tissues)
+    key="Tumor",
+    settings="R_default",
 )
+bp.run(n_cores=1, update_gibbs=True)
 
-bp.run(
-    n_cores=4,
-    update_gibbs=True,
-    gibbs_control={"chain_length": 1000, "burn_in": 500, "thinning": 2, "alpha": 1.0, "seed": 123},
-    opt_control={"maxiter": 100000, "optimizer": "MAP", "sigma": 2.0},
-)
+theta_df = bp.get_results(output_type="dataframe")
+print(theta_df.head())
+print("Posterior CV shape:", bp.theta_cv.shape)
 
-res_df = bp.get_results(output_type="dataframe")
-res_adata = bp.get_results(output_type="anndata")
+# Spatial transcriptomics mode & de novo tumor embedding
+emb = bp.learn_embedding_nmf(K=3, cycle=20, settings="R_default")
 ```
 
-## Advanced Capabilities
+## `settings="default"` vs `settings="R_default"`
 
-### 1. Spatial Transcriptomics (`bp.run_st()`)
-Uses shared-$\gamma$ Maximum Likelihood Estimation (`optimizer="MLE"` by default) across cell states (`optimize_psi_one_gamma`) to model platform/capture scaling factors between single-cell references and spatial spots:
+- **`settings="default"` (Pythonic mode)**:
+  - Accumulates running posterior means `(Z, theta)` without storing per-draw arrays (`theta_cv` omitted).
+  - Initializes `learn_embedding_nmf` with single-start Frobenius-norm NMF.
+  - Clusters `plot_cor_phi` using Ward linkage on Euclidean distance between correlation rows.
+- **`settings="R_default"` (Exact `Danko-Lab/BayesPrism` parity)**:
+  - Computes and stores **`theta_cv`** (posterior $\text{SD} / \text{mean}$ across thinned post-burn-in Gibbs draws, matching `ThetaPost@theta.cv`, including state-summed cell-type draws) on `bp.theta_cv` and inside `posterior_*` dictionaries across `run()` and `run_st()`.
+  - Uses Brunet **KL-divergence** (`beta_loss="kullback-leibler"`, `solver="mu"`, multi-start `n_runs=10` selecting minimal KL reconstruction error) NMF initialization in `learn_embedding_nmf` (`learn_embedding.R`).
+  - Uses **`1 - cor_mat`** pairwise distance (`complete` hierarchical linkage) in `plot_cor_phi`.
 
-```python
-bp_st = Prism(
-    reference=ref_adata,
-    mixture=st_adata,
-    cell_type_labels="cell_type",
-    cell_state_labels="cell_state",
-    key=None,
-)
-bp_st.run_st(n_cores=4)
+## Key Outputs
+
+- `bp.get_results(output_type="dataframe" | "anndata")`: deconvolved cell-type proportions (`samples x cell_types`).
+- `bp.get_exp(state_or_type="type" | "state", cell_name=...)`: sample-specific posterior read matrix (`samples x genes`).
+- `bp.theta_cv`: `(samples x cell_types)` posterior coefficient of variation (when `settings="R_default"`).
+- `bp.learn_embedding_nmf(...)`: dict with `'eta_prior'`, `'eta_post'`, and `'omega'`.
+
+## Running Tests
+
+```bash
+PYTHONPATH=bayesprism /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m pytest bayesprism/tests -q
 ```
-
-### 2. De Novo Tumor Embedding Learning (`bp.learn_embedding_nmf()`)
-Learns $K$ malignant expression programs ($\eta$) and sample weights ($\omega$) via Expectation-Maximization initialized by NMF on reconstructed tumor expression (`psi_mal`):
-
-```python
-embedding_res = bp.learn_embedding_nmf(K=3, cycle=20, n_cores=4)
-# Keys: 'eta_prior', 'eta_post', 'omega'
-```
-
-### 3. Cell-Type-Specific Expression Extraction (`bp.get_exp()`)
-```python
-Z_b_cells = bp.get_exp(state_or_type="type", cell_name="B")
-```
-
-### 4. Reference & Mixture QC Plots (`plots.py`)
-`matplotlib` and `seaborn` are imported lazily when plotting functions are invoked, so `pythonic_bayesprism` works in headless environments without plotting libraries installed:
-
-```python
-from pythonic_bayesprism import plot_cor_phi, plot_bulk_vs_sc
-
-plot_cor_phi(bp, min_exp=3, cmap="RdBu_r")
-plot_bulk_vs_sc(bp)
-```
-
-## Citation
-
-- Chu, T., Wang, Z., Pe'er, D. & Danko, C. G. Cell type and gene expression deconvolution with BayesPrism enables Bayesian integrative analysis across bulk and single-cell RNA sequencing in oncology. *Nature Cancer* **3**, 505–517 (2022).

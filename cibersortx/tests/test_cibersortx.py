@@ -571,3 +571,116 @@ def test_edge_cases_and_validation_errors() -> None:
     with pytest.raises(ValueError, match="AnnData expression matrix is None"):
         deconvolve(adata_none, B_df, n_permutations=0)
 
+
+def test_settings_validation_and_r_default_cibersortx_protocol() -> None:
+    """
+    Verify `settings="R_default"` (and alias `"cibersortx_default"`) across all
+    primary functions, strict `ValueError` on invalid `settings`, Newman et al. (2019)
+    `> 50%` non-zero phenotype gate + mini-bulk Welch `ttest` in `build_signature_matrix`,
+    and S-mode single-cell mini-bulk + NNLS signature recovery in `deconvolve`.
+    """
+    rng = np.random.default_rng(2026)
+    B_df, M_df, F_true, _, cell_types = _make_signature_and_mixtures(
+        n_genes=80, n_types=4, n_samples=16, noise_sd=0.01, seed=2026
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        deconvolve(M_df, B_df, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        combat_align(M_df, M_df, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        impute_gep_group(M_df, F_true, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        impute_gep_highres(M_df, F_true, n_permutations=5, settings="bad_mode")  # type: ignore[arg-type]
+
+    # Build scRNA-seq dataset with a bursty <=50% dropout artifact gene (G_bursty: 30% non-zero in CT_0)
+    n_cells_per_ct = 60
+    n_genes = 160
+    genes = [f"G_{i:03d}" for i in range(n_genes)]
+    cts = ["CT_0", "CT_1", "CT_2", "CT_3"]
+    sc_blocks = []
+    sc_labels = []
+    for k, ct in enumerate(cts):
+        mat_k = rng.poisson(2.0, size=(n_cells_per_ct, n_genes)).astype(np.float64)
+        mat_k[:, k * 25 : (k + 1) * 25] += rng.poisson(30.0, size=(n_cells_per_ct, 25))
+        if k == 0:
+            # Gene 150 is expressed in only 18/60 = 30% (<= 50%) of CT_0 cells, at high burst level
+            mat_k[:, 150] = 0.0
+            mat_k[:18, 150] = 400.0
+        else:
+            mat_k[:, 150] = 0.0
+        sc_blocks.append(mat_k)
+        sc_labels.extend([ct] * n_cells_per_ct)
+
+    X_sc = np.vstack(sc_blocks)
+    adata_sc = ad.AnnData(
+        X=X_sc,
+        obs=pd.DataFrame({"ct": sc_labels}, index=[f"cell_{i}" for i in range(len(sc_labels))]),
+        var=pd.DataFrame(index=genes),
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        build_signature_matrix(adata_sc, "ct", settings="bad_mode")  # type: ignore[arg-type]
+
+    sig_def = build_signature_matrix(
+        adata_sc, "ct", min_genes=10, max_genes=25, step=5, seed=7, settings="default"
+    )
+    sig_r = build_signature_matrix(
+        adata_sc, "ct", min_genes=10, max_genes=25, step=5, seed=7, settings="R_default"
+    )
+    sig_alias = build_signature_matrix(
+        adata_sc, "ct", min_genes=10, max_genes=25, step=5, seed=7, settings="cibersortx_default"
+    )
+    np.testing.assert_allclose(sig_r.signature, sig_alias.signature, atol=1e-12)
+    assert sig_r.gene_names == sig_alias.gene_names
+
+    # Under R_default, G_150 (30% non-zero <= 50%) is gated out for CT_0
+    deg_r = sig_r.deg_dataframe()
+    g150_ct0 = deg_r[(deg_r["gene"] == "G_150") & (deg_r["cell_type"] == "CT_0")].iloc[0]
+    assert float(g150_ct0["mean_target"]) == 0.0
+    assert bool(g150_ct0["passed_strict"]) is False
+    assert "G_150" not in sig_r.gene_names
+    assert sig_def.signature.shape[1] == 4
+
+    # S-mode with settings="R_default": synthetic barcode mini-bulks + NNLS signature inversion
+    cap_bias = np.exp(rng.normal(0.0, 0.85, size=n_genes))
+    X_sc_cp10k = X_sc * (1e4 / np.sum(X_sc, axis=1, keepdims=True))
+    B_true_bulk = np.column_stack(
+        [np.mean(X_sc_cp10k[np.asarray(sc_labels) == ct], axis=0) / cap_bias for ct in cts]
+    )
+    F_bulk = rng.dirichlet(np.ones(4), size=50)
+    # Center cohort composition around uniform simplex mean so ComBat batch-mean assumption holds
+    F_bulk = F_bulk / np.mean(F_bulk, axis=0, keepdims=True)
+    F_bulk = F_bulk / np.sum(F_bulk, axis=1, keepdims=True)
+    M_bulk_df = pd.DataFrame(
+        B_true_bulk @ F_bulk.T,
+        index=genes,
+        columns=[f"Bulk_{i}" for i in range(50)],
+    )
+    res_s_r = deconvolve(
+        M_bulk_df,
+        sig_r,
+        batch_mode="S",
+        sc_ref=adata_sc,
+        sc_cell_type_labels="ct",
+        n_synthetic=100,
+        cells_per_mixture=80,
+        n_permutations=0,
+        seed=11,
+        settings="R_default",
+    )
+    res_unadj = deconvolve(M_bulk_df, sig_r, batch_mode="none", n_permutations=0, settings="R_default")
+    mae_s_r = float(np.mean(np.abs(res_s_r.fractions - F_bulk)))
+    mae_unadj = float(np.mean(np.abs(res_unadj.fractions - F_bulk)))
+    assert mae_s_r < 0.55 * mae_unadj
+    assert float(np.corrcoef(res_s_r.fractions.ravel(), F_bulk.ravel())[0, 1]) > 0.94
+
+    # Verify combat_align, impute_gep_group, and impute_gep_highres run cleanly under R_default
+    ca_r = combat_align(M_df, M_df, settings="R_default")
+    np.testing.assert_allclose(ca_r.adjusted_target, M_df.to_numpy(), atol=1e-12)
+    grp_r = impute_gep_group(M_df.iloc[:15, :], F_true, n_bootstrap=10, seed=1, settings="R_default")
+    hr_r = impute_gep_highres(M_df.iloc[:6, :], F_true, n_permutations=5, seed=1, settings="R_default")
+    assert isinstance(grp_r, GroupGEPResult)
+    assert isinstance(hr_r, HighResGEPResult)
+
+

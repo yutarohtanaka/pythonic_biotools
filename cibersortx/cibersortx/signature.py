@@ -17,9 +17,11 @@ from scipy import sparse, stats
 
 from ._io import (
     ExpressionInput,
+    SettingsInput,
     bh_fdr,
     parse_label_vector,
     parse_sc_reference_sparse_aware,
+    validate_settings,
 )
 
 
@@ -90,7 +92,7 @@ def build_signature_matrix(
     replicates_per_type: int | None = None,
     normalize_cells: bool = True,
     target_sum: float = 1e4,
-    test_method: Literal["mannwhitney", "ttest"] = "mannwhitney",
+    test_method: Literal["mannwhitney", "ttest"] | None = None,
     q_value: float = 0.01,
     min_fc: float = 1.5,
     min_expr: float = 0.0,
@@ -102,12 +104,25 @@ def build_signature_matrix(
     is_log2: bool = False,
     log2_offset: float = 0.0,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> SignatureMatrixResult:
     """
     Construct a cell-type signature matrix from single-cell or replicate
     reference profiles via one-vs-rest DEG selection and condition-number
     minimization (Newman et al., Nat Biotechnol 2019).
+
+    When `settings="R_default"` (or `"cibersortx_default"`), applies the exact
+    Newman et al. (2019) single-cell signature protocol:
+      - `> 50%` within-phenotype non-zero single-cell expression fraction gate
+      - Random single-cell mini-bulk replicate pooling (default 5 replicates/type)
+      - Welch two-sample `ttest` (`q <= 0.01`, `FC >= 1.5`)
     """
+    eff_mode = validate_settings(settings)
+    eff_test_method: Literal["mannwhitney", "ttest"] = (
+        test_method
+        if test_method is not None
+        else ("ttest" if eff_mode == "R_default" else "mannwhitney")
+    )
     if target_sum <= 0:
         raise ValueError("`target_sum` must be positive.")
     if min_fc <= 0:
@@ -201,7 +216,25 @@ def build_signature_matrix(
     prof_mat = np.ascontiguousarray(X_active.T, dtype=np.float64)
     prof_labels = np.asarray(labels, dtype=object)
 
-    # 2. Optional replicate pseudobulk partitioning
+    # Newman et al. (2019) > 50% within-phenotype non-zero expression fraction gate
+    nonzero_frac_by_type: dict[str, np.ndarray] = {}
+    if eff_mode == "R_default":
+        for ct in cell_types:
+            ct_sc_mask = prof_labels == ct
+            cols_sc = prof_mat[:, ct_sc_mask]
+            nz_frac = np.mean(cols_sc > 0.0, axis=1)
+            nonzero_frac_by_type[ct] = nz_frac
+            if np.any(nz_frac > 0.5):
+                low_det = nz_frac <= 0.5
+                if np.any(low_det):
+                    prof_mat[np.ix_(low_det, np.flatnonzero(ct_sc_mask))] = 0.0
+
+    # 2. Optional replicate pseudobulk partitioning (automatic mini-bulks in R_default)
+    eff_reps = (
+        replicates_per_type
+        if replicates_per_type is not None
+        else (5 if (eff_mode == "R_default" and donor_vec is None) else None)
+    )
     if donor_vec is not None:
         donor_arr = np.asarray(donor_vec, dtype=object)
         rep_cols: list[np.ndarray] = []
@@ -215,14 +248,14 @@ def build_signature_matrix(
                 rep_types.append(ct)
         prof_mat = np.column_stack(rep_cols)
         prof_labels = np.asarray(rep_types, dtype=object)
-    elif replicates_per_type is not None:
+    elif eff_reps is not None:
         rng = np.random.default_rng(seed)
         rep_cols = []
         rep_types = []
         for ct in cell_types:
             idx = np.flatnonzero(prof_labels == ct)
             perm_idx = idx[rng.permutation(len(idx))]
-            n_buckets = min(int(replicates_per_type), len(perm_idx))
+            n_buckets = min(int(eff_reps), len(perm_idx))
             for bucket in np.array_split(perm_idx, n_buckets):
                 rep_cols.append(np.mean(prof_mat[:, bucket], axis=1))
                 rep_types.append(ct)
@@ -254,10 +287,14 @@ def build_signature_matrix(
         mu_rest = np.mean(x_rest, axis=1)
         log2_fc = np.log2((mu_k + 1.0) / (mu_rest + 1.0))
 
-        p_vals = _compute_one_vs_rest_pvalues(x_k, x_rest, test_method=test_method)
+        p_vals = _compute_one_vs_rest_pvalues(x_k, x_rest, test_method=eff_test_method)
         q_vals = bh_fdr(p_vals)
 
         strict_mask = (q_vals <= q_value) & (log2_fc >= log2_min_fc) & (mu_k >= min_expr)
+        if eff_mode == "R_default" and ct in nonzero_frac_by_type:
+            nz_f = nonzero_frac_by_type[ct]
+            if np.any(nz_f > 0.5):
+                strict_mask = strict_mask & (nz_f > 0.5)
         strict_idx = np.flatnonzero(strict_mask)
 
         # Sort deterministically by (-log2_fc, q_val, gene_name)

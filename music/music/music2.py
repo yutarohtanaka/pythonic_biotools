@@ -1,7 +1,13 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import nnls
-from .music import _get_counts, _music_prop_from_basis, music_basis
+from .music import (
+    SettingsMode,
+    _get_counts,
+    _music_prop_from_basis,
+    music_basis,
+    validate_settings,
+)
 
 
 def music2_prop(
@@ -33,13 +39,14 @@ def music2_prop(
     centered=False,
     normalize=False,
     seed=None,
+    settings: SettingsMode = "default",
 ):
     """
     MuSiC2 Deconvolution across clinical conditions (Fan et al., Briefings in Bioinformatics 2022).
 
     Iteratively identifies condition-associated cell-type-specific differentially
     expressed (DE) genes between bulk control and case cohorts and removes them from
-    the precomputed scRNA-seq basis until case proportions converge.
+    the scRNA-seq basis until case proportions converge.
 
     Returns
     -------
@@ -48,6 +55,7 @@ def music2_prop(
         'convergence', 'n_iter' (when converged), 'DE_genes' (final iteration DE gene list),
         and 'id_not_converge' (when not converged).
     """
+    validate_settings(settings)
     rng = np.random.default_rng(seed)
 
     bulk_control_genes = pd.Index(bulk_control_adata.var_names)
@@ -94,12 +102,28 @@ def music2_prop(
     exp_genel = gene_all[exp_mask].values
     exp_genel_idx = np.flatnonzero(exp_mask)
 
-    # Initial deconvolution using precomputed basis
+    if settings == "R_default":
+        sc_init_adata = sc_adata[:, gene_all]
+        basis_init = music_basis(
+            sc_init_adata,
+            cluster_col,
+            sample_col,
+            layer=sc_layer,
+            markers=None,
+            select_ct=select_ct,
+            cell_sizes=cell_sizes,
+            ct_cov=ct_cov,
+            non_zero=non_zero,
+        )
+    else:
+        basis_init = basis
+
+    # Initial deconvolution
     res_control = _music_prop_from_basis(
         bulk_X=bulk_control_X,
         bulk_obs_names=bulk_control_adata.obs_names,
         bulk_genes=gene_all,
-        basis=basis,
+        basis=basis_init,
         markers=None,
         non_zero=non_zero,
         check_overlap=False,
@@ -108,6 +132,7 @@ def music2_prop(
         eps=eps_music,
         centered=centered,
         normalize=normalize,
+        settings=settings,
     )
     prop_control = res_control["Est_prop_weighted"]
 
@@ -115,7 +140,7 @@ def music2_prop(
         bulk_X=bulk_case_X,
         bulk_obs_names=bulk_case_adata.obs_names,
         bulk_genes=gene_all,
-        basis=basis,
+        basis=basis_init,
         markers=None,
         non_zero=non_zero,
         check_overlap=False,
@@ -124,6 +149,7 @@ def music2_prop(
         eps=eps_music,
         centered=centered,
         normalize=normalize,
+        settings=settings,
     )
     prop_case_ini = res_case_ini["Est_prop_weighted"]
     prop_case_fix = pd.DataFrame(columns=prop_control.columns, dtype=float)
@@ -230,21 +256,61 @@ def music2_prop(
         unconverged_names = prop_case_ini.index
         unconverged_rows = [case_name_to_row[name] for name in unconverged_names]
 
-        res_case_new = _music_prop_from_basis(
-            bulk_X=bulk_case_X[unconverged_rows, :],
-            bulk_obs_names=unconverged_names,
-            bulk_genes=gene_all,
-            basis=basis,
-            markers=l_genes,
-            non_zero=non_zero,
-            check_overlap=False,
-            iter_max=iter_max_music,
-            nu=nu,
-            eps=eps_music,
-            centered=centered,
-            normalize=normalize,
-        )
-        prop_case_new = res_case_new["Est_prop_weighted"]
+        if settings == "R_default":
+            # music2.R:121 recomputes music_basis on sc_adata[:, l_genes] inside every iteration
+            l_gene_idx = gene_all.get_indexer(pd.Index(l_genes))
+            basis_iter = music_basis(
+                sc_adata[:, l_genes],
+                cluster_col,
+                sample_col,
+                layer=sc_layer,
+                markers=None,
+                select_ct=list(cell_types),
+                cell_sizes=cell_sizes,
+                ct_cov=ct_cov,
+                non_zero=non_zero,
+            )
+            res_case_new = _music_prop_from_basis(
+                bulk_X=bulk_case_X[np.ix_(unconverged_rows, l_gene_idx)],
+                bulk_obs_names=unconverged_names,
+                bulk_genes=pd.Index(l_genes),
+                basis=basis_iter,
+                markers=None,
+                non_zero=non_zero,
+                check_overlap=False,
+                iter_max=iter_max_music,
+                nu=nu,
+                eps=eps_music,
+                centered=centered,
+                normalize=normalize,
+                settings=settings,
+            )
+            prop_case_new = res_case_new["Est_prop_weighted"].reindex(
+                columns=cell_types, fill_value=0.0
+            )
+            row_s = prop_case_new.sum(axis=1)
+            pos_s = row_s > 0
+            if bool(pos_s.any()):
+                prop_case_new.loc[pos_s] = prop_case_new.loc[pos_s].div(
+                    row_s.loc[pos_s], axis=0
+                )
+        else:
+            res_case_new = _music_prop_from_basis(
+                bulk_X=bulk_case_X[unconverged_rows, :],
+                bulk_obs_names=unconverged_names,
+                bulk_genes=gene_all,
+                basis=basis,
+                markers=l_genes,
+                non_zero=non_zero,
+                check_overlap=False,
+                iter_max=iter_max_music,
+                nu=nu,
+                eps=eps_music,
+                centered=centered,
+                normalize=normalize,
+                settings="default",
+            )
+            prop_case_new = res_case_new["Est_prop_weighted"]
 
         pc = np.abs(prop_case_new.values - prop_case_ini.values)
         conv = np.ones_like(pc, dtype=int)

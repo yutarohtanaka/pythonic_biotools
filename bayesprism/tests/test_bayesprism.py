@@ -336,3 +336,100 @@ def test_plots_min_exp_and_identity_line(tmp_path, monkeypatch):
     # True y = x identity line must have identical x and y endpoints!
     np.testing.assert_allclose(xdata, ydata, rtol=1e-12)
     plt.close(fig)
+
+
+def test_bayesprism_settings_validation():
+    ref_adata, mix_adata, _, _ = _make_synthetic_cohort(seed=5, n_samples=2)
+    with pytest.raises(ValueError, match="settings"):
+        Prism(ref_adata, mix_adata, "cell_type", outlier_fraction=1.0, settings="bad")  # type: ignore[arg-type]
+
+    bp = Prism(ref_adata, mix_adata, "cell_type", outlier_fraction=1.0)
+    with pytest.raises(ValueError, match="settings"):
+        bp.run(settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        bp.run_st(settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        bp.learn_embedding_nmf(K=2, settings="bad")  # type: ignore[arg-type]
+
+
+def test_r_default_theta_cv_kl_nmf_and_plot_cor_distance(tmp_path, monkeypatch):
+    """
+    Verify Danko-Lab/BayesPrism parity under settings='R_default':
+    1. Computes and stores theta_cv (posterior SD / posterior mean across thinned Gibbs draws)
+       in Prism.run (both tumor and non-tumor modes) and Prism.run_st.
+    2. Uses Brunet KL-divergence (beta_loss='kullback-leibler', solver='mu', multi-start
+       n_runs=10 best reconstruction) NMF initialization in learn_embedding_nmf.
+    3. Uses 1 - cor_mat distance matrix in plot_cor_phi.
+    """
+    ref_adata, mix_adata, _, _ = _make_synthetic_cohort(seed=61, n_samples=4)
+
+    gc_fast = {"chain_length": 120, "burn_in": 60, "thinning": 2, "alpha": 1.0, "seed": 42}
+    oc_fast = {"maxiter": 120, "optimizer": "MAP", "sigma": 2.0}
+
+    # Default mode does not store theta_cv; R_default computes and stores theta_cv
+    bp_def = Prism(
+        ref_adata, mix_adata, "cell_type", "cell_state", key="Tumor", outlier_fraction=1.0
+    ).run(gibbs_control=gc_fast, opt_control=oc_fast, settings="default")
+    assert not hasattr(bp_def, "theta_cv")
+
+    bp_r = Prism(
+        ref_adata,
+        mix_adata,
+        "cell_type",
+        "cell_state",
+        key="Tumor",
+        outlier_fraction=1.0,
+        settings="R_default",
+    ).run(gibbs_control=gc_fast, opt_control=oc_fast)
+
+    assert hasattr(bp_r, "theta_cv")
+    assert bp_r.theta_cv.shape == (4, 3)
+    assert np.all(np.isfinite(bp_r.theta_cv)) and np.all(bp_r.theta_cv > 0.0)
+    assert "theta_cv" in bp_r.posterior_initial_cellState
+    assert "theta_cv" in bp_r.posterior_initial_cellType
+    assert bp_r.posterior_initial_cellType["theta_cv"].shape == (4, 3)
+
+    # Brunet KL multi-start NMF in learn_embedding_nmf
+    emb_def = bp_def.learn_embedding_nmf(
+        K=2, cycle=1, gibbs_control=gc_fast, opt_control=oc_fast,
+        nmf_control={"nrun": 4, "seed": 7}, settings="default"
+    )
+    emb_r = bp_r.learn_embedding_nmf(
+        K=2, cycle=1, gibbs_control=gc_fast, opt_control=oc_fast,
+        nmf_control={"n_runs": 4, "seed": 7}
+    )
+    assert emb_r["eta_prior"].shape == (2, len(bp_r.gene_names))
+    np.testing.assert_allclose(emb_r["eta_prior"].sum(axis=1), 1.0, atol=1e-6)
+    # KL multi-start NMF initialization differs from single-start Frobenius NMF
+    assert not np.allclose(emb_def["eta_prior"], emb_r["eta_prior"], atol=1e-5)
+
+    # Also verify run_st under settings='R_default' populates theta_cv
+    bp_st_r = Prism(
+        ref_adata, mix_adata, "cell_type", "cell_state", key=None, outlier_fraction=1.0
+    ).run_st(gibbs_control=gc_fast, opt_control={"maxiter": 100}, settings="R_default")
+    assert hasattr(bp_st_r, "theta_cv")
+    assert bp_st_r.theta_cv.shape == (4, 3)
+    assert "theta_cv" in bp_st_r.posterior_cellState
+    assert "theta_cv" in bp_st_r.posterior_cellType
+
+    # Verify 1 - cor_mat distance in plot_cor_phi
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
+    matplotlib = pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.cluster.hierarchy import linkage
+    from scipy.spatial.distance import squareform
+
+    grid_def = plot_cor_phi(bp_def, min_exp=3, show=False, settings="default")
+    grid_r = plot_cor_phi(bp_r, min_exp=3, show=False)
+
+    assert hasattr(grid_r, "distance_matrix")
+    expected_link = linkage(squareform(grid_r.distance_matrix, checks=False), method="complete")
+    np.testing.assert_allclose(grid_r.dendrogram_row.linkage, expected_link, atol=1e-12)
+    assert not np.allclose(
+        grid_def.dendrogram_row.linkage[:, 2],
+        grid_r.dendrogram_row.linkage[:, 2],
+        atol=1e-6,
+    )
+    plt.close("all")

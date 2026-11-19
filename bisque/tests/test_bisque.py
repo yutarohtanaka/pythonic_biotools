@@ -790,3 +790,118 @@ def test_boundary_single_donor_overlap_fallback_and_errors():
             weights={"B_cell": {g: -1.0 for g in genes[:6]}},
             weighted_pca=True,
         )
+
+
+def test_settings_r_default_simplex_qp_overlap_remaining_and_old_cpm():
+    """
+    Verify `settings="R_default"` vs `settings="default"` across `bisque`:
+    1. Strict `ValueError` on unknown `settings`.
+    2. Exact equality-and-inequality-constrained simplex QP (`limSolve::lsei`) matches
+       closed-form KKT optimum `(70/164, 94/164)` where `nnls` + division gives `(3/23, 20/23)`.
+    3. Default `old_cpm=True` and `use_overlap=True` (when overlapping subject IDs exist),
+       returning deconvolved proportions strictly on `remaining` non-overlapping bulk samples
+       and dropping `anyNA` zero-variance training genes.
+    4. `marker_based_decomposition(..., settings="R_default")` defaults to `minmax` + weighted PCA.
+    """
+    from bisque.reference import _solve_simplex_qp
+
+    sc_adata, Y_bulk_clean, bulk_props_true, _, genes, donor_names, bulk_names = (
+        _simulate_reference_cohort(seed=2026, n_donors=12, n_bulk=14, n_genes=60)
+    )
+    bulk_df = pd.DataFrame(Y_bulk_clean, index=bulk_names, columns=genes)
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        reference_based_decomposition(bulk_df, sc_adata, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        marker_based_decomposition(bulk_df, {"B_cell": genes[:8]}, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        generate_sc_reference(sc_adata, settings="bad_mode")  # type: ignore[arg-type]
+
+    # 2. Analytical simplex QP vs unconstrained NNLS + post-hoc normalization
+    Z_test = np.array([[10.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+    b_test = np.array([5.0, 2.0], dtype=np.float64)
+    p_qp, rnorm_qp = _solve_simplex_qp(Z_test.T @ Z_test, Z_test, b_test)
+    q_nnls, _ = nnls(Z_test, b_test)
+    p_nnls = q_nnls / np.sum(q_nnls)
+    np.testing.assert_allclose(p_qp, np.array([70.0 / 164.0, 94.0 / 164.0]), atol=1e-10)
+    np.testing.assert_allclose(p_nnls, np.array([0.3 / 2.3, 2.0 / 2.3]), atol=1e-10)
+    assert np.isclose(rnorm_qp, float(np.linalg.norm(Z_test @ p_qp - b_test)), atol=1e-12)
+
+    # Single-donor untransformed check where Z columns have asymmetric norms so QP != NNLS/sum
+    sc_1 = ad.AnnData(
+        X=np.array([[10.0, 0.0, 1.0], [1.0, 1.0, 2.0]], dtype=np.float64),
+    )
+    sc_1.obs_names = ["C0", "C1"]
+    sc_1.var_names = ["G0", "G1", "G2"]
+    sc_1.obs["cell_type"] = ["CT_A", "CT_B"]
+    sc_1.obs["subject_id"] = ["D0", "D0"]
+    bulk_1 = pd.DataFrame([[5.0, 2.0, 1.5]], index=["S0"], columns=["G0", "G1", "G2"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        r_qp = reference_based_decomposition(
+            bulk_1, sc_1, normalize_cpm=False, settings="R_default"
+        )
+        r_nnls = reference_based_decomposition(
+            bulk_1, sc_1, normalize_cpm=False, settings="default"
+        )
+    np.testing.assert_allclose(r_qp.bulk_props.sum(axis=1), 1.0, atol=1e-12)
+    assert not np.allclose(r_qp.bulk_props, r_nnls.bulk_props, atol=1e-2)
+
+    # 3. Default old_cpm=True and automatic use_overlap=True returning `remaining` bulk samples
+    #    and dropping anyNA zero-variance training genes
+    rng = np.random.default_rng(2026)
+    sc_ref = generate_sc_reference(sc_adata, normalize_cpm=False)
+    n_ov = 8
+    ov_ids = donor_names[:n_ov]
+    rem_ids = [f"Rem_{i:02d}" for i in range(10)]
+    rem_props = rng.dirichlet([1.8, 1.8, 1.8], size=10)
+    all_props = np.vstack([sc_ref.sc_props[:n_ov], rem_props])
+    B_ov = all_props @ sc_ref.signature_matrix.T
+    # Force Gene_000 to be 0.0 on all overlapping bulk samples X_train (remains zero-variance after CPM)
+    # while varying across remaining samples so global variance > 0
+    B_ov[:n_ov, 0] = 0.0
+    B_ov[n_ov:, 0] = np.linspace(10.0, 200.0, 10)
+    # Add an extra unshared bulk-only gene with moderate variation to test default old_cpm=True
+    extra_col = np.concatenate([np.full(n_ov, 50.0), np.linspace(100.0, 600.0, 10)])[:, None]
+    bulk_ov_df = pd.DataFrame(
+        np.hstack([B_ov, extra_col]),
+        index=ov_ids + rem_ids,
+        columns=genes + ["BulkOnly_Extra"],
+    )
+
+    res_r_ov = reference_based_decomposition(bulk_ov_df, sc_adata, settings="R_default")
+    res_r_explicit = reference_based_decomposition(
+        bulk_ov_df, sc_adata, use_overlap=True, old_cpm=True, settings="R_default"
+    )
+    res_def_ov = reference_based_decomposition(
+        bulk_ov_df, sc_adata, use_overlap=True, old_cpm=False, settings="default"
+    )
+
+    assert res_r_ov.mode == "overlapping"
+    assert res_r_ov.sample_names == rem_ids
+    assert len(res_def_ov.sample_names) == n_ov + 10
+    assert "Gene_000" not in res_r_ov.genes_used
+    assert "Gene_000" in res_def_ov.genes_used
+    pd.testing.assert_frame_equal(res_r_ov.to_dataframe(), res_r_explicit.to_dataframe())
+    np.testing.assert_allclose(res_r_ov.bulk_props.sum(axis=1), 1.0, atol=1e-12)
+    assert float(np.mean(np.abs(res_r_ov.bulk_props - rem_props))) < 0.05
+
+    # 4. marker_based_decomposition under settings="R_default": defaults to minmax + weighted PCA
+    m_rows = [
+        {"cluster": "B_cell", "gene": g, "avg_logFC": 2.5 if j < 4 else 1.2}
+        for j, g in enumerate(genes[:8])
+    ] + [
+        {"cluster": "Macrophage", "gene": g, "avg_logFC": 2.0}
+        for g in genes[20:28]
+    ]
+    m_df = pd.DataFrame(m_rows)
+    m_r = marker_based_decomposition(bulk_df, m_df, settings="R_default")
+    m_def = marker_based_decomposition(bulk_df, m_df, settings="default")
+    assert m_r.normalization == "minmax"
+    assert m_r.weighted_pca is True
+    assert m_def.normalization == "none"
+    assert m_def.weighted_pca is False
+    np.testing.assert_allclose(m_r.bulk_props.min(axis=0), 0.0, atol=1e-12)
+    np.testing.assert_allclose(m_r.bulk_props.max(axis=0), 1.0, atol=1e-12)
+

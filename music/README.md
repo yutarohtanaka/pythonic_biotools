@@ -1,113 +1,70 @@
-# Pythonic MuSiC: Bulk RNA-seq Deconvolution
+# `music`: Multi-Subject Single-Cell Deconvolution (MuSiC & MuSiC2)
 
-Python implementation of the **MuSiC** (Multi-subject Single Cell deconvolution; Wang et al., *Nature Communications* 2019) and **MuSiC2** (Fan et al., *Briefings in Bioinformatics* 2022) algorithms, natively compatible with `AnnData` and `scipy.sparse` count matrices.
+Python implementation of **MuSiC** (Wang et al., *Nature Communications* 2019) and **MuSiC2** (Fan et al., *Briefings in Bioinformatics* 2022) for bulk RNA-seq cell-type deconvolution from multi-subject scRNA-seq references, natively supporting `AnnData` and `scipy.sparse` count matrices.
 
-## Installation
+## Citations
 
-```bash
-pip install ./music
-```
+- Wang, X., Park, J., Susztak, K., Zhang, N. R., & Li, M. Bulk tissue cell type deconvolution with multi-subject single-cell expression reference. *Nature Communications* **10**, 380 (2019). https://doi.org/10.1038/s41467-018-08023-x
+- Fan, J., Lyu, Y., Zhang, Q., Wang, X., Li, M., & Xiao, R. MuSiC2: cell-type deconvolution for multi-condition bulk RNA-seq data. *Briefings in Bioinformatics* **23**, bbac430 (2022). https://doi.org/10.1093/bib/bbac430
+- Upstream R package: https://github.com/xuranw/MuSiC
 
-## Overview
+## Statistical & Algorithmic Overview
 
-MuSiC estimates cell-type proportions in bulk RNA-seq data by leveraging multi-subject single-cell RNA-seq references, incorporating **cross-subject expression variance** ($\Sigma$) and **cell-type-specific library sizes** ($S$) into an iteratively reweighted non-negative least squares (NNLS) model.
+1. **Multi-Subject Reference Basis (`music_basis`)**:
+   Computes per-donor relative expression $\theta_{i,k,g}$ and cell size $S_{i,k}$, aggregating cross-donor mean abundance `M_theta`, mean library size `M_S`, design matrix $D = M_\theta \odot M_S$, and cross-donor expression variance `Sigma` (plus optional cross-cell-type covariance `Sigma_ct`).
+2. **Iteratively Reweighted NNLS (`music_iter`, `music_prop`)**:
+   Weights each gene inversely by residual plus cross-subject variance,
+   $$w_g = \frac{1}{\nu + r_g^2 + \sum_k (q_k S_k)^2 \Sigma_{g,k}},$$
+   solving weighted NNLS (`scipy.optimize.nnls`) until simplex proportions $p = q / \sum_k q_k$ converge.
+3. **Tree-Guided & Multi-Condition Deconvolution (`music_prop_cluster`, `music2_prop`)**:
+   Supports two-level hierarchical group-to-subcluster deconvolution (`music_prop_cluster`) and iterative removal of condition-associated cell-type-specific DE genes between control and case cohorts (`music2_prop`).
 
-Exported functions from `music`:
-- `music_basis`: Computes cross-subject mean relative abundance (`M_theta`), cross-subject variance (`Sigma`), optional cross-cell-type covariance (`Sigma_ct`), library sizes (`S`, `M_S`), and design matrix (`Design_mtx`).
-- `music_iter`: Core iteratively reweighted NNLS solver (`scipy.optimize.nnls`) with simplex convergence testing.
-- `music_prop`: End-to-end bulk RNA-seq deconvolution pipeline.
-- `music2_prop`: Iterative cross-condition deconvolution that detects and removes condition-associated cell-type-specific DE genes between bulk control and case cohorts.
-- `music_prop_cluster`: Hierarchical / tree-guided deconvolution across major cell groups and closely related sub-clusters.
-
-## Usage
-
-```python
-from music import music_prop, music2_prop, music_prop_cluster
-```
-
-### 1. Standard MuSiC (`music_prop`)
+## Quickstart
 
 ```python
-import anndata as ad
-from music import music_prop
+from music import music2_prop, music_prop, music_prop_cluster
 
-sc_adata = ad.read_h5ad("sc_reference.h5ad")   # Obs: cells, Vars: genes
-bulk_adata = ad.read_h5ad("bulk_data.h5ad")    # Obs: samples, Vars: genes
-
-results = music_prop(
+# Standard MuSiC (settings="default" or settings="R_default")
+res = music_prop(
     bulk_adata=bulk_adata,
     sc_adata=sc_adata,
     cluster_col="cell_type",
     sample_col="subject_id",
-    ct_cov=False,
-    iter_max=1000,
-    eps=0.01,
+    settings="R_default",
 )
+print(res["Est_prop_weighted"].head())
 
-est_proportions = results["Est_prop_weighted"]
-print(est_proportions.head())
-```
-
-### 2. MuSiC2 (`music2_prop`)
-
-```python
-import anndata as ad
-from music import music2_prop
-
-bulk_control = ad.read_h5ad("bulk_control.h5ad")
-bulk_case = ad.read_h5ad("bulk_case.h5ad")
-sc_adata = ad.read_h5ad("sc_reference.h5ad")
-
-results = music2_prop(
-    bulk_control_adata=bulk_control,
+# Multi-condition MuSiC2
+res_m2 = music2_prop(
+    bulk_control_adata=bulk_ctrl,
     bulk_case_adata=bulk_case,
     sc_adata=sc_adata,
     cluster_col="cell_type",
     sample_col="subject_id",
-    maxiter=200,
+    settings="R_default",
 )
-
-final_proportions = results["Est_prop"]
-de_genes = results["DE_genes"]
+print(res_m2["Est_prop"].head())
 ```
 
-### 3. Hierarchical / Cluster-based Deconvolution (`music_prop_cluster`)
+## `settings="default"` vs `settings="R_default"`
 
-```python
-import anndata as ad
-from music import music_prop_cluster
+- **`settings="default"` (Pythonic mode)**:
+  - Retains single-donor cell types whose cross-donor variance `Sigma` is `NaN` (substituting `0.0` in gene-weight denominators).
+  - Precomputes `music_basis` once outside the `music2_prop` loop and subsets it to `l_genes` per iteration.
+  - Returns `{'Est_prop_weighted', 'Est_prop_allgene', 'R_squared'}` from `music_prop`.
+- **`settings="R_default"` (Exact `xuranw/MuSiC` `analysis.R` & `music2.R` parity)**:
+  - Drops cell types with `Sigma = NaN` (single-donor cell types) in `music_prop`, `music_prop_cluster`, and `music2_prop` (`analysis.R:122`).
+  - Recomputes `music_basis` directly on `sc_adata[:, l_genes]` inside every `music2_prop` iteration (`music2.R:121`), renormalizing donor-level $\theta$ and $\Sigma$ on the retained non-DE gene set.
+  - Populates `'Var_prop'` (delta-method NNLS sandwich variance) and `'Weight_gene'` (`genes x samples` final IRLS weights) in the `music_prop` return dictionary.
 
-sc_adata = ad.read_h5ad("sc_reference.h5ad")
-bulk_adata = ad.read_h5ad("bulk_data.h5ad")
+## Key Outputs
 
-clusters_type = {
-    "T_cells": ["CD4_T", "CD8_T", "Treg"],
-    "B_cells": ["Memory_B", "Naive_B"],
-    "Myeloid": ["Macrophage", "Dendritic"],
-}
+- `music_prop`: dict with `'Est_prop_weighted'`, `'Est_prop_allgene'`, `'R_squared'`, and (in `settings="R_default"`) `'Var_prop'` and `'Weight_gene'`.
+- `music_prop_cluster`: dict with `'Est_prop_weighted_cluster'`.
+- `music2_prop`: dict with `'Est_prop'`, `'convergence'`, `'DE_genes'`, and `'n_iter'` / `'id_not_converge'`.
 
-group_markers = {
-    "T_cells": ["CD4", "CD8A", "FOXP3"],
-    "B_cells": ["CD27", "IGHD"],
-    "Myeloid": ["CD68", "CD1C"],
-}
+## Running Tests
 
-results = music_prop_cluster(
-    bulk_adata=bulk_adata,
-    sc_adata=sc_adata,
-    group_markers=group_markers,
-    groups_col="cell_type_group",
-    clusters_col="cell_type",
-    samples_col="subject_id",
-    clusters_type=clusters_type,
-    iter_max=1000,
-)
-
-est_proportions = results["Est_prop_weighted_cluster"]
+```bash
+PYTHONPATH=music /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m pytest music/tests -q
 ```
-
-## Methodological Details
-
-- **AnnData Orientation**: Expects standard `AnnData` matrices (`obs x var`, i.e., cells/samples by genes) in dense or sparse (`scipy.sparse`) format.
-- **Zero-count & Single-donor Handling**: All-zero genes are filtered (`non_zero=True`); donor-cluster combinations with zero total counts are treated as `NaN` when computing cross-donor means and variances, while `NaN` variance estimates for single-donor clusters fall back cleanly to `0.0` in NNLS weighting (matching R `MuSiC`'s `na.rm = TRUE`).
-- **Deterministic Gene Indexing**: Uses `pandas.Index.intersection` throughout to guarantee deterministic results across Python runs.

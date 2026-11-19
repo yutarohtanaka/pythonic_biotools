@@ -1,10 +1,20 @@
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 from scipy import sparse
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 DEFAULT_GIBBS_CONTROL = {
@@ -97,10 +107,13 @@ class Prism:
         gene_names_ref: Optional[np.ndarray] = None,
         gene_names_mix: Optional[np.ndarray] = None,
         sample_names_mix: Optional[np.ndarray] = None,
+        settings: SettingsMode = "default",
     ):
         """
         Construct a Prism object from single-cell reference and bulk/spatial mixture counts.
         """
+        validate_settings(settings)
+        self.settings: SettingsMode = settings
         self.key = key
         self.pseudo_min = pseudo_min
 
@@ -248,49 +261,105 @@ class Prism:
             df_map.drop_duplicates().groupby("ct")["cs"].apply(list).to_dict()
         )
 
+    def _resolve_settings(self, settings: SettingsMode) -> SettingsMode:
+        validate_settings(settings)
+        if settings == "R_default":
+            self.settings = "R_default"
+            return "R_default"
+        return self.settings
+
     def run(
         self,
         n_cores: int = 1,
         update_gibbs: bool = True,
         gibbs_control: Optional[dict] = None,
         opt_control: Optional[dict] = None,
+        settings: SettingsMode = "default",
     ):
         """
         Run BayesPrism bulk deconvolution.
         """
-        from .gibbs import run_gibbs, run_gibbs_tumor, update_reference
+        from .gibbs import (
+            _compute_cv_from_draws,
+            run_gibbs,
+            run_gibbs_tumor,
+            update_reference,
+        )
+
+        eff_settings = self._resolve_settings(settings)
+        use_r = eff_settings == "R_default"
 
         gc = {**DEFAULT_GIBBS_CONTROL, **(gibbs_control or {})}
         oc = {**DEFAULT_OPT_CONTROL_MAP, **(opt_control or {})}
 
-        Z_cs, theta_cs = run_gibbs(
-            X=self.mixture,
-            phi=self.phi_cellState,
-            alpha=gc["alpha"],
-            chain_length=gc["chain_length"],
-            burn_in=gc["burn_in"],
-            thinning=gc["thinning"],
-            seed=gc["seed"],
-            n_cores=n_cores,
-            sample_Z=True,
-        )
-        self.posterior_initial_cellState = {"Z": Z_cs, "theta": theta_cs}
+        if use_r:
+            Z_cs, theta_cs, draws_cs = run_gibbs(
+                X=self.mixture,
+                phi=self.phi_cellState,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+                return_draws=True,
+            )
+            theta_cs_cv = _compute_cv_from_draws(draws_cs)
+            self.posterior_initial_cellState = {
+                "Z": Z_cs,
+                "theta": theta_cs,
+                "theta_cv": theta_cs_cv,
+            }
+        else:
+            draws_cs = None
+            Z_cs, theta_cs = run_gibbs(
+                X=self.mixture,
+                phi=self.phi_cellState,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+            )
+            self.posterior_initial_cellState = {"Z": Z_cs, "theta": theta_cs}
 
         # Merge cell states to cell types in canonical self.ct_names order
         N, G, _ = Z_cs.shape
         K_ct = len(self.ct_names)
         Z_ct = np.zeros((N, G, K_ct), dtype=float)
         theta_ct = np.zeros((N, K_ct), dtype=float)
+        draws_ct = (
+            np.zeros((N, draws_cs.shape[1], K_ct), dtype=float)
+            if draws_cs is not None
+            else None
+        )
 
         cs_to_idx = {name: i for i, name in enumerate(self.cs_names)}
         for k, ct in enumerate(self.ct_names):
             cs_indices = [cs_to_idx[cs] for cs in self.map_dict[ct]]
             Z_ct[:, :, k] = Z_cs[:, :, cs_indices].sum(axis=2)
             theta_ct[:, k] = theta_cs[:, cs_indices].sum(axis=1)
+            if draws_ct is not None and draws_cs is not None:
+                draws_ct[:, :, k] = draws_cs[:, :, cs_indices].sum(axis=2)
 
-        self.posterior_initial_cellType = {"Z": Z_ct, "theta": theta_ct}
+        if use_r and draws_ct is not None:
+            theta_ct_cv = _compute_cv_from_draws(draws_ct)
+            self.posterior_initial_cellType = {
+                "Z": Z_ct,
+                "theta": theta_ct,
+                "theta_cv": theta_ct_cv,
+            }
+        else:
+            theta_ct_cv = None
+            self.posterior_initial_cellType = {"Z": Z_ct, "theta": theta_ct}
 
         if not update_gibbs:
+            if use_r and theta_ct_cv is not None:
+                self.theta_cv = theta_ct_cv
+                self.posterior_theta_cv = theta_ct_cv
             return self
 
         psi = update_reference(
@@ -305,33 +374,68 @@ class Prism:
         self.reference_update = psi
 
         if self.key is None:
-            _, theta_f = run_gibbs(
-                X=self.mixture,
-                phi=psi,
-                alpha=gc["alpha"],
-                chain_length=gc["chain_length"],
-                burn_in=gc["burn_in"],
-                thinning=gc["thinning"],
-                seed=gc["seed"],
-                n_cores=n_cores,
-                sample_Z=False,
-            )
+            if use_r:
+                _, theta_f, draws_f = run_gibbs(
+                    X=self.mixture,
+                    phi=psi,
+                    alpha=gc["alpha"],
+                    chain_length=gc["chain_length"],
+                    burn_in=gc["burn_in"],
+                    thinning=gc["thinning"],
+                    seed=gc["seed"],
+                    n_cores=n_cores,
+                    sample_Z=False,
+                    return_draws=True,
+                )
+                theta_f_cv = _compute_cv_from_draws(draws_f)
+            else:
+                theta_f_cv = None
+                _, theta_f = run_gibbs(
+                    X=self.mixture,
+                    phi=psi,
+                    alpha=gc["alpha"],
+                    chain_length=gc["chain_length"],
+                    burn_in=gc["burn_in"],
+                    thinning=gc["thinning"],
+                    seed=gc["seed"],
+                    n_cores=n_cores,
+                    sample_Z=False,
+                )
         else:
             key_idx = list(self.ct_names).index(self.key)
-            theta_f = run_gibbs_tumor(
-                X=self.mixture,
-                psi_mal=psi["psi_mal"],
-                psi_env=psi["psi_env"],
-                alpha=gc["alpha"],
-                chain_length=gc["chain_length"],
-                burn_in=gc["burn_in"],
-                thinning=gc["thinning"],
-                seed=gc["seed"],
-                n_cores=n_cores,
-                key_idx=key_idx,
-            )
+            if use_r:
+                theta_f, theta_f_cv = run_gibbs_tumor(
+                    X=self.mixture,
+                    psi_mal=psi["psi_mal"],
+                    psi_env=psi["psi_env"],
+                    alpha=gc["alpha"],
+                    chain_length=gc["chain_length"],
+                    burn_in=gc["burn_in"],
+                    thinning=gc["thinning"],
+                    seed=gc["seed"],
+                    n_cores=n_cores,
+                    key_idx=key_idx,
+                    return_cv=True,
+                )
+            else:
+                theta_f_cv = None
+                theta_f = run_gibbs_tumor(
+                    X=self.mixture,
+                    psi_mal=psi["psi_mal"],
+                    psi_env=psi["psi_env"],
+                    alpha=gc["alpha"],
+                    chain_length=gc["chain_length"],
+                    burn_in=gc["burn_in"],
+                    thinning=gc["thinning"],
+                    seed=gc["seed"],
+                    n_cores=n_cores,
+                    key_idx=key_idx,
+                )
 
         self.posterior_theta_f = theta_f
+        if use_r and theta_f_cv is not None:
+            self.theta_cv = theta_f_cv
+            self.posterior_theta_cv = theta_f_cv
         return self
 
     def get_results(self, output_type: str = "anndata"):
@@ -378,28 +482,51 @@ class Prism:
         n_cores: int = 1,
         gibbs_control: Optional[dict] = None,
         opt_control: Optional[dict] = None,
+        settings: SettingsMode = "default",
     ):
         """
         Run BayesPrism spatial transcriptomics deconvolution.
         Uses shared-gamma MLE ('optimizer': 'MLE') across cell states by default.
         """
-        from .gibbs import run_gibbs, update_reference
+        from .gibbs import _compute_cv_from_draws, run_gibbs, update_reference
+
+        eff_settings = self._resolve_settings(settings)
+        use_r = eff_settings == "R_default"
 
         gc = {**DEFAULT_GIBBS_CONTROL, **(gibbs_control or {})}
         oc = {**DEFAULT_OPT_CONTROL_ST, **(opt_control or {})}
 
-        Z_cs, theta_cs = run_gibbs(
-            X=self.mixture,
-            phi=self.phi_cellState,
-            alpha=gc["alpha"],
-            chain_length=gc["chain_length"],
-            burn_in=gc["burn_in"],
-            thinning=gc["thinning"],
-            seed=gc["seed"],
-            n_cores=n_cores,
-            sample_Z=True,
-        )
-        self.posterior_initial_cellState = {"Z": Z_cs, "theta": theta_cs}
+        if use_r:
+            Z_cs, theta_cs, draws_cs = run_gibbs(
+                X=self.mixture,
+                phi=self.phi_cellState,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+                return_draws=True,
+            )
+            self.posterior_initial_cellState = {
+                "Z": Z_cs,
+                "theta": theta_cs,
+                "theta_cv": _compute_cv_from_draws(draws_cs),
+            }
+        else:
+            Z_cs, theta_cs = run_gibbs(
+                X=self.mixture,
+                phi=self.phi_cellState,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+            )
+            self.posterior_initial_cellState = {"Z": Z_cs, "theta": theta_cs}
 
         psi = update_reference(
             Z_ct=Z_cs,
@@ -412,31 +539,69 @@ class Prism:
         )
         self.reference_update = psi
 
-        Z_cs_f, theta_cs_f = run_gibbs(
-            X=self.mixture,
-            phi=psi,
-            alpha=gc["alpha"],
-            chain_length=gc["chain_length"],
-            burn_in=gc["burn_in"],
-            thinning=gc["thinning"],
-            seed=gc["seed"],
-            n_cores=n_cores,
-            sample_Z=True,
-        )
-        self.posterior_cellState = {"Z": Z_cs_f, "theta": theta_cs_f}
+        if use_r:
+            Z_cs_f, theta_cs_f, draws_cs_f = run_gibbs(
+                X=self.mixture,
+                phi=psi,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+                return_draws=True,
+            )
+            self.posterior_cellState = {
+                "Z": Z_cs_f,
+                "theta": theta_cs_f,
+                "theta_cv": _compute_cv_from_draws(draws_cs_f),
+            }
+        else:
+            draws_cs_f = None
+            Z_cs_f, theta_cs_f = run_gibbs(
+                X=self.mixture,
+                phi=psi,
+                alpha=gc["alpha"],
+                chain_length=gc["chain_length"],
+                burn_in=gc["burn_in"],
+                thinning=gc["thinning"],
+                seed=gc["seed"],
+                n_cores=n_cores,
+                sample_Z=True,
+            )
+            self.posterior_cellState = {"Z": Z_cs_f, "theta": theta_cs_f}
 
         N, G, _ = Z_cs_f.shape
         K_ct = len(self.ct_names)
         Z_ct = np.zeros((N, G, K_ct), dtype=float)
         theta_ct = np.zeros((N, K_ct), dtype=float)
+        draws_ct_f = (
+            np.zeros((N, draws_cs_f.shape[1], K_ct), dtype=float)
+            if draws_cs_f is not None
+            else None
+        )
 
         cs_to_idx = {name: i for i, name in enumerate(self.cs_names)}
         for k, ct in enumerate(self.ct_names):
             cs_indices = [cs_to_idx[cs] for cs in self.map_dict[ct]]
             Z_ct[:, :, k] = Z_cs_f[:, :, cs_indices].sum(axis=2)
             theta_ct[:, k] = theta_cs_f[:, cs_indices].sum(axis=1)
+            if draws_ct_f is not None and draws_cs_f is not None:
+                draws_ct_f[:, :, k] = draws_cs_f[:, :, cs_indices].sum(axis=2)
 
-        self.posterior_cellType = {"Z": Z_ct, "theta": theta_ct}
+        if use_r and draws_ct_f is not None:
+            theta_ct_cv = _compute_cv_from_draws(draws_ct_f)
+            self.posterior_cellType = {
+                "Z": Z_ct,
+                "theta": theta_ct,
+                "theta_cv": theta_ct_cv,
+            }
+            self.theta_cv = theta_ct_cv
+            self.posterior_theta_cv = theta_ct_cv
+        else:
+            self.posterior_cellType = {"Z": Z_ct, "theta": theta_ct}
+
         self.posterior_theta_f = theta_ct
         return self
 
@@ -448,9 +613,18 @@ class Prism:
         gibbs_control: Optional[dict] = None,
         opt_control: Optional[dict] = None,
         nmf_control: Optional[dict] = None,
+        settings: SettingsMode = "default",
     ):
         from .embedding import learn_embedding_nmf
 
+        eff_settings = self._resolve_settings(settings)
         return learn_embedding_nmf(
-            self, K, cycle, n_cores, gibbs_control, opt_control, nmf_control
+            self,
+            K,
+            cycle,
+            n_cores,
+            gibbs_control,
+            opt_control,
+            nmf_control,
+            settings=eff_settings,
         )

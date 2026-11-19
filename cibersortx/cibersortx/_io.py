@@ -6,7 +6,7 @@ and NaN-aware multiple-testing utilities for `cibersortx`.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import anndata as ad
 import numpy as np
@@ -14,6 +14,18 @@ import pandas as pd
 from scipy import sparse, stats
 
 ExpressionInput = ad.AnnData | pd.DataFrame | np.ndarray
+SettingsInput = Literal["default", "R_default", "cibersortx_default"]
+
+
+def validate_settings(settings: str) -> Literal["default", "R_default"]:
+    """Validate `settings` strictly ('default', 'R_default', or alias 'cibersortx_default')."""
+    if settings == "default":
+        return "default"
+    if settings in ("R_default", "cibersortx_default"):
+        return "R_default"
+    raise ValueError(
+        f"`settings` must be 'default' or 'R_default' (or alias 'cibersortx_default'), got {settings!r}."
+    )
 
 
 def _validate_unique_names(names: Sequence[str], kind: str) -> list[str]:

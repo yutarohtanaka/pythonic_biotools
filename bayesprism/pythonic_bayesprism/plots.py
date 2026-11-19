@@ -3,7 +3,12 @@ from scipy.stats import pearsonr, spearmanr
 
 
 def plot_cor_phi(
-    bp, min_exp=3, cmap="RdBu_r", title="Cell Type Correlation", show=True
+    bp,
+    min_exp=3,
+    cmap="RdBu_r",
+    title="Cell Type Correlation",
+    show=True,
+    settings=None,
 ):
     """
     Plot hierarchical clustermap of pairwise correlations across reference cell types.
@@ -11,8 +16,14 @@ def plot_cor_phi(
     Imports matplotlib and seaborn lazily so importing pythonic_bayesprism works
     in headless environments without plotting libraries installed.
     """
+    from .core import validate_settings
     import matplotlib.pyplot as plt
     import seaborn as sns
+
+    eff_settings = (
+        getattr(bp, "settings", "default") if settings is None else settings
+    )
+    validate_settings(eff_settings)
 
     ref_ct = bp.phi_cellType.copy()
 
@@ -28,15 +39,35 @@ def plot_cor_phi(
 
     cor_mat = np.corrcoef(ref_ct_centered)
 
-    grid = sns.clustermap(
-        cor_mat,
-        xticklabels=bp.ct_names,
-        yticklabels=bp.ct_names,
-        cmap=cmap,
-        method="ward",
-        metric="euclidean",
-        figsize=(8, 8),
-    )
+    if eff_settings == "R_default" and cor_mat.shape[0] >= 2:
+        from scipy.cluster.hierarchy import linkage
+        from scipy.spatial.distance import squareform
+
+        dist_mat = np.clip(1.0 - np.nan_to_num(cor_mat, nan=0.0), 0.0, 2.0)
+        dist_mat = 0.5 * (dist_mat + dist_mat.T)
+        np.fill_diagonal(dist_mat, 0.0)
+        condensed = squareform(dist_mat, checks=False)
+        hc_link = linkage(condensed, method="complete")
+        grid = sns.clustermap(
+            cor_mat,
+            row_linkage=hc_link,
+            col_linkage=hc_link,
+            xticklabels=bp.ct_names,
+            yticklabels=bp.ct_names,
+            cmap=cmap,
+            figsize=(8, 8),
+        )
+        grid.distance_matrix = dist_mat
+    else:
+        grid = sns.clustermap(
+            cor_mat,
+            xticklabels=bp.ct_names,
+            yticklabels=bp.ct_names,
+            cmap=cmap,
+            method="ward",
+            metric="euclidean",
+            figsize=(8, 8),
+        )
     grid.fig.suptitle(title)
     if show:
         plt.show()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 import warnings
 
 import anndata as ad
@@ -12,6 +12,16 @@ import pandas as pd
 from scipy import sparse
 
 ExpressionInput = ad.AnnData | pd.DataFrame | np.ndarray | sparse.spmatrix
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    """Strictly validate `settings` parameter (`'default'` or `'R_default'`)."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unsupported settings={settings!r}; expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)

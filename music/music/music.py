@@ -1,8 +1,19 @@
+from typing import Literal
 import warnings
 import numpy as np
 import pandas as pd
 from scipy.optimize import nnls
 from scipy.sparse import issparse
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 def _get_counts(adata, layer=None):
@@ -162,6 +173,7 @@ def music_iter(
     eps=0.01,
     centered=False,
     normalize=False,
+    return_var=False,
 ):
     """
     Iteratively reweighted NNLS solver for MuSiC (Wang et al., 2019).
@@ -250,7 +262,23 @@ def music_iter(
         else:
             R_squared = np.nan
 
-    return p_weight, p_nnls, R_squared, weight_gene
+    if not return_var:
+        return p_weight, p_nnls, R_squared, weight_gene
+
+    # NNLS sandwich variance Var(p_weight) via delta method on p = q / sum(q)
+    q_sum = float(np.sum(q_weight))
+    if q_sum > 0 and len(Y) > 0:
+        xpx = D_weight.T @ D_weight
+        inv_xpx = np.linalg.pinv(xpx)
+        meat = (D_weight * (r ** 2)[:, None]).T @ D_weight
+        cov_q = inv_xpx @ meat @ inv_xpx
+        jac = (np.eye(len(p_weight), dtype=float) - np.outer(p_weight, np.ones_like(p_weight))) / q_sum
+        cov_p = jac @ cov_q @ jac.T
+        var_p = np.maximum(np.diag(cov_p), 0.0)
+    else:
+        var_p = np.full(len(p_weight), np.nan, dtype=float)
+
+    return p_weight, p_nnls, R_squared, weight_gene, var_p
 
 
 def _music_prop_from_basis(
@@ -266,14 +294,19 @@ def _music_prop_from_basis(
     eps=0.01,
     centered=False,
     normalize=False,
+    settings: SettingsMode = "default",
 ):
     """Run MuSiC deconvolution given a precomputed scRNA-seq basis dictionary."""
+    validate_settings(settings)
     D_df = basis["Design_mtx"]
     Sigma_df = basis["Sigma"]
     M_S_series = basis["M_S"]
     Sigma_ct = basis.get("Sigma_ct", None)
 
     valid_ct_mask = (~D_df.isna().any(axis=0)) & (~M_S_series.isna())
+    if settings == "R_default":
+        # analysis.R:122 drops cell types with Sigma = NaN (single-donor cell types)
+        valid_ct_mask = valid_ct_mask & (~Sigma_df.isna().any(axis=0))
     valid_ct = valid_ct_mask[valid_ct_mask].index
 
     if len(valid_ct) == 0:
@@ -314,12 +347,14 @@ def _music_prop_from_basis(
         else None
     )
     bulk_X_common = bulk_X[:, bulk_loc]
+    used_genes = common_genes
 
     if non_zero:
         keep_nz = (np.sum(bulk_X_common, axis=0) > 0) & (np.sum(D_mat, axis=1) > 0)
         bulk_X_common = bulk_X_common[:, keep_nz]
         D_mat = D_mat[keep_nz, :]
         Sigma_mat = Sigma_mat[keep_nz, :]
+        used_genes = used_genes[keep_nz]
         if Sigma_ct_mat is not None:
             Sigma_ct_mat = Sigma_ct_mat[keep_nz, :, :]
 
@@ -331,6 +366,12 @@ def _music_prop_from_basis(
     res_p_weight = []
     res_p_nnls = []
     res_r2 = []
+    res_var_p = []
+    weight_gene_mat = (
+        np.full((len(used_genes), Y_ra.shape[0]), np.nan, dtype=float)
+        if settings == "R_default"
+        else None
+    )
 
     for i in range(Y_ra.shape[0]):
         Y_i = Y_ra[i, :]
@@ -339,6 +380,8 @@ def _music_prop_from_basis(
             res_p_weight.append(np.full(len(valid_ct), np.nan))
             res_p_nnls.append(np.full(len(valid_ct), np.nan))
             res_r2.append(np.nan)
+            if settings == "R_default":
+                res_var_p.append(np.full(len(valid_ct), np.nan))
             continue
 
         Y_i_sub = Y_i[mask]
@@ -346,18 +389,36 @@ def _music_prop_from_basis(
         Sigma_mat_sub = Sigma_mat[mask, :]
         Sigma_ct_sub = Sigma_ct_mat[mask, :, :] if Sigma_ct_mat is not None else None
 
-        pw, pnnls, r2, _ = music_iter(
-            Y_i_sub,
-            D_mat_sub,
-            S_vec,
-            Sigma_mat_sub,
-            Sigma_ct=Sigma_ct_sub,
-            iter_max=iter_max,
-            nu=nu,
-            eps=eps,
-            centered=centered,
-            normalize=normalize,
-        )
+        if settings == "R_default":
+            pw, pnnls, r2, w_sub, vp = music_iter(
+                Y_i_sub,
+                D_mat_sub,
+                S_vec,
+                Sigma_mat_sub,
+                Sigma_ct=Sigma_ct_sub,
+                iter_max=iter_max,
+                nu=nu,
+                eps=eps,
+                centered=centered,
+                normalize=normalize,
+                return_var=True,
+            )
+            res_var_p.append(vp)
+            assert weight_gene_mat is not None
+            weight_gene_mat[mask, i] = w_sub
+        else:
+            pw, pnnls, r2, _ = music_iter(
+                Y_i_sub,
+                D_mat_sub,
+                S_vec,
+                Sigma_mat_sub,
+                Sigma_ct=Sigma_ct_sub,
+                iter_max=iter_max,
+                nu=nu,
+                eps=eps,
+                centered=centered,
+                normalize=normalize,
+            )
 
         res_p_weight.append(pw)
         res_p_nnls.append(pnnls)
@@ -366,11 +427,17 @@ def _music_prop_from_basis(
     df_weight = pd.DataFrame(res_p_weight, index=bulk_obs_names, columns=valid_ct)
     df_nnls = pd.DataFrame(res_p_nnls, index=bulk_obs_names, columns=valid_ct)
 
-    return {
+    out = {
         "Est_prop_weighted": df_weight,
         "Est_prop_allgene": df_nnls,
         "R_squared": pd.Series(res_r2, index=bulk_obs_names),
     }
+    if settings == "R_default":
+        out["Var_prop"] = pd.DataFrame(res_var_p, index=bulk_obs_names, columns=valid_ct)
+        out["Weight_gene"] = pd.DataFrame(
+            weight_gene_mat, index=used_genes, columns=bulk_obs_names
+        )
+    return out
 
 
 def music_prop(
@@ -390,10 +457,12 @@ def music_prop(
     eps=0.01,
     centered=False,
     normalize=False,
+    settings: SettingsMode = "default",
 ):
     """
     Estimate cell-type proportions in bulk RNA-seq data using MuSiC.
     """
+    validate_settings(settings)
     basis = music_basis(
         sc_adata,
         cluster_col,
@@ -419,4 +488,5 @@ def music_prop(
         eps=eps,
         centered=centered,
         normalize=normalize,
+        settings=settings,
     )

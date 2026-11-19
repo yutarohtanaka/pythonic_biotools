@@ -370,3 +370,150 @@ def test_music2_prop_sample_order_de_genes_and_single_case():
     )
     assert list(res_single_case["Est_prop"].index) == ctrl_names + ["Case_9"]
     assert not res_single_case["Est_prop"].isna().any().any()
+
+
+def test_music_settings_validation():
+    sc_adata, bulk_adata, _ = _make_synthetic_sc_and_bulk(seed=1)
+    with pytest.raises(ValueError, match="settings"):
+        music_prop(bulk_adata, sc_adata, "cell_type", "subject_id", settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        music2_prop(bulk_adata, bulk_adata, sc_adata, "cell_type", "subject_id", settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        music_prop_cluster(
+            bulk_adata,
+            sc_adata,
+            group_markers={"G": []},
+            groups_col="cell_type",
+            clusters_col="cell_type",
+            samples_col="subject_id",
+            clusters_type={"G": ["B_cell"]},
+            settings="bad",  # type: ignore[arg-type]
+        )
+
+
+def test_r_default_drop_nan_sigma_var_prop_weight_gene_and_music2_rebasis():
+    """
+    Verify xuranw/MuSiC (analysis.R:122, music2.R:121) parity under settings='R_default':
+    1. Drops cell types with Sigma = NaN (single-donor cell types) in music_prop & music_prop_cluster.
+    2. Populates Var_prop (NNLS sandwich variance) & Weight_gene in music_prop return dict.
+    3. Recomputes music_basis on non-DE l_genes inside music2_prop iterations.
+    """
+    sc_adata, bulk_adata, true_df = _make_synthetic_sc_and_bulk(seed=77)
+
+    # 1 & 2: Full multi-donor run checks Var_prop & Weight_gene; single-donor Macrophage checks dropping
+    res_def_full = music_prop(
+        bulk_adata, sc_adata, "cell_type", "subject_id", settings="default"
+    )
+    res_r_full = music_prop(
+        bulk_adata, sc_adata, "cell_type", "subject_id", settings="R_default"
+    )
+    assert "Var_prop" not in res_def_full and "Weight_gene" not in res_def_full
+    assert "Var_prop" in res_r_full and "Weight_gene" in res_r_full
+
+    var_df = res_r_full["Var_prop"]
+    w_df = res_r_full["Weight_gene"]
+    assert var_df.shape == res_r_full["Est_prop_weighted"].shape
+    assert np.all(np.isfinite(var_df.values)) and np.all(var_df.values >= 0.0)
+    assert list(w_df.columns) == list(bulk_adata.obs_names)
+    assert w_df.shape[0] == 119  # Gene_119 all-zero excluded
+    assert np.all(np.isfinite(w_df.values)) and np.all(w_df.values > 0.0)
+
+    # Single-donor Macrophage -> Sigma['Macrophage'] is NaN:
+    # default retains Macrophage; R_default drops Macrophage!
+    keep_mask = ~(
+        (sc_adata.obs["cell_type"] == "Macrophage")
+        & (sc_adata.obs["subject_id"] != "Donor_0")
+    )
+    sc_single = sc_adata[keep_mask].copy()
+    res_single_def = music_prop(
+        bulk_adata, sc_single, "cell_type", "subject_id", settings="default"
+    )
+    res_single_r = music_prop(
+        bulk_adata, sc_single, "cell_type", "subject_id", settings="R_default"
+    )
+    assert list(res_single_def["Est_prop_weighted"].columns) == ["B_cell", "Macrophage", "T_cell"]
+    assert list(res_single_r["Est_prop_weighted"].columns) == ["B_cell", "T_cell"]
+    np.testing.assert_allclose(
+        res_single_r["Est_prop_weighted"].sum(axis=1).values, 1.0, atol=1e-6
+    )
+
+    # Also check music_prop_cluster drops single-donor sub-cluster in R_default
+    sc_single.obs["major_group"] = [
+        "Lymphoid" if ct in ("B_cell", "T_cell") else "Myeloid"
+        for ct in sc_single.obs["cell_type"]
+    ]
+    # Add a multi-donor Myeloid partner or test Lymphoid + single-donor subcluster inside Lymphoid:
+    sc_sub = sc_adata.copy()
+    # Restrict T_cell to Donor_0 while B_cell & Macrophage span all 4 donors
+    sc_sub = sc_sub[
+        ~((sc_sub.obs["cell_type"] == "T_cell") & (sc_sub.obs["subject_id"] != "Donor_0"))
+    ].copy()
+    sc_sub.obs["major_group"] = [
+        "Lymphoid" if ct in ("B_cell", "T_cell") else "Myeloid"
+        for ct in sc_sub.obs["cell_type"]
+    ]
+    cl_def = music_prop_cluster(
+        bulk_adata,
+        sc_sub,
+        group_markers={"Lymphoid": [f"Gene_{i}" for i in range(0, 20)], "Myeloid": []},
+        groups_col="major_group",
+        clusters_col="cell_type",
+        samples_col="subject_id",
+        clusters_type={"Lymphoid": ["B_cell", "T_cell"], "Myeloid": ["Macrophage"]},
+        settings="default",
+    )
+    cl_r = music_prop_cluster(
+        bulk_adata,
+        sc_sub,
+        group_markers={"Lymphoid": [f"Gene_{i}" for i in range(0, 20)], "Myeloid": []},
+        groups_col="major_group",
+        clusters_col="cell_type",
+        samples_col="subject_id",
+        clusters_type={"Lymphoid": ["B_cell", "T_cell"], "Myeloid": ["Macrophage"]},
+        settings="R_default",
+    )
+    assert list(cl_def["Est_prop_weighted_cluster"].columns) == ["B_cell", "T_cell", "Macrophage"]
+    assert list(cl_r["Est_prop_weighted_cluster"].columns) == ["B_cell", "Macrophage"]
+
+    # 3. music2_prop recomputing music_basis on l_genes under settings='R_default'
+    rng = np.random.default_rng(88)
+    genes = list(sc_adata.var_names)
+    basis = music_basis(sc_adata, "cell_type", "subject_id")
+    D_full = np.zeros((len(genes), 3), dtype=float)
+    idx_nz = [genes.index(g) for g in basis["Design_mtx"].index]
+    D_full[idx_nz, :] = basis["Design_mtx"].values
+
+    ctrl_props = rng.dirichlet([3.0, 3.0, 3.0], size=8)
+    case_props = rng.dirichlet([4.0, 2.0, 2.0], size=8)
+    D_case = D_full.copy()
+    D_case[0:5, 0] *= 30.0  # strong DE on Gene_0..Gene_4
+
+    bulk_ctrl = ad.AnnData(
+        X=np.vstack([rng.poisson(60.0 * (D_full @ p)).astype(float) for p in ctrl_props])
+    )
+    bulk_ctrl.var_names = genes
+    bulk_ctrl.obs_names = [f"C_{i}" for i in range(8)]
+    bulk_case = ad.AnnData(
+        X=np.vstack([rng.poisson(60.0 * (D_case @ p)).astype(float) for p in case_props])
+    )
+    bulk_case.var_names = genes
+    bulk_case.obs_names = [f"D_{i}" for i in range(8)]
+
+    m2_def = music2_prop(
+        bulk_ctrl, bulk_case, sc_adata, "cell_type", "subject_id",
+        n_resample=10, maxiter=15, seed=88, settings="default"
+    )
+    m2_r = music2_prop(
+        bulk_ctrl, bulk_case, sc_adata, "cell_type", "subject_id",
+        n_resample=10, maxiter=15, seed=88, settings="R_default"
+    )
+    assert not m2_r["Est_prop"].isna().any().any()
+    # Recomputing music_basis on l_genes shifts theta/Sigma normalization slightly vs static basis slicing
+    assert not np.allclose(
+        m2_def["Est_prop"].loc[bulk_case.obs_names].values,
+        m2_r["Est_prop"].loc[bulk_case.obs_names].values,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        m2_r["Est_prop"].loc[bulk_case.obs_names].values, case_props, atol=0.10
+    )

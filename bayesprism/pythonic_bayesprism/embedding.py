@@ -1,5 +1,6 @@
 from functools import partial
 import multiprocessing
+import warnings
 
 import numpy as np
 from sklearn.decomposition import NMF
@@ -147,8 +148,21 @@ def learn_embedding_nmf(
     gibbs_control=None,
     opt_control=None,
     nmf_control=None,
+    settings="default",
 ):
-    from .core import DEFAULT_GIBBS_CONTROL, DEFAULT_OPT_CONTROL_MAP, _norm_to_one
+    from .core import (
+        DEFAULT_GIBBS_CONTROL,
+        DEFAULT_OPT_CONTROL_MAP,
+        _norm_to_one,
+        validate_settings,
+    )
+
+    validate_settings(settings)
+    eff_settings = (
+        "R_default"
+        if ("R_default" in (settings, getattr(bp, "settings", "default")))
+        else "default"
+    )
 
     if not hasattr(bp, "reference_update"):
         raise ValueError("Please run Prism with update_gibbs=True first.")
@@ -165,11 +179,35 @@ def learn_embedding_nmf(
     nc = {"nrun": 10, "seed": 123, **(nmf_control or {})}
 
     psi_mal = bp.reference_update["psi_mal"]
-    model = NMF(
-        n_components=K, init="random", random_state=nc["seed"], max_iter=200
-    )
-    model.fit(psi_mal)
-    eta_prior = _norm_to_one(model.components_, pseudo_min=bp.pseudo_min)
+    if eff_settings == "R_default":
+        # Brunet KL-divergence multi-start NMF matching Danko-Lab/BayesPrism learn_embedding.R
+        n_runs = max(1, int(nc.get("n_runs", nc.get("nrun", 10))))
+        base_seed = int(nc.get("seed", 123))
+        max_nmf_iter = int(nc.get("max_iter", nc.get("maxiter", 500)))
+        best_err = float("inf")
+        best_comp = None
+        for r_idx in range(n_runs):
+            model = NMF(
+                n_components=K,
+                init="random",
+                solver="mu",
+                beta_loss="kullback-leibler",
+                random_state=base_seed + r_idx,
+                max_iter=max_nmf_iter,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model.fit(psi_mal)
+            if best_comp is None or float(model.reconstruction_err_) < best_err:
+                best_err = float(model.reconstruction_err_)
+                best_comp = model.components_.copy()
+        eta_prior = _norm_to_one(best_comp, pseudo_min=bp.pseudo_min)
+    else:
+        model = NMF(
+            n_components=K, init="random", random_state=nc["seed"], max_iter=200
+        )
+        model.fit(psi_mal)
+        eta_prior = _norm_to_one(model.components_, pseudo_min=bp.pseudo_min)
 
     key_idx = list(bp.ct_names).index(bp.key)
     env_idx = [i for i in range(len(bp.ct_names)) if i != key_idx]

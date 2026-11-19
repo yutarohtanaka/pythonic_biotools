@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from scipy import linalg, optimize, stats
 
-from ._io import ExpressionInput, bh_fdr, parse_expression_matrix
+from ._io import ExpressionInput, SettingsInput, bh_fdr, parse_expression_matrix, validate_settings
 
 
 @dataclass(frozen=True)
@@ -274,12 +274,14 @@ def impute_gep_group(
     is_log2: bool = False,
     log2_offset: float = 0.0,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> GroupGEPResult:
     """
     CIBERSORTx Group-Mode cell-type gene expression estimation using QR-NNLS,
     sample-level bootstrap standard errors, one-sided z-tests with BH-FDR,
     and adaptive noise filtering (Newman et al., Nat Biotechnol 2019).
     """
+    validate_settings(settings)
     if n_bootstrap < 0:
         raise ValueError("`n_bootstrap` must be >= 0.")
     if ridge_alpha < 0.0:
@@ -665,12 +667,14 @@ def impute_gep_highres(
     is_log2: bool = False,
     log2_offset: float = 0.0,
     seed: int = 0,
+    settings: SettingsInput = "default",
 ) -> HighResGEPResult:
     """
     CIBERSORTx High-Resolution Mode sample-specific cell-type expression
     purification via residual-sorted sliding-window non-negative ridge/NNLS
     and residual-permutation significance testing (Newman et al., Nat Biotechnol 2019).
     """
+    validate_settings(settings)
     if ridge_alpha < 0.0:
         raise ValueError("`ridge_alpha` must be >= 0.")
     if aggregation not in ("median", "mean"):

@@ -12,7 +12,23 @@ def _rdirichlet(alpha, rng=None):
     return rng.dirichlet(alpha)
 
 
-def _sample_Z_theta_n(X_n, phi, alpha, gibbs_idx, sample_Z=True, rng=None):
+def _compute_cv_from_draws(draws: np.ndarray) -> np.ndarray:
+    """
+    Compute posterior coefficient of variation (SD / mean across thinned Gibbs draws)
+    matching Danko-Lab/BayesPrism `ThetaPost@theta.cv`.
+    `draws` has shape `(n_draws, K)` or `(N, n_draws, K)`.
+    """
+    mean = np.mean(draws, axis=-2)
+    if draws.shape[-2] > 1:
+        sd = np.std(draws, axis=-2, ddof=1)
+    else:
+        sd = np.zeros_like(mean)
+    return np.where(mean > 0.0, sd / np.maximum(mean, 1e-300), 0.0)
+
+
+def _sample_Z_theta_n(
+    X_n, phi, alpha, gibbs_idx, sample_Z=True, return_draws=False, rng=None
+):
     """
     Vectorized collapsed/blocked Gibbs sampler for a single bulk/spatial sample n.
     Uses C-level vectorized Generator.multinomial across all non-zero genes simultaneously.
@@ -25,6 +41,11 @@ def _sample_Z_theta_n(X_n, phi, alpha, gibbs_idx, sample_Z=True, rng=None):
 
     Z_n_sum = np.zeros((G, K), dtype=float) if sample_Z else None
     theta_n_sum = np.zeros(K, dtype=float)
+    num_samples = len(gibbs_idx)
+    theta_draws = (
+        np.empty((num_samples, K), dtype=float) if return_draws else None
+    )
+    draw_pos = 0
 
     X_int = np.rint(X_n).astype(np.int64)
     nz_mask = X_int > 0
@@ -55,41 +76,70 @@ def _sample_Z_theta_n(X_n, phi, alpha, gibbs_idx, sample_Z=True, rng=None):
             if sample_Z and has_nz:
                 Z_n_sum[nz_mask] += Z_nz
             theta_n_sum += theta_n_i
+            if theta_draws is not None:
+                theta_draws[draw_pos] = theta_n_i
+                draw_pos += 1
 
-    num_samples = len(gibbs_idx)
     res_theta = theta_n_sum / num_samples
-    if sample_Z:
-        res_Z = Z_n_sum / num_samples
-        return res_Z, res_theta
-    return None, res_theta
+    res_Z = (Z_n_sum / num_samples) if sample_Z else None
+    if return_draws:
+        return res_Z, res_theta, theta_draws
+    return res_Z, res_theta
 
 
-def _worker_initial_gibbs(n, X, phi, alpha, gibbs_idx, sample_Z, seed):
+def _worker_initial_gibbs(
+    n, X, phi, alpha, gibbs_idx, sample_Z, seed, return_draws=False
+):
     rng = np.random.default_rng(seed + n if seed is not None else None)
-    return _sample_Z_theta_n(X[n], phi, alpha, gibbs_idx, sample_Z=sample_Z, rng=rng)
+    return _sample_Z_theta_n(
+        X[n],
+        phi,
+        alpha,
+        gibbs_idx,
+        sample_Z=sample_Z,
+        return_draws=return_draws,
+        rng=rng,
+    )
 
 
-def _worker_tumor_gibbs(n, X, psi_mal, psi_env, alpha, gibbs_idx, seed):
+def _worker_tumor_gibbs(
+    n, X, psi_mal, psi_env, alpha, gibbs_idx, seed, return_draws=False
+):
     rng = np.random.default_rng(seed + n if seed is not None else None)
     phi_n = np.vstack([psi_mal[n], psi_env])
     nonzero_idx = phi_n.max(axis=0) > 0
 
-    _, res_theta = _sample_Z_theta_n(
+    out = _sample_Z_theta_n(
         X[n, nonzero_idx],
         phi_n[:, nonzero_idx],
         alpha,
         gibbs_idx,
         sample_Z=False,
+        return_draws=return_draws,
         rng=rng,
     )
-    return res_theta
+    if return_draws:
+        _, res_theta, draws = out
+        return res_theta, _compute_cv_from_draws(draws)
+    return out[1]
 
 
 def get_gibbs_idx(chain_length, burn_in, thinning):
     return np.arange(burn_in + 1, chain_length + 1, thinning)
 
 
-def run_gibbs(X, phi, alpha, chain_length, burn_in, thinning, seed, n_cores, sample_Z):
+def run_gibbs(
+    X,
+    phi,
+    alpha,
+    chain_length,
+    burn_in,
+    thinning,
+    seed,
+    n_cores,
+    sample_Z,
+    return_draws=False,
+):
     N = X.shape[0]
     gibbs_idx = get_gibbs_idx(chain_length, burn_in, thinning)
 
@@ -103,20 +153,23 @@ def run_gibbs(X, phi, alpha, chain_length, burn_in, thinning, seed, n_cores, sam
                 gibbs_idx=gibbs_idx,
                 sample_Z=sample_Z,
                 seed=seed,
+                return_draws=return_draws,
             )
             results = pool.map(func, range(N))
     else:
         results = [
-            _worker_initial_gibbs(n, X, phi, alpha, gibbs_idx, sample_Z, seed)
+            _worker_initial_gibbs(
+                n, X, phi, alpha, gibbs_idx, sample_Z, seed, return_draws=return_draws
+            )
             for n in range(N)
         ]
 
-    if sample_Z:
-        Z = np.array([r[0] for r in results])
-        theta = np.array([r[1] for r in results])
-        return Z, theta
+    Z = np.array([r[0] for r in results]) if sample_Z else None
     theta = np.array([r[1] for r in results])
-    return None, theta
+    if return_draws:
+        draws = np.array([r[2] for r in results])
+        return Z, theta, draws
+    return Z, theta
 
 
 def run_gibbs_tumor(
@@ -130,6 +183,7 @@ def run_gibbs_tumor(
     seed,
     n_cores,
     key_idx=0,
+    return_cv=False,
 ):
     """
     Run final Gibbs sampling for tumor mode and map columns back to canonical
@@ -149,18 +203,39 @@ def run_gibbs_tumor(
                 alpha=alpha,
                 gibbs_idx=gibbs_idx,
                 seed=seed,
+                return_draws=return_cv,
             )
             results = pool.map(func, range(N))
     else:
         results = [
-            _worker_tumor_gibbs(n, X, psi_mal, psi_env, alpha, gibbs_idx, seed)
+            _worker_tumor_gibbs(
+                n,
+                X,
+                psi_mal,
+                psi_env,
+                alpha,
+                gibbs_idx,
+                seed,
+                return_draws=return_cv,
+            )
             for n in range(N)
         ]
 
-    theta_raw = np.array(results)
     K_ct = 1 + psi_env.shape[0]
     env_idx = [i for i in range(K_ct) if i != key_idx]
 
+    if return_cv:
+        theta_raw = np.array([r[0] for r in results])
+        cv_raw = np.array([r[1] for r in results])
+        theta_ordered = np.zeros((N, K_ct), dtype=theta_raw.dtype)
+        cv_ordered = np.zeros((N, K_ct), dtype=cv_raw.dtype)
+        theta_ordered[:, key_idx] = theta_raw[:, 0]
+        theta_ordered[:, env_idx] = theta_raw[:, 1:]
+        cv_ordered[:, key_idx] = cv_raw[:, 0]
+        cv_ordered[:, env_idx] = cv_raw[:, 1:]
+        return theta_ordered, cv_ordered
+
+    theta_raw = np.array(results)
     theta_ordered = np.zeros((N, K_ct), dtype=theta_raw.dtype)
     theta_ordered[:, key_idx] = theta_raw[:, 0]
     theta_ordered[:, env_idx] = theta_raw[:, 1:]

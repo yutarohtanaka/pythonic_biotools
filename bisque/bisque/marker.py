@@ -11,9 +11,11 @@ import pandas as pd
 
 from ._io import (
     ExpressionInput,
+    SettingsMode,
     cpm_scale_factors,
     parse_expression_input,
     subset_columns_dense,
+    validate_settings,
 )
 
 
@@ -167,7 +169,7 @@ def marker_based_decomposition(
     markers: Mapping[str, Sequence[str]] | pd.DataFrame,
     *,
     weights: Mapping[str, Mapping[str, float]] | pd.DataFrame | None = None,
-    weighted_pca: bool = False,
+    weighted_pca: bool | None = None,
     ct_col: str = "cluster",
     gene_col: str = "gene",
     weight_col: str = "avg_logFC",
@@ -175,55 +177,42 @@ def marker_based_decomposition(
     max_gene: int | None = 200,
     unique_markers: bool = True,
     normalize_cpm: bool = True,
-    normalization: Literal["none", "minmax", "proportional"] = "none",
+    normalization: Literal["none", "minmax", "proportional"] | None = None,
     bulk_layer: str | None = None,
     bulk_sample_names: Sequence[str] | None = None,
     bulk_gene_names: Sequence[str] | None = None,
+    settings: SettingsMode = "default",
 ) -> MarkerDeconvolutionResult:
     """
     Estimate relative cell-type abundance from bulk expression using marker-gene PCA.
-
-    Parameters
-    ----------
-    bulk
-        Bulk expression matrix in ``samples x genes`` orientation (AnnData, DataFrame,
-        ndarray, or scipy sparse matrix). Requires at least 2 bulk samples.
-    markers
-        Cell-type marker definitions as ``{cell_type: [gene, ...]}`` or a DataFrame
-        with columns ``(ct_col, gene_col[, weight_col])``.
-    weights
-        Optional positive marker weights (e.g. ``avg_logFC``) when ``weighted_pca=True``.
-    weighted_pca
-        If True, multiply standardized marker expression by marker weights prior to SVD.
-    ct_col, gene_col, weight_col
-        Column names used when ``markers`` or ``weights`` is a DataFrame.
-    min_gene
-        Minimum number of informative markers required per cell type (default 5).
-    max_gene
-        Maximum number of markers retained per cell type (default 200; ``None`` disables).
-    unique_markers
-        If True (default), exclude markers shared across multiple cell types.
-    normalize_cpm
-        If True (default), convert bulk samples to CPM across all genes before extracting
-        marker columns.
-    normalization
-        Post-processing of PC1 scores: ``"none"`` (raw sign-aligned PC1), ``"minmax"``
-        (scaled to ``[0, 1]`` per cell type), or ``"proportional"`` (min-max scaled and
-        row-normalized to sum to 1 across valid cell types).
-    bulk_layer
-        Optional ``AnnData.layers`` key.
-    bulk_sample_names, bulk_gene_names
-        Optional name overrides when passing raw arrays.
     """
+    eff_mode = validate_settings(settings)
+    if normalization is None:
+        eff_norm: Literal["none", "minmax", "proportional"] = (
+            "minmax" if eff_mode == "R_default" else "none"
+        )
+    else:
+        eff_norm = normalization
+    if weighted_pca is None:
+        if eff_mode == "R_default":
+            eff_weighted = bool(
+                weights is not None
+                or (isinstance(markers, pd.DataFrame) and weight_col in markers.columns)
+            )
+        else:
+            eff_weighted = False
+    else:
+        eff_weighted = bool(weighted_pca)
+
     if min_gene < 1:
         raise ValueError(f"`min_gene` must be >= 1; got {min_gene}.")
     if max_gene is not None and max_gene < min_gene:
         raise ValueError(
             f"`max_gene` ({max_gene}) must be >= `min_gene` ({min_gene})."
         )
-    if normalization not in ("none", "minmax", "proportional"):
+    if eff_norm not in ("none", "minmax", "proportional"):
         raise ValueError(
-            f"`normalization` must be 'none', 'minmax', or 'proportional'; got {normalization!r}."
+            f"`normalization` must be 'none', 'minmax', or 'proportional'; got {eff_norm!r}."
         )
 
     parsed_bulk = parse_expression_input(
@@ -245,7 +234,7 @@ def marker_based_decomposition(
     ct_order, ct_genes, weight_lookup = _parse_markers_and_weights(
         markers,
         weights=weights,
-        weighted_pca=weighted_pca,
+        weighted_pca=eff_weighted,
         ct_col=ct_col,
         gene_col=gene_col,
         weight_col=weight_col,
@@ -289,7 +278,7 @@ def marker_based_decomposition(
     raw_scores = np.full((n_bulk, n_ct), np.nan, dtype=np.float64)
     markers_used: dict[str, list[str]] = {}
     variance_explained: dict[str, float] = {}
-    weights_used: dict[str, np.ndarray] | None = {} if weighted_pca else None
+    weights_used: dict[str, np.ndarray] | None = {} if eff_weighted else None
 
     for k, ct in enumerate(ct_order):
         cand_genes = [
@@ -298,7 +287,7 @@ def marker_based_decomposition(
             if g in marker_col_map and marker_sd[marker_col_map[g]] > 1e-12
         ]
 
-        if weighted_pca:
+        if eff_weighted:
             assert weight_lookup is not None
             ct_w_map = weight_lookup.get(ct, {})
             cand_weights = []
@@ -348,7 +337,7 @@ def marker_based_decomposition(
         if weights_used is not None:
             weights_used[ct] = w_arr.copy()
 
-        Z_w = Z_k * w_arr[None, :] if weighted_pca else Z_k
+        Z_w = Z_k * w_arr[None, :] if eff_weighted else Z_k
 
         U, S, Vt = np.linalg.svd(Z_w, full_matrices=False)
         score = U[:, 0] * S[0]
@@ -364,7 +353,7 @@ def marker_based_decomposition(
         raw_scores[:, k] = score
         variance_explained[ct] = pve
 
-    if normalization == "none":
+    if eff_norm == "none":
         bulk_props = raw_scores
     else:
         minmax = np.full_like(raw_scores, np.nan, dtype=np.float64)
@@ -379,7 +368,7 @@ def marker_based_decomposition(
             else:
                 minmax[:, k] = 0.5
 
-        if normalization == "minmax":
+        if eff_norm == "minmax":
             bulk_props = minmax
         else:
             bulk_props = np.full_like(minmax, np.nan, dtype=np.float64)
@@ -400,6 +389,6 @@ def marker_based_decomposition(
         markers_used=markers_used,
         variance_explained=variance_explained,
         weights_used=weights_used,
-        normalization=normalization,
-        weighted_pca=weighted_pca,
+        normalization=eff_norm,
+        weighted_pca=eff_weighted,
     )

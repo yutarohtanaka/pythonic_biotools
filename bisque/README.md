@@ -52,6 +52,22 @@ marker_res = marker_based_decomposition(
 print(marker_res.to_dataframe().head())
 ```
 
+## Exact `BisqueRNA` v1.0.5 Parity (`settings="R_default"`)
+
+`reference_based_decomposition`, `marker_based_decomposition`, and `generate_sc_reference` accept `settings: Literal["default", "R_default"] = "default"` (strictly validated; raises `ValueError` on unknown values):
+
+| Component | `settings="default"` (Pythonic default) | `settings="R_default"` (`cozygene/bisque` v1.0.5 parity) |
+| :--- | :--- | :--- |
+| **Deconvolution solver** | Unconstrained `scipy.optimize.nnls` + post-hoc simplex normalization | Exact equality-and-inequality-constrained simplex QP ($\min_p \|Z p - b\|_2^2$ s.t. $\sum_k p_k = 1, p_k \ge 0$ via `SLSQP`, matching `limSolve::lsei`) |
+| **Default `old_cpm`** | `False` (CPM across full transcriptome before intersecting genes) | `True` (intersects common/marker genes before CPM, matching `old.cpm = TRUE`) |
+| **Default `use_overlap` & output samples** | `False`; returns all bulk samples and imputes zero-variance training genes via cohort shrinkage | `True` when overlapping subject IDs exist between `bulk` and `sc`; drops `anyNA` zero-variance training genes and returns deconvolved proportions on `remaining` non-overlapping bulk samples (when `remaining` is non-empty) |
+| **Marker-based defaults** | `normalization="none"`, `weighted_pca=False` | `normalization="minmax"`, `weighted_pca=True` (when weights exist) |
+
+```python
+ref_r = reference_based_decomposition(bulk_adata, sc_adata, settings="R_default")
+marker_r = marker_based_decomposition(bulk_adata, markers_df, settings="R_default")
+```
+
 ## License
 
 MIT (clean-room implementation from published equations in Jew et al., 2020).

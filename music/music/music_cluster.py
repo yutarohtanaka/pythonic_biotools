@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from .music import _get_counts, music_basis, music_iter
+from .music import SettingsMode, _get_counts, music_basis, music_iter, validate_settings
 
 
 def music_prop_cluster(
@@ -19,10 +19,12 @@ def music_prop_cluster(
     eps=0.01,
     centered=False,
     normalize=False,
+    settings: SettingsMode = "default",
 ):
     """
     Hierarchical / tree-guided MuSiC deconvolution across major cell groups and sub-clusters.
     """
+    validate_settings(settings)
     if set(group_markers.keys()) != set(clusters_type.keys()):
         raise ValueError("Keys for group_markers and clusters_type must match!")
 
@@ -47,6 +49,38 @@ def music_prop_cluster(
         select_ct=sub_cluster_names,
         non_zero=non_zero,
     )
+
+    eff_clusters_type = {g: list(clusters_type[g]) for g in group_names}
+    if settings == "R_default":
+        valid_grp_mask = (
+            (~cluster_sc_basis["Design_mtx"].isna().any(axis=0))
+            & (~cluster_sc_basis["M_S"].isna())
+            & (~cluster_sc_basis["Sigma"].isna().any(axis=0))
+        )
+        valid_sub_mask = (
+            (~sc_basis["Design_mtx"].isna().any(axis=0))
+            & (~sc_basis["M_S"].isna())
+            & (~sc_basis["Sigma"].isna().any(axis=0))
+        )
+        valid_sub_set = set(valid_sub_mask[valid_sub_mask].index)
+        new_group_names = []
+        new_sub_names = []
+        new_clusters_type = {}
+        for g in group_names:
+            if not bool(valid_grp_mask.get(g, False)):
+                continue
+            kept_subs = [s for s in eff_clusters_type[g] if s in valid_sub_set]
+            if kept_subs:
+                new_group_names.append(g)
+                new_clusters_type[g] = kept_subs
+                new_sub_names.extend(kept_subs)
+        if not new_sub_names:
+            raise ValueError(
+                "No valid cell types with finite cross-subject Sigma remain in single-cell reference!"
+            )
+        group_names = new_group_names
+        sub_cluster_names = new_sub_names
+        eff_clusters_type = new_clusters_type
 
     bulk_genes = pd.Index(bulk_adata.var_names)
     sc_genes = sc_basis["Design_mtx"].index.intersection(
@@ -137,7 +171,7 @@ def music_prop_cluster(
 
         p_weight = []
         for j, g_name in enumerate(group_names):
-            sub_ct = clusters_type[g_name]
+            sub_ct = eff_clusters_type[g_name]
             if len(sub_ct) == 1:
                 p_weight.append(float(pw_cluster[j]))
             elif pw_cluster[j] == 0:

@@ -9,16 +9,70 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from scipy.optimize import nnls
+from scipy.optimize import minimize, nnls
 
 from ._io import (
     ExpressionInput,
     ParsedExpression,
+    SettingsMode,
     cpm_normalize,
     parse_expression_input,
     resolve_sc_annotations,
     subset_columns_dense,
+    validate_settings,
 )
+
+
+def _solve_simplex_qp(
+    G_mat: np.ndarray,
+    Z: np.ndarray,
+    b: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """
+    Solve the exact equality-and-inequality-constrained simplex quadratic program
+    (`limSolve::lsei` in `BisqueRNA::Deconvolve`):
+        min_{p in R^K} ||Z p - b||_2^2   subject to  sum_k p_k = 1,  p_k >= 0.
+    """
+    n_ct = Z.shape[1]
+    if n_ct == 1:
+        p_one = np.ones(1, dtype=np.float64)
+        return p_one, float(np.linalg.norm(Z @ p_one - b))
+
+    c_vec = Z.T @ b
+    scale = max(float(np.trace(G_mat)), 1.0)
+    G_sc = G_mat / scale
+    c_sc = c_vec / scale
+
+    def _obj_and_grad(p: np.ndarray) -> tuple[float, np.ndarray]:
+        gp = G_sc @ p
+        val = 0.5 * float(np.dot(p, gp)) - float(np.dot(c_sc, p))
+        grad = gp - c_sc
+        return val, grad
+
+    p0 = np.full(n_ct, 1.0 / float(n_ct), dtype=np.float64)
+    bounds = [(0.0, 1.0)] * n_ct
+    constraints = {
+        "type": "eq",
+        "fun": lambda p: float(np.sum(p) - 1.0),
+        "jac": lambda p: np.ones(n_ct, dtype=np.float64),
+    }
+    res = minimize(
+        _obj_and_grad,
+        p0,
+        method="SLSQP",
+        jac=True,
+        bounds=bounds,
+        constraints=constraints,
+        options={"ftol": 1e-14, "maxiter": 500},
+    )
+    p_hat = np.clip(np.asarray(res.x, dtype=np.float64), 0.0, 1.0)
+    p_sum = float(np.sum(p_hat))
+    if p_sum > 1e-15:
+        p_hat /= p_sum
+    else:
+        p_hat = p0
+    rnorm = float(np.linalg.norm(Z @ p_hat - b))
+    return p_hat, rnorm
 
 
 @dataclass(frozen=True)
@@ -223,37 +277,16 @@ def generate_sc_reference(
     select_ct: Sequence[str] | None = None,
     markers: Sequence[str] | None = None,
     normalize_cpm: bool = True,
-    old_cpm: bool = False,
+    old_cpm: bool | None = None,
     sc_layer: str | None = None,
     sc_gene_names: Sequence[str] | None = None,
+    settings: SettingsMode = "default",
 ) -> SCReference:
     """
     Build single-cell signature matrix, donor cell proportions, and pseudobulk.
-
-    Parameters
-    ----------
-    sc
-        Single-cell expression in ``cells x genes`` orientation (AnnData, DataFrame,
-        ndarray, or scipy sparse matrix).
-    cell_types
-        Column in ``sc.obs`` (for AnnData) or explicit per-cell cell-type labels.
-    subject_names
-        Column in ``sc.obs`` (for AnnData), explicit per-cell donor IDs, or ``None``
-        for single-donor fallback.
-    select_ct
-        Optional ordered subset of cell types to retain.
-    markers
-        Optional gene subset to retain.
-    normalize_cpm
-        Whether to apply counts-per-million (CPM) normalization.
-    old_cpm
-        If True, subset to ``markers`` before CPM normalization; if False (default),
-        apply CPM on all genes first.
-    sc_layer
-        Optional ``AnnData.layers`` key.
-    sc_gene_names
-        Optional gene names override for array inputs.
     """
+    eff_mode = validate_settings(settings)
+    eff_old_cpm = (True if eff_mode == "R_default" else False) if old_cpm is None else bool(old_cpm)
     parsed_sc: ParsedExpression = parse_expression_input(
         sc,
         name="sc",
@@ -280,10 +313,10 @@ def generate_sc_reference(
 
     col_idx = sc_genes.get_indexer(target_genes)
 
-    if normalize_cpm and not old_cpm:
+    if normalize_cpm and not eff_old_cpm:
         sc_mat = cpm_normalize(sc_mat)
         sc_mat = sc_mat[:, col_idx]
-    elif normalize_cpm and old_cpm:
+    elif normalize_cpm and eff_old_cpm:
         sc_mat = cpm_normalize(sc_mat[:, col_idx])
     else:
         sc_mat = sc_mat[:, col_idx]
@@ -305,47 +338,21 @@ def reference_based_decomposition(
     subject_names: str | Sequence[str] | np.ndarray | None = "subject_id",
     markers: Sequence[str] | None = None,
     select_ct: Sequence[str] | None = None,
-    use_overlap: bool = False,
-    old_cpm: bool = False,
+    use_overlap: bool | None = None,
+    old_cpm: bool | None = None,
     normalize_cpm: bool = True,
     bulk_layer: str | None = None,
     sc_layer: str | None = None,
     bulk_sample_names: Sequence[str] | None = None,
     bulk_gene_names: Sequence[str] | None = None,
     sc_gene_names: Sequence[str] | None = None,
+    settings: SettingsMode = "default",
 ) -> ReferenceDeconvolutionResult:
     """
     Estimate cell-type proportions in bulk expression via Bisque reference alignment.
-
-    Parameters
-    ----------
-    bulk
-        Bulk expression matrix in ``samples x genes`` orientation (AnnData, DataFrame,
-        ndarray, or scipy sparse matrix). 1D arrays of shape ``(n_genes,)`` are treated
-        as a single bulk sample.
-    sc
-        Single-cell reference expression in ``cells x genes`` orientation.
-    cell_types
-        Column name in ``sc.obs`` or explicit per-cell sequence of cell-type labels.
-    subject_names
-        Column name in ``sc.obs``, explicit per-cell donor IDs, or ``None`` for a single donor.
-    markers
-        Optional subset of genes to restrict deconvolution.
-    select_ct
-        Optional ordered subset of cell types to include.
-    use_overlap
-        If True, fit gene-specific paired standardized regression on subjects present in
-        both ``bulk`` sample names and ``sc`` subject names.
-    old_cpm
-        If True, intersect common/marker genes before CPM normalization. If False (default),
-        apply CPM across all genes before intersecting.
-    normalize_cpm
-        If True (default), apply row-wise CPM normalization to both bulk and single-cell data.
-    bulk_layer, sc_layer
-        Optional ``AnnData.layers`` keys.
-    bulk_sample_names, bulk_gene_names, sc_gene_names
-        Optional name overrides when passing raw arrays.
     """
+    eff_mode = validate_settings(settings)
+    eff_old_cpm = (True if eff_mode == "R_default" else False) if old_cpm is None else bool(old_cpm)
     parsed_bulk = parse_expression_input(
         bulk,
         name="bulk",
@@ -389,12 +396,12 @@ def reference_based_decomposition(
     bulk_col_idx = bulk_idx_genes.get_indexer(common_genes)
     sc_col_idx = sc_idx_genes.get_indexer(common_genes)
 
-    if normalize_cpm and not old_cpm:
+    if normalize_cpm and not eff_old_cpm:
         bulk_norm = cpm_normalize(bulk_mat)
         sc_norm = cpm_normalize(sc_mat)
         B = subset_columns_dense(bulk_norm, bulk_col_idx)
         sc_sub = sc_norm[:, sc_col_idx]
-    elif normalize_cpm and old_cpm:
+    elif normalize_cpm and eff_old_cpm:
         B_sub = subset_columns_dense(bulk_mat, bulk_col_idx)
         B = np.asarray(cpm_normalize(B_sub), dtype=np.float64)
         sc_sub = cpm_normalize(sc_mat[:, sc_col_idx])
@@ -437,17 +444,23 @@ def reference_based_decomposition(
     B = B[:, keep]
     Y_sc = Y_sc[:, keep]
 
+    sc_subj_to_idx = {s: j for j, s in enumerate(sc_ref.subject_names)}
+    overlap_pairs = [
+        (i, sc_subj_to_idx[s], s)
+        for i, s in enumerate(parsed_bulk.obs_names)
+        if s in sc_subj_to_idx
+    ]
+    if use_overlap is None:
+        eff_use_overlap = (eff_mode == "R_default") and (len(overlap_pairs) > 0)
+    else:
+        eff_use_overlap = bool(use_overlap)
+
     # Gene-specific affine domain transformation
     overlapping_subjects: list[str] = []
-    run_non_overlap = not use_overlap
+    run_non_overlap = not eff_use_overlap
+    sample_names_out = list(parsed_bulk.obs_names)
 
-    if use_overlap:
-        sc_subj_to_idx = {s: j for j, s in enumerate(sc_ref.subject_names)}
-        overlap_pairs = [
-            (i, sc_subj_to_idx[s], s)
-            for i, s in enumerate(parsed_bulk.obs_names)
-            if s in sc_subj_to_idx
-        ]
+    if eff_use_overlap:
         overlapping_subjects = [s for _, _, s in overlap_pairs]
         if len(overlap_pairs) == 0:
             raise ValueError(
@@ -475,34 +488,63 @@ def reference_based_decomposition(
             sd_y = np.std(Y_train, axis=0, ddof=1)
 
             valid_paired = (sd_x > 1e-12) & (sd_y > 1e-12)
-            B_tilde = np.empty_like(B, dtype=np.float64)
 
-            if np.any(valid_paired):
+            if eff_mode == "R_default":
+                # BisqueRNA v1.0.5 SupervisedTransformBulk: drop anyNA zero-variance training genes
+                # and deconvolve remaining non-overlapping bulk samples (when remaining is non-empty)
+                if not np.any(valid_paired):
+                    raise ValueError(
+                        "No informative common genes remain after dropping zero-variance overlapping training genes."
+                    )
+                b_set = set(int(i) for i in b_idx)
+                rem_list = [i for i in range(n_bulk) if i not in b_set]
+                eval_idx = (
+                    np.asarray(rem_list, dtype=np.intp)
+                    if len(rem_list) > 0
+                    else np.arange(n_bulk, dtype=np.intp)
+                )
+                sample_names_out = [parsed_bulk.obs_names[int(i)] for i in eval_idx]
+                genes_used = [g for g, flag in zip(genes_used, valid_paired) if flag]
+                Z = Z[valid_paired, :]
                 x_z = (X_train[:, valid_paired] - mu_x[valid_paired]) / sd_x[valid_paired]
                 y_z = (Y_train[:, valid_paired] - mu_y[valid_paired]) / sd_y[valid_paired]
                 denom = np.sum(x_z * x_z, axis=0)
                 beta_hat = np.sum(x_z * y_z, axis=0) / denom
-                B_tilde[:, valid_paired] = (
+                B_eval = B[eval_idx, :][:, valid_paired]
+                B_tilde = (
                     mu_y[valid_paired]
                     + sd_y[valid_paired]
                     * beta_hat
-                    * ((B[:, valid_paired] - mu_x[valid_paired]) / sd_x[valid_paired])
+                    * ((B_eval - mu_x[valid_paired]) / sd_x[valid_paired])
                 )
+            else:
+                B_tilde = np.empty_like(B, dtype=np.float64)
+                if np.any(valid_paired):
+                    x_z = (X_train[:, valid_paired] - mu_x[valid_paired]) / sd_x[valid_paired]
+                    y_z = (Y_train[:, valid_paired] - mu_y[valid_paired]) / sd_y[valid_paired]
+                    denom = np.sum(x_z * x_z, axis=0)
+                    beta_hat = np.sum(x_z * y_z, axis=0) / denom
+                    B_tilde[:, valid_paired] = (
+                        mu_y[valid_paired]
+                        + sd_y[valid_paired]
+                        * beta_hat
+                        * ((B[:, valid_paired] - mu_x[valid_paired]) / sd_x[valid_paired])
+                    )
 
-            if np.any(~valid_paired):
-                inv = ~valid_paired
-                if n_donors >= 2 and n_bulk >= 2:
-                    mu_sc_inv = np.mean(Y_sc[:, inv], axis=0)
-                    sig_sc_inv = np.sqrt(
-                        np.sum((Y_sc[:, inv] - mu_sc_inv) ** 2, axis=0) / (n_donors + 1.0)
-                    )
-                    mu_b_inv = np.mean(B[:, inv], axis=0)
-                    sd_b_inv = np.std(B[:, inv], axis=0, ddof=1)
-                    B_tilde[:, inv] = mu_sc_inv + sig_sc_inv * (
-                        (B[:, inv] - mu_b_inv) / sd_b_inv
-                    )
-                else:
-                    B_tilde[:, inv] = mu_y[inv]
+                if np.any(~valid_paired):
+                    inv = ~valid_paired
+                    if n_donors >= 2 and n_bulk >= 2:
+                        mu_sc_inv = np.mean(Y_sc[:, inv], axis=0)
+                        sig_sc_inv = np.sqrt(
+                            np.sum((Y_sc[:, inv] - mu_sc_inv) ** 2, axis=0) / (n_donors + 1.0)
+                        )
+                        mu_b_inv = np.mean(B[:, inv], axis=0)
+                        sd_b_inv = np.std(B[:, inv], axis=0, ddof=1)
+                        B_tilde[:, inv] = mu_sc_inv + sig_sc_inv * (
+                            (B[:, inv] - mu_b_inv) / sd_b_inv
+                        )
+                    else:
+                        B_tilde[:, inv] = mu_y[inv]
 
     if run_non_overlap:
         if n_donors < 2 or n_bulk < 2:
@@ -524,30 +566,38 @@ def reference_based_decomposition(
             sd_bulk = np.std(B, axis=0, ddof=1)
             B_tilde = mu_sc + sigma_sc_tilde * ((B - mu_bulk) / sd_bulk)
 
-    # Solve NNLS per bulk sample and normalize to sum to 1
+    n_eval = B_tilde.shape[0]
     n_ct = len(sc_ref.cell_types)
-    bulk_props = np.empty((n_bulk, n_ct), dtype=np.float64)
-    rnorm = np.empty(n_bulk, dtype=np.float64)
+    bulk_props = np.empty((n_eval, n_ct), dtype=np.float64)
+    rnorm = np.empty(n_eval, dtype=np.float64)
 
-    for i in range(n_bulk):
-        q_hat, res_norm = nnls(Z, B_tilde[i, :])
-        rnorm[i] = float(res_norm)
-        q_sum = float(np.sum(q_hat))
-        if q_sum > 1e-15:
-            bulk_props[i, :] = q_hat / q_sum
-        else:
-            warnings.warn(
-                f"NNLS returned zero-sum weights for bulk sample '{parsed_bulk.obs_names[i]}'; "
-                "setting estimated proportions to NaN.",
-                UserWarning,
-                stacklevel=2,
-            )
-            bulk_props[i, :] = np.nan
+    if eff_mode == "R_default":
+        # Exact constrained simplex QP matching limSolve::lsei in BisqueRNA::Deconvolve
+        G_mat = Z.T @ Z
+        for i in range(n_eval):
+            p_hat, res_norm = _solve_simplex_qp(G_mat, Z, B_tilde[i, :])
+            bulk_props[i, :] = p_hat
+            rnorm[i] = res_norm
+    else:
+        for i in range(n_eval):
+            q_hat, res_norm = nnls(Z, B_tilde[i, :])
+            rnorm[i] = float(res_norm)
+            q_sum = float(np.sum(q_hat))
+            if q_sum > 1e-15:
+                bulk_props[i, :] = q_hat / q_sum
+            else:
+                warnings.warn(
+                    f"NNLS returned zero-sum weights for bulk sample '{sample_names_out[i]}'; "
+                    "setting estimated proportions to NaN.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                bulk_props[i, :] = np.nan
 
     return ReferenceDeconvolutionResult(
         bulk_props=bulk_props,
         sc_props=P_sc,
-        sample_names=parsed_bulk.obs_names,
+        sample_names=sample_names_out,
         sc_subject_names=sc_ref.subject_names,
         cell_types=sc_ref.cell_types,
         genes_used=genes_used,
