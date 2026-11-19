@@ -19,3 +19,4 @@ htmlcov/
 *.vcf
 *.vcf.gz
 *.h5ad
+.agents/
