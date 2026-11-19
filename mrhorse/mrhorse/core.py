@@ -7,23 +7,60 @@ horizontal pleiotropy without requiring external JAGS installation.
 from __future__ import annotations
 
 import numpy as np
-from scipy import special
+from scipy import special, stats
 
 GRID = 200
+_TP_FLOOR = 1e-60
 
 
 def _qform(bx0, mx, s, vx0, rho, alpha, phi, tau):
-    K = bx0.shape[1]
-    coef = rho * alpha / (phi * tau)
-    z = bx0 - mx[None] - coef[:, None] * s[None]
-    kappa = -rho ** 2 / (1.0 - K * rho ** 2)
-    return (z ** 2 / vx0[None]).sum(1) - kappa * (z / s[None]).sum(1) ** 2
+    tp = np.maximum(phi * tau, _TP_FLOOR)
+    a_vec = alpha / tp
+    z = bx0 - mx[None, :] - a_vec[:, None] * rho * s[None, :]
+    ztilde = z / s[None, :]
+    one_minus_r2 = np.maximum(1.0 - np.sum(rho ** 2, axis=1), 1e-8)
+    dot_rz = np.sum(rho * ztilde, axis=1)
+    return np.sum(z ** 2 / vx0[None, :], axis=1) + (dot_rz ** 2) / one_minus_r2
+
+
+def _sample_right_tail_std_norm(alpha: float, beta: float, rng: np.random.Generator) -> float:
+    """Exact Robert (1995) shifted-exponential rejection sampler on [alpha, beta] for alpha > 0."""
+    width = beta - alpha
+    if width <= 0.0:
+        return alpha
+    lam = 0.5 * (alpha + np.sqrt(alpha * alpha + 4.0))
+    u_max = -np.expm1(-lam * width)
+    if u_max <= 0.0:
+        return alpha
+    for _ in range(1000):
+        u = rng.uniform(0.0, u_max)
+        z = alpha - np.log1p(-u) / lam
+        if np.log(rng.uniform()) <= -0.5 * (z - lam) ** 2:
+            return float(np.clip(z, alpha, beta))
+    return float(np.clip(alpha + 1.0 / max(lam, 1.0), alpha, beta))
 
 
 def _trunc_norm(mean: float, sd: float, lo: float, hi: float, rng: np.random.Generator) -> float:
-    a, b = special.ndtr((lo - mean) / sd), special.ndtr((hi - mean) / sd)
-    u = rng.uniform(a, b)
-    return float(mean + sd * special.ndtri(np.clip(u, 1e-300, 1.0 - 1e-16)))
+    """Sample from N(mean, sd^2) truncated to [lo, hi] without extreme-tail boundary violations."""
+    if lo >= hi:
+        raise ValueError(f"Invalid truncation bounds lo={lo} >= hi={hi}.")
+    if not (np.isfinite(sd) and sd > 0.0):
+        return float(np.clip(mean, lo, hi))
+    alpha = (lo - mean) / sd
+    beta = (hi - mean) / sd
+    if alpha > 5.0:
+        z = _sample_right_tail_std_norm(alpha, beta, rng)
+        return float(np.clip(mean + sd * z, lo, hi))
+    if beta < -5.0:
+        z = -_sample_right_tail_std_norm(-beta, -alpha, rng)
+        return float(np.clip(mean + sd * z, lo, hi))
+    a, b = float(special.ndtr(alpha)), float(special.ndtr(beta))
+    if b - a > 1e-12:
+        u = rng.uniform(a, b)
+        z = float(special.ndtri(np.clip(u, 1e-300, 1.0 - 1e-16)))
+        return float(np.clip(mean + sd * z, lo, hi))
+    val = float(stats.truncnorm.rvs(alpha, beta, loc=mean, scale=sd, random_state=rng))
+    return float(np.clip(val, lo, hi))
 
 
 class _Chain:
@@ -34,9 +71,10 @@ class _Chain:
         self.theta = rng.normal(0, 0.5, K)
         self.bx0 = bx.copy()
         self.alpha = np.zeros(N)
-        self.rho = rng.uniform(-0.2, 0.2, N)
-        self.phi = np.exp(rng.normal(0, 0.3, N))
-        self.tau = float(np.exp(rng.normal(np.log(0.1), 0.5)))
+        init_r = 0.2 / np.sqrt(K)
+        self.rho = rng.uniform(-init_r, init_r, (N, K))
+        self.phi = np.maximum(np.exp(rng.normal(0, 0.3, N)), _TP_FLOOR)
+        self.tau = float(max(np.exp(rng.normal(np.log(0.1), 0.5)), _TP_FLOOR))
         self.vx0 = np.maximum(bx.var(0), 1e-8) * np.exp(rng.normal(0, 0.3, K))
         self.mx = np.zeros(K)
         self.step = dict(phi=0.5, tau=0.5, vx0=np.full(K, 0.3))
@@ -44,18 +82,16 @@ class _Chain:
         self.n_prop = 0
         rg = (np.arange(GRID) + 0.5) / GRID
         self.rho_grid = 2.0 * rg - 1.0
-        self.ok_grid = np.abs(self.rho_grid) < 1.0 / np.sqrt(K)
-        self.logbeta = 9.0 * np.log(rg) + 9.0 * np.log(1.0 - rg)
 
     def _P(self):
-        K = self.K
         s = np.sqrt(self.vx0)
-        u = 1.0 / s
-        c = self.rho ** 2 / (1.0 - K * self.rho ** 2)
-        return np.diag(1.0 / self.vx0)[None] + c[:, None, None] * np.outer(u, u)[None]
+        u = self.rho / s[None, :]
+        inv_one_minus_r2 = 1.0 / np.maximum(1.0 - np.sum(self.rho ** 2, axis=1), 1e-8)
+        return np.diag(1.0 / self.vx0)[None, :, :] + inv_one_minus_r2[:, None, None] * (u[:, :, None] * u[:, None, :])
 
     def _gamma(self):
-        return np.sqrt(self.vx0)[None] * (self.rho / (self.phi * self.tau))[:, None]
+        tp = np.maximum(self.phi * self.tau, _TP_FLOOR)
+        return np.sqrt(self.vx0)[None, :] * self.rho / tp[:, None]
 
     def sweep(self, adapt: bool) -> None:
         rng, N, K = self.rng, self.N, self.K
@@ -73,54 +109,76 @@ class _Chain:
         Lc = np.linalg.cholesky(prec)
         self.bx0 = mean + np.linalg.solve(Lc.transpose(0, 2, 1), rng.normal(size=(N, K, 1)))[:, :, 0]
 
+        tp = np.maximum(self.tau * self.phi, _TP_FLOOR)
         Pg = np.einsum("ijk,ik->ij", P, gam)
-        prec_a = 1.0 / sy ** 2 + 1.0 / (self.tau * self.phi) ** 2 + np.einsum("ij,ij->i", gam, Pg)
+        prec_a = 1.0 / sy ** 2 + 1.0 / (tp ** 2) + np.einsum("ij,ij->i", gam, Pg)
         rhs_a = (by - self.bx0 @ self.theta) / sy ** 2 + np.einsum("ij,ij->i", Pg, self.bx0 - self.mx[None])
         self.alpha = rhs_a / prec_a + rng.normal(size=N) / np.sqrt(prec_a)
 
         for k in range(K):
             e = by - self.alpha - self.bx0 @ self.theta + self.bx0[:, k] * self.theta[k]
             pk = float(np.sum(self.bx0[:, k] ** 2 / sy ** 2))
-            mk = float(np.sum(self.bx0[:, k] * e / sy ** 2) / pk)
-            self.theta[k] = _trunc_norm(mk, 1.0 / np.sqrt(pk), -10.0, 10.0, rng)
+            if pk > 0.0:
+                mk = float(np.sum(self.bx0[:, k] * e / sy ** 2) / pk)
+                self.theta[k] = _trunc_norm(mk, 1.0 / np.sqrt(pk), -10.0, 10.0, rng)
 
         prec_m = np.eye(K) + P.sum(0)
         rhs_m = np.einsum("ijk,ik->j", P, self.bx0 - gam * self.alpha[:, None])
         Lm = np.linalg.cholesky(prec_m)
         self.mx = np.linalg.solve(prec_m, rhs_m) + np.linalg.solve(Lm.T, rng.normal(size=K))
 
+        # Per-exposure rho[:, k] Gibbs updates respecting positive-definite correlation Cholesky ||rho_i||_2 < 1
         G = GRID
-        coef = (self.alpha / (self.phi * self.tau))[:, None] * self.rho_grid[None, :]
-        z = self.bx0[:, None, :] - self.mx[None, None, :] - coef[:, :, None] * s[None, None, :]
-        kappa = -self.rho_grid ** 2 / (1.0 - K * self.rho_grid ** 2 + (~self.ok_grid))
-        q = (z ** 2 / self.vx0[None, None]).sum(2) - kappa[None] * (z / s[None, None]).sum(2) ** 2
-        with np.errstate(divide="ignore", invalid="ignore"):
-            lp = self.logbeta[None] - 0.5 * np.log(1.0 - K * self.rho_grid ** 2)[None] - 0.5 * q
-        lp[:, ~self.ok_grid] = -np.inf
-        lp -= lp.max(1, keepdims=True)
-        pr = np.exp(lp)
-        pr /= pr.sum(1, keepdims=True)
-        cdf = np.cumsum(pr, 1)
-        u = rng.uniform(size=N)
-        idx = np.minimum((cdf < u[:, None]).sum(1), G - 1)
-        r = np.clip((idx + rng.uniform(-0.5, 0.5, N) + 0.5) / G, 0.5 / G, 1.0 - 0.5 / G)
-        rho_new = 2.0 * r - 1.0
-        self.rho = np.where(np.abs(rho_new) < 1.0 / np.sqrt(K), rho_new, self.rho_grid[idx])
+        a_vec = self.alpha / tp
+        d_tilde = (self.bx0 - self.mx[None, :]) / s[None, :]
+        for k in range(K):
+            s_other = np.sum(self.rho ** 2, axis=1) - self.rho[:, k] ** 2
+            r_max = np.sqrt(np.maximum(1.0 - 1e-6 - s_other, 1e-8))
+            g_mat = r_max[:, None] * self.rho_grid[None, :]
+
+            z_cur = d_tilde - a_vec[:, None] * self.rho
+            norm_z_other = np.sum(z_cur ** 2, axis=1) - z_cur[:, k] ** 2
+            rz_other = np.sum(self.rho * z_cur, axis=1) - self.rho[:, k] * z_cur[:, k]
+
+            zk_grid = d_tilde[:, k : k + 1] - a_vec[:, None] * g_mat
+            norm_z2 = norm_z_other[:, None] + zk_grid ** 2
+            dot_rz = rz_other[:, None] + g_mat * zk_grid
+            one_minus_r2 = np.maximum((1.0 - s_other)[:, None] - g_mat ** 2, 1e-12)
+            q = norm_z2 + (dot_rz ** 2) / one_minus_r2
+
+            lp = 9.0 * np.log(np.maximum(1.0 - g_mat ** 2, 1e-30)) - 0.5 * np.log(one_minus_r2) - 0.5 * q
+            lp -= lp.max(axis=1, keepdims=True)
+            pr = np.exp(lp)
+            pr /= pr.sum(axis=1, keepdims=True)
+            cdf = np.cumsum(pr, axis=1)
+            u = rng.uniform(size=N)
+            idx = np.minimum((cdf < u[:, None]).sum(axis=1), G - 1)
+            u_jit = np.clip((idx + rng.uniform(-0.5, 0.5, N) + 0.5) / G, 0.5 / G, 1.0 - 0.5 / G)
+            self.rho[:, k] = r_max * (2.0 * u_jit - 1.0)
 
         def logt_phi(phi):
+            tp_p = np.maximum(self.tau * phi, _TP_FLOOR)
             qf = _qform(self.bx0, self.mx, s, self.vx0, self.rho, self.alpha, phi, self.tau)
-            return -self.alpha ** 2 / (2.0 * self.tau ** 2 * phi ** 2) - 0.5 * qf - np.log1p(phi ** 2)
+            return -self.alpha ** 2 / (2.0 * tp_p ** 2) - 0.5 * qf - np.log1p(np.minimum(phi, 1e150) ** 2)
 
-        prop = self.phi * np.exp(self.step["phi"] * rng.normal(size=N))
+        prop = np.maximum(self.phi * np.exp(self.step["phi"] * rng.normal(size=N)), _TP_FLOOR)
         acc = np.log(rng.uniform(size=N)) < logt_phi(prop) - logt_phi(self.phi)
         self.phi = np.where(acc, prop, self.phi)
         self.acc["phi"] += float(acc.mean())
 
         def logt_tau(tau):
+            tp_t = np.maximum(tau * self.phi, _TP_FLOOR)
             qf = _qform(self.bx0, self.mx, s, self.vx0, self.rho, self.alpha, self.phi, tau)
-            return -N * np.log(tau) - np.sum(self.alpha ** 2 / self.phi ** 2) / (2.0 * tau ** 2) - 0.5 * qf.sum() - np.log1p(tau ** 2) + np.log(tau)
+            tau_safe = max(tau, _TP_FLOOR)
+            return (
+                -N * np.log(tau_safe)
+                - np.sum(self.alpha ** 2 / (2.0 * tp_t ** 2))
+                - 0.5 * qf.sum()
+                - np.log1p(min(tau_safe, 1e150) ** 2)
+                + np.log(tau_safe)
+            )
 
-        prop_t = float(self.tau * np.exp(self.step["tau"] * rng.normal()))
+        prop_t = float(max(self.tau * np.exp(self.step["tau"] * rng.normal()), _TP_FLOOR))
         a = bool(np.log(rng.uniform()) < logt_tau(prop_t) - logt_tau(self.tau))
         if a:
             self.tau = prop_t
@@ -133,7 +191,7 @@ class _Chain:
                 qf = _qform(self.bx0, self.mx, np.sqrt(vv), vv, self.rho, self.alpha, self.phi, self.tau)
                 return -0.5 * N * np.log(vv).sum() - 0.5 * qf.sum() - v ** 2 / 2.0 + np.log(v)
 
-            prop_v = float(self.vx0[k] * np.exp(self.step["vx0"][k] * rng.normal()))
+            prop_v = float(max(self.vx0[k] * np.exp(self.step["vx0"][k] * rng.normal()), 1e-30))
             av = bool(np.log(rng.uniform()) < logt_v(prop_v) - logt_v(self.vx0[k]))
             if av:
                 self.vx0[k] = prop_v
@@ -148,26 +206,41 @@ class _Chain:
             self.acc["vx0"][:] = 0.0
 
 
-def gelman_rubin(chains: np.ndarray) -> float:
-    """Potential scale reduction factor (`coda::gelman.diag` point estimate)."""
+def gelman_rubin(chains: np.ndarray, split_chains: bool = False) -> float:
+    """Potential scale reduction factor (`coda::gelman.diag` point estimate on post-burnin chains).
+
+    Uses all supplied post-burnin draws without discarding half the samples. When `split_chains=True`,
+    each chain is split into two equal halves (split-Rhat) while still retaining ~100% of draws.
+    """
     x = np.asarray(chains, dtype=float)
-    m, n0 = x.shape
-    x = x[:, n0 // 2 :]
+    if x.ndim == 1:
+        x = x[None, :]
+    if split_chains:
+        half = x.shape[1] // 2
+        if half >= 2:
+            x = np.vstack([x[:, :half], x[:, half : 2 * half]])
     m, n = x.shape
+    if m < 2 or n < 2:
+        return float("nan")
     s2 = x.var(1, ddof=1)
     xbar = x.mean(1)
-    w = s2.mean()
-    b = n * xbar.var(ddof=1)
-    muhat = xbar.mean()
-    var_w = s2.var(ddof=1) / m
+    w = float(s2.mean())
+    b = float(n * xbar.var(ddof=1))
+    if w <= 1e-30:
+        return 1.0 if b <= 1e-30 else float("inf")
+    muhat = float(xbar.mean())
+    var_w = float(s2.var(ddof=1)) / m
     var_b = 2.0 * b ** 2 / (m - 1)
-    cov_wb = m * (np.cov(s2, xbar ** 2)[0, 1] - 2.0 * muhat * np.cov(s2, xbar)[0, 1])
+    cov_wb = (n / m) * float(np.cov(s2, xbar ** 2)[0, 1] - 2.0 * muhat * np.cov(s2, xbar)[0, 1])
     V = (n - 1) * w / n + (1.0 + 1.0 / m) * b / n
     var_V = ((n - 1) ** 2 * var_w + (1.0 + 1.0 / m) ** 2 * var_b + 2.0 * (n - 1) * (1.0 + 1.0 / m) * cov_wb) / n ** 2
-    df_V = 2.0 * V ** 2 / var_V
-    df_adj = (df_V + 3.0) / (df_V + 1.0)
+    if var_V <= 0.0 or not np.isfinite(var_V):
+        df_adj = 1.0
+    else:
+        df_V = 2.0 * V ** 2 / var_V
+        df_adj = (df_V + 3.0) / (df_V + 1.0)
     r2 = (n - 1) / n + (1.0 + 1.0 / m) * (1.0 / n) * (b / w)
-    return float(np.sqrt(df_adj * r2))
+    return float(np.sqrt(max(df_adj * r2, 0.0)))
 
 
 def horse(
@@ -191,6 +264,10 @@ def horse(
     ss = np.random.SeedSequence(seed)
     names = [f"theta[{k + 1}]" for k in range(K)]
     out: dict[str, list[np.ndarray]] = {nm: [] for nm in names}
+    valid_save_keys = {"theta", "alpha", "rho", "phi", "tau", "vx0", "mx", "bx0"}
+    unknown = set(save) - valid_save_keys
+    if unknown:
+        raise ValueError(f"Unsupported save key(s): {sorted(unknown)}; valid keys are {sorted(valid_save_keys)}.")
     extra: dict[str, list[np.ndarray]] = {key: [] for key in save if key != "theta"}
 
     for c, child in enumerate(ss.spawn(n_chains)):
@@ -202,10 +279,18 @@ def horse(
             if it >= n_burnin and (it - n_burnin + 1) % thin == 0:
                 for k, nm in enumerate(names):
                     keep[nm].append(float(ch.theta[k]))
-                for key in extra:
-                    ek[key].append(
-                        {"alpha": ch.alpha, "rho": ch.rho, "phi": ch.phi, "tau": np.array(ch.tau), "vx0": ch.vx0.copy(), "mx": ch.mx.copy()}[key].copy()
-                    )
+                if extra:
+                    state_map = {
+                        "alpha": ch.alpha,
+                        "rho": ch.rho,
+                        "phi": ch.phi,
+                        "tau": np.array(ch.tau),
+                        "vx0": ch.vx0,
+                        "mx": ch.mx,
+                        "bx0": ch.bx0,
+                    }
+                    for key in extra:
+                        ek[key].append(state_map[key].copy())
         for nm in names:
             out[nm].append(np.array(keep[nm]))
         for key in extra:

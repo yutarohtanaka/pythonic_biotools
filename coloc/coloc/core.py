@@ -70,6 +70,33 @@ class ColocABFResult:
         return [self.snp_ids[i] for i in order[: min(cutoff, self.n_snps)]]
 
 
+def _log_sum_offdiag(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute log(sum_{i != j} exp(a[i] + b[j])) without float64 cancellation or overflow."""
+    n = a.size
+    if n <= 1:
+        return -np.inf
+    sum_shared = float(special.logsumexp(a + b))
+    log_prod = float(special.logsumexp(a) + special.logsumexp(b))
+    diff = log_prod - sum_shared
+    if diff >= 40.0:
+        return log_prod + float(np.log1p(-np.exp(-diff)))
+    if diff >= 0.1:
+        return sum_shared + float(np.log(np.expm1(diff)))
+
+    k = int(np.argmax(a + b))
+    mask = np.ones(n, dtype=bool)
+    mask[k] = False
+    a_rest = a[mask]
+    b_rest = b[mask]
+    la = float(special.logsumexp(a_rest))
+    lb = float(special.logsumexp(b_rest))
+    term12 = float(special.logsumexp([a[k] + lb, b[k] + la]))
+    if n == 2 or (la + lb <= term12 - 45.0):
+        return term12
+    term3 = _log_sum_offdiag(a_rest, b_rest)
+    return float(special.logsumexp([term12, term3]))
+
+
 def coloc_abf(
     beta1: Sequence[float] | np.ndarray,
     se1: Sequence[float] | np.ndarray,
@@ -81,6 +108,8 @@ def coloc_abf(
     p1: float = 1e-4,
     p2: float = 1e-4,
     p12: float = 1e-5,
+    sd_y1: float | None = None,
+    sd_y2: float | None = None,
     locus_name: str = "locus",
     trait1_name: str = "trait1",
     trait2_name: str = "trait2",
@@ -89,7 +118,19 @@ def coloc_abf(
 
     Default priors (`prior_w1=0.15` for quantitative traits, `0.20` recommended for case-control
     log-odds; `p1=1e-4, p2=1e-4, p12=1e-5`) match R `coloc::coloc.abf` v5 defaults.
+    When `sd_y1` or `sd_y2` is provided, `prior_w1` / `prior_w2` are scaled by the trait SD.
     """
+    if not (np.isfinite(prior_w1) and prior_w1 > 0.0 and np.isfinite(prior_w2) and prior_w2 > 0.0):
+        raise ValueError("prior_w1 and prior_w2 must be finite and strictly positive.")
+    if not (np.isfinite(p1) and np.isfinite(p2) and np.isfinite(p12) and p1 > 0.0 and p2 > 0.0 and p12 > 0.0):
+        raise ValueError("Prior probabilities p1, p2, p12 must be finite and strictly positive.")
+    if p1 + p2 + p12 >= 1.0:
+        raise ValueError("Sum of prior probabilities p1 + p2 + p12 must be strictly less than 1.")
+    if sd_y1 is not None and not (np.isfinite(sd_y1) and sd_y1 > 0.0):
+        raise ValueError("sd_y1 must be finite and strictly positive when provided.")
+    if sd_y2 is not None and not (np.isfinite(sd_y2) and sd_y2 > 0.0):
+        raise ValueError("sd_y2 must be finite and strictly positive when provided.")
+
     b1 = np.asarray(beta1, dtype=np.float64).ravel()
     s1 = np.asarray(se1, dtype=np.float64).ravel()
     b2 = np.asarray(beta2, dtype=np.float64).ravel()
@@ -107,19 +148,23 @@ def coloc_abf(
     if len(ids) != m:
         raise ValueError("snp_ids length must match beta1.")
 
+    w1 = float(prior_w1) * (1.0 if sd_y1 is None else float(sd_y1))
+    w2 = float(prior_w2) * (1.0 if sd_y2 is None else float(sd_y2))
+
     v1 = s1**2
     v2 = s2**2
-    w1_sq = prior_w1**2
-    w2_sq = prior_w2**2
+    w1_sq = w1**2
+    w2_sq = w2**2
 
     r1 = w1_sq / (v1 + w1_sq)
     r2 = w2_sq / (v2 + w2_sq)
     z1_sq = (b1**2) / v1
     z2_sq = (b2**2) / v2
 
-    lbf1 = 0.5 * np.log(1.0 - r1) + 0.5 * r1 * z1_sq
-    lbf2 = 0.5 * np.log(1.0 - r2) + 0.5 * r2 * z2_sq
+    lbf1 = -0.5 * np.log1p(w1_sq / v1) + 0.5 * r1 * z1_sq
+    lbf2 = -0.5 * np.log1p(w2_sq / v2) + 0.5 * r2 * z2_sq
 
+    p0 = 1.0 - (p1 + p2 + p12)
     log_h0 = 0.0
     log_h1 = np.log(p1) + float(special.logsumexp(lbf1))
     log_h2 = np.log(p2) + float(special.logsumexp(lbf2))
@@ -128,11 +173,13 @@ def coloc_abf(
     sum_lbf_shared = float(special.logsumexp(lbf_shared))
     log_h4 = np.log(p12) + sum_lbf_shared
 
-    log_prod = float(special.logsumexp(lbf1) + special.logsumexp(lbf2))
-    diff_exp = max(float(np.exp(log_prod - sum_lbf_shared)) - 1.0, 1e-300)
-    log_sum_distinct = sum_lbf_shared + np.log(diff_exp)
-    log_h3 = np.log(p1) + np.log(p2) + log_sum_distinct
+    if m == 1:
+        log_h3 = -np.inf
+    else:
+        log_sum_distinct = _log_sum_offdiag(lbf1, lbf2)
+        log_h3 = np.log(p1) + np.log(p2) + log_sum_distinct
 
+    _ = p0  # H0 reference log-BF is 0.0 per Giambartolomei et al. (2014)
     log_hyps = np.array([log_h0, log_h1, log_h2, log_h3, log_h4], dtype=np.float64)
     log_denom = float(special.logsumexp(log_hyps))
     posteriors = np.exp(log_hyps - log_denom)

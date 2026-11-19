@@ -1,5 +1,5 @@
-"""Python implementation of Multivariable Constrained Maximum Likelihood (`MVMR-cML`) and
-conditional GWAS bias adjustment (Lin et al., AJHG 2023).
+"""Python implementation of Multivariable Constrained Maximum Likelihood (`MVMR-cML`,
+`MVMR-cML-MA`, `MVMR-cML-DP`) and conditional GWAS bias adjustment (Lin et al., AJHG 2023).
 """
 from __future__ import annotations
 
@@ -19,30 +19,27 @@ def _lik_terms(betax_t, betayc, SIGinv, betay_t, b, betax_obs):
     return a2 - a1, float(a1.sum())
 
 
-def cml_ma(
+def _fit_cml_path(
     N: float,
     betax: np.ndarray,
     betayc: np.ndarray,
-    SIG: np.ndarray,
-    threshold: float = 0.01,
-    maxit: int = 500,
+    SIGinv: np.ndarray,
+    A11: np.ndarray,
+    A12: np.ndarray,
+    A22: np.ndarray,
+    threshold: float,
+    maxit: int,
     verbose: bool = False,
-) -> dict:
-    """Fit MVMR-cML (`cml_MA`) across `k = 0 .. m - (p + 1)` invalid instruments selected by BIC."""
-    betax, betayc = np.asarray(betax, dtype=float), np.asarray(betayc, dtype=float)
+):
     m, p = betax.shape
-    if m < p + 1:
-        raise ValueError(f"Need at least p + 1 = {p + 1} instruments, got {m}")
-    SIGinv = np.linalg.inv(SIG)
-    A11 = SIGinv[:, 0, 0]
-    A12 = SIGinv[:, 0, 1:]
-    A22 = SIGinv[:, 1:, 1:]
     nk = m - (p + 1) + 1
     btotal = np.zeros((p, nk))
     betayesttotal = np.zeros((m, nk))
     betaxesttotal = []
     bic = np.zeros(nk)
     valid = []
+    log_n = float(np.log(N))
+
     for k in range(nk):
         b = np.zeros(p)
         betayest = np.zeros(m)
@@ -52,11 +49,14 @@ def cml_ma(
             c += 1
             old = b.copy()
             betayest = betayc - betaxest @ b + (1.0 / A11) * np.einsum("ij,ij->i", betax - betaxest, A12)
-            go, _ = _lik_terms(betaxest, betayc, SIGinv, betayest, b, betax)
-            order = np.argsort(-go, kind="stable")
-            keep = np.zeros(m, bool)
-            keep[order[:k]] = True
-            betayest = np.where(keep, betayest, 0.0)
+            if k > 0:
+                go, _ = _lik_terms(betaxest, betayc, SIGinv, betayest, b, betax)
+                order = np.argsort(-go, kind="stable")
+                keep = np.zeros(m, bool)
+                keep[order[:k]] = True
+                betayest = np.where(keep, betayest, 0.0)
+            else:
+                betayest = np.zeros(m)
 
             Mi = (
                 A11[:, None, None] * np.outer(b, b)[None]
@@ -70,73 +70,251 @@ def cml_ma(
 
             a = np.einsum("i,ij,ik->jk", A11, betaxest, betaxest)
             rb = np.einsum("i,ij->j", A11 * (betayc - betayest) + np.einsum("ij,ij->i", A12, betax - betaxest), betaxest)
-            b = np.linalg.solve(a, rb)
+            try:
+                b = np.linalg.solve(a, rb)
+            except np.linalg.LinAlgError:
+                b = np.linalg.pinv(a) @ rb
             if np.abs(old - b).sum() < threshold or c > maxit:
                 break
         btotal[:, k] = b
         betayesttotal[:, k] = betayest
         betaxesttotal.append(betaxest)
         _, like = _lik_terms(betaxest, betayc, SIGinv, betayest, b, betax)
-        bic[k] = like + np.log(N) * k
+        bic[k] = like + log_n * k
         valid.append(np.flatnonzero(betayest == 0))
         if verbose:
             print(f"[mvcml] k={k} iterations={c} BIC={bic[k]:.4f}")
 
-    kbest = int(np.argmin(bic))
-    b = btotal[:, kbest]
-    validuse = valid[kbest]
-    betaxest = betaxesttotal[kbest]
-    nv = len(validuse)
-    siginv = SIGinv[validuse]
-    betaxvalid = betaxest[validuse]
-    betaxIVvalid = betax[validuse]
-    betaGYCvalid = betayc[validuse]
+    return btotal, betayesttotal, betaxesttotal, bic, valid
 
-    B = np.zeros((nv, p, p))
-    C = np.zeros((nv, p, p))
-    for i in range(nv):
-        a11 = siginv[i, 0, 0]
-        A12v = siginv[i, 0, 1:]
-        A22v = siginv[i, 1:, 1:]
-        bx = betaxvalid[i]
-        for j in range(p):
-            for kk in range(p):
-                if j == kk:
-                    B[i, j, kk] = (b[j] * bx[j] + b @ bx - betaGYCvalid[i]) * a11 - A12v @ (betaxIVvalid[i] - bx) + A12v[j] * bx[j]
-                    C[i, j, kk] = b[j] ** 2 * a11 + 2.0 * b[j] * A12v[j] + A22v[j, j]
-                else:
-                    B[i, j, kk] = b[j] * bx[kk] * a11 + A12v[j] * bx[kk]
-                    C[i, j, kk] = b[j] * b[kk] * a11 + b[j] * A12v[kk] + b[kk] * A12v[j] + A22v[j, kk]
-    B1 = B.reshape(nv * p, p)
-    C1 = np.zeros((nv * p, nv * p))
-    for i in range(nv):
-        C1[i * p : (i + 1) * p, i * p : (i + 1) * p] = C[i]
-    A = np.einsum("i,ij,ik->jk", siginv[:, 0, 0], betaxvalid, betaxvalid)
-    Info3 = np.block([[C1, B1], [B1.T, A]])
-    Info = np.linalg.inv(Info3)
-    Info_s = (Info + Info.T) / 2.0
-    mineig = float(np.linalg.eigvalsh(Info_s).min())
-    if mineig < 0:
-        Info = Info + (-1.001) * mineig * np.eye(Info.shape[0])
-    Covb = Info[-p:, -p:]
+
+def _cov_omega_at_k(
+    b: np.ndarray,
+    validuse: np.ndarray,
+    betaxest: np.ndarray,
+    betax: np.ndarray,
+    betayc: np.ndarray,
+    SIGinv: np.ndarray,
+    need_omega: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Compute Cov(b) and optional influence matrix Omega in O(nv * p^3) via block-diagonal C1 Schur complement."""
+    nv = len(validuse)
+    p = len(b)
+    siginv = SIGinv[validuse]
+    a11 = siginv[:, 0, 0]
+    A12v = siginv[:, 0, 1:]
+    A22v = siginv[:, 1:, 1:]
+    bx = betaxest[validuse]
+    bx_iv = betax[validuse]
+    byc_v = betayc[validuse]
+
+    # Block-diagonal C (nv, p, p) and off-diagonal B (nv, p, p)
+    C = (
+        a11[:, None, None] * np.outer(b, b)[None, :, :]
+        + b[None, :, None] * A12v[:, None, :]
+        + b[None, None, :] * A12v[:, :, None]
+        + A22v
+    )
+    B = (b[None, :] * a11[:, None] + A12v)[:, :, None] * bx[:, None, :]
+    diag_shift = (bx @ b - byc_v) * a11 - np.einsum("ij,ij->i", A12v, bx_iv - bx)
+    idx_p = np.arange(p)
+    B[:, idx_p, idx_p] += diag_shift[:, None]
+
+    try:
+        C_inv = np.linalg.inv(C)
+    except np.linalg.LinAlgError:
+        C_inv = np.array([np.linalg.pinv(C[i]) for i in range(nv)])
+
+    A = np.einsum("i,ij,ik->jk", a11, bx, bx)
+    Bt_Cinv_B = np.einsum("ijm,ijl,ilk->mk", B, C_inv, B)
+    schur = 0.5 * ((A - Bt_Cinv_B) + (A - Bt_Cinv_B).T)
+    try:
+        Covb = np.linalg.inv(schur)
+    except np.linalg.LinAlgError:
+        Covb = np.linalg.pinv(schur)
+    Covb = 0.5 * (Covb + Covb.T)
+    mineig = float(np.linalg.eigvalsh(Covb).min())
+    if mineig < 0.0:
+        Covb = Covb + (-1.001 * mineig) * np.eye(p)
+
+    if not need_omega:
+        return Covb, None
+
     W = np.column_stack([b, np.eye(p)])
-    Omega1 = np.zeros((nv * p, nv * (p + 1)))
-    Omega2 = np.zeros((p, nv * (p + 1)))
-    for i in range(nv):
-        Omega1[i * p : (i + 1) * p, i * (p + 1) : (i + 1) * (p + 1)] = W @ siginv[i]
-        V = np.column_stack([betaxIVvalid[i], np.zeros((p, p))])
-        Omega2[:, i * (p + 1) : (i + 1) * (p + 1)] = V @ siginv[i]
-    Omega3 = np.vstack([Omega1, Omega2])
-    Omega = -Info[-p:, :] @ Omega3
+    W_sig = np.einsum("jk,ikl->ijl", W, siginv)
+    Bt_Cinv_Wsig = np.einsum("imj,iml,ilk->ijk", B, C_inv, W_sig)
+    Om2 = bx_iv[:, :, None] * siginv[:, None, 0, :]
+    diff_blocks = (Bt_Cinv_Wsig - Om2).transpose(1, 0, 2).reshape(p, nv * (p + 1))
+    Omega = Covb @ diff_blocks
+    return Covb, Omega
+
+
+def cml_ma(
+    N: float,
+    betax: np.ndarray,
+    betayc: np.ndarray,
+    SIG: np.ndarray,
+    threshold: float = 1e-6,
+    maxit: int = 500,
+    verbose: bool = False,
+) -> dict:
+    """Fit MVMR-cML-MA and MVMR-cML-BIC across `k = 0 .. m - (p + 1)` invalid instruments."""
+    betax, betayc = np.asarray(betax, dtype=float), np.asarray(betayc, dtype=float)
+    SIG = np.asarray(SIG, dtype=float)
+    m, p = betax.shape
+    if m < p + 1:
+        raise ValueError(f"Need at least p + 1 = {p + 1} instruments, got {m}")
+    SIGinv = np.linalg.inv(SIG)
+    A11 = SIGinv[:, 0, 0]
+    A12 = SIGinv[:, 0, 1:]
+    A22 = SIGinv[:, 1:, 1:]
+
+    btotal, _, betaxesttotal, bic, valid = _fit_cml_path(
+        N, betax, betayc, SIGinv, A11, A12, A22, threshold=threshold, maxit=maxit, verbose=verbose
+    )
+
+    kbest = int(np.argmin(bic))
+    b_bic = btotal[:, kbest].copy()
+    validuse = valid[kbest]
+    betaxest_best = betaxesttotal[kbest]
+    Covb_bic, Omega_bic = _cov_omega_at_k(b_bic, validuse, betaxest_best, betax, betayc, SIGinv, need_omega=True)
+    se_bic = np.sqrt(np.maximum(np.diag(Covb_bic), 0.0))
+
+    # Genuine BIC Model Averaging: w_k = softmax(-0.5 * bic_k)
+    log_w = -0.5 * (bic - float(np.min(bic)))
+    ma_weights = np.exp(log_w)
+    ma_weights /= np.sum(ma_weights)
+    b_ma = btotal @ ma_weights
+
+    nk = len(bic)
+    Covb_ma = np.zeros((p, p), dtype=float)
+    se_ma = np.zeros(p, dtype=float)
+    for k in range(nk):
+        wk = float(ma_weights[k])
+        if wk <= 1e-12:
+            continue
+        Covb_k = Covb_bic if k == kbest else _cov_omega_at_k(btotal[:, k], valid[k], betaxesttotal[k], betax, betayc, SIGinv, need_omega=False)[0]
+        dk = btotal[:, k] - b_ma
+        Covb_ma += wk * (Covb_k + np.outer(dk, dk))
+        se_ma += wk * np.sqrt(np.maximum(np.diag(Covb_k), 0.0) + dk ** 2)
+
+    Covb_ma = 0.5 * (Covb_ma + Covb_ma.T)
+    pval_ma = 2.0 * stats.norm.sf(np.abs(b_ma) / np.maximum(se_ma, 1e-300))
+    pval_bic = 2.0 * stats.norm.sf(np.abs(b_bic) / np.maximum(se_bic, 1e-300))
+
     return dict(
-        b=b,
-        Covb=Covb,
-        betaxvalid=betaxvalid,
-        betaxIVvalid=betaxIVvalid,
+        b=b_ma,
+        b_ma=b_ma,
+        b_bic=b_bic,
+        se_ma=se_ma,
+        se_bic=se_bic,
+        pval_ma=pval_ma,
+        pval_bic=pval_bic,
+        Covb=Covb_ma,
+        Covb_ma=Covb_ma,
+        Covb_bic=Covb_bic,
+        ma_weights=ma_weights,
+        btotal=btotal,
+        betaxvalid=betaxest_best[validuse],
+        betaxIVvalid=betax[validuse],
         validuse=validuse,
-        Omega=Omega,
+        Omega=Omega_bic,
         bic=bic,
         k_invalid=kbest,
+    )
+
+
+def mvcml_dp(
+    N: float,
+    betax: np.ndarray,
+    betayc: np.ndarray,
+    SIG: np.ndarray,
+    num_pert: int = 100,
+    threshold: float = 1e-6,
+    maxit: int = 500,
+    seed: int | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Data-Perturbation MVMR-cML (`MVmr_cML_DP`, Lin et al., AJHG 2023).
+
+    Resamples `num_pert` perturbed summary-statistic datasets `(betayc*, betax*) ~ N((betayc, betax), SIG)`
+    to capture invalid-IV model-selection uncertainty.
+    """
+    if num_pert < 2:
+        raise ValueError("num_pert must be >= 2.")
+    betax, betayc = np.asarray(betax, dtype=float), np.asarray(betayc, dtype=float)
+    SIG = np.asarray(SIG, dtype=float)
+    m, p = betax.shape
+    if m < p + 1:
+        raise ValueError(f"Need at least p + 1 = {p + 1} instruments, got {m}")
+
+    base = cml_ma(N, betax, betayc, SIG, threshold=threshold, maxit=maxit, verbose=verbose)
+    SIGinv = np.linalg.inv(SIG)
+    A11 = SIGinv[:, 0, 0]
+    A12 = SIGinv[:, 0, 1:]
+    A22 = SIGinv[:, 1:, 1:]
+
+    # Batch square-root factors of SIG[i] for fast perturbation sampling
+    L_sig = np.empty_like(SIG)
+    for i in range(m):
+        si = 0.5 * (SIG[i] + SIG[i].T)
+        try:
+            L_sig[i] = np.linalg.cholesky(si)
+        except np.linalg.LinAlgError:
+            vals, vecs = np.linalg.eigh(si)
+            L_sig[i] = vecs * np.sqrt(np.maximum(vals, 0.0))[None, :]
+
+    rng = np.random.default_rng(seed)
+    pert_b_ma = np.empty((num_pert, p), dtype=float)
+    pert_b_bic = np.empty((num_pert, p), dtype=float)
+
+    for t in range(num_pert):
+        z = rng.standard_normal((m, p + 1, 1))
+        err = (L_sig @ z)[:, :, 0]
+        by_pt = betayc + err[:, 0]
+        bx_pt = betax + err[:, 1:]
+        bt_pt, _, _, bic_pt, _ = _fit_cml_path(
+            N, bx_pt, by_pt, SIGinv, A11, A12, A22, threshold=threshold, maxit=maxit, verbose=False
+        )
+        kb_pt = int(np.argmin(bic_pt))
+        w_pt = np.exp(-0.5 * (bic_pt - float(np.min(bic_pt))))
+        w_pt /= np.sum(w_pt)
+        pert_b_bic[t] = bt_pt[:, kb_pt]
+        pert_b_ma[t] = bt_pt @ w_pt
+
+    b_ma_dp = pert_b_ma.mean(axis=0)
+    b_bic_dp = pert_b_bic.mean(axis=0)
+    Covb_ma_dp = np.atleast_2d(np.cov(pert_b_ma, rowvar=False, ddof=1)).reshape(p, p)
+    Covb_bic_dp = np.atleast_2d(np.cov(pert_b_bic, rowvar=False, ddof=1)).reshape(p, p)
+    se_ma_dp = np.sqrt(np.maximum(np.diag(Covb_ma_dp), 1e-30))
+    se_bic_dp = np.sqrt(np.maximum(np.diag(Covb_bic_dp), 1e-30))
+    pval_ma_dp = 2.0 * stats.norm.sf(np.abs(b_ma_dp) / se_ma_dp)
+    pval_bic_dp = 2.0 * stats.norm.sf(np.abs(b_bic_dp) / se_bic_dp)
+
+    return dict(
+        b=b_ma_dp,
+        b_se=se_ma_dp,
+        Covb=Covb_ma_dp,
+        pval=pval_ma_dp,
+        b_ma_dp=b_ma_dp,
+        se_ma_dp=se_ma_dp,
+        pval_ma_dp=pval_ma_dp,
+        Covb_ma_dp=Covb_ma_dp,
+        b_bic_dp=b_bic_dp,
+        se_bic_dp=se_bic_dp,
+        pval_bic_dp=pval_bic_dp,
+        Covb_bic_dp=Covb_bic_dp,
+        b_ma=base["b_ma"],
+        b_bic=base["b_bic"],
+        se_ma=base["se_ma"],
+        se_bic=base["se_bic"],
+        bic=base["bic"],
+        ma_weights=base["ma_weights"],
+        k_invalid=base["k_invalid"],
+        validuse=base["validuse"],
+        Omega=base["Omega"],
+        pert_b_ma=pert_b_ma,
+        pert_b_bic=pert_b_bic,
     )
 
 
@@ -150,7 +328,7 @@ def make_corr(p: int, rho_yx=None, rho_xx=None) -> np.ndarray:
     return R
 
 
-def adjusted_variances(betaGX, sdGX, betaGYC, sdGYC, fit, R, iv_snp_idx, ld=None, legacy_sigma_gzh: bool = True):
+def adjusted_variances(betaGX, sdGX, betaGYC, sdGYC, fit, R, iv_snp_idx, ld=None, legacy_sigma_gzh: bool = False):
     b, Covb, Omega = fit["b"], fit["Covb"], fit["Omega"]
     S, p = betaGX.shape
     b1 = np.einsum("sj,jk,sk->s", betaGX, Covb, betaGX)
@@ -215,12 +393,15 @@ def mvcml_adjust(
     rho_yx=None,
     rho_xx=None,
     ld: np.ndarray | None = None,
-    threshold: float = 0.001,
+    threshold: float = 1e-6,
     maxit: int = 500,
-    legacy_sigma_gzh: bool = True,
+    legacy_sigma_gzh: bool = False,
+    dp: bool = False,
+    num_pert: int = 100,
+    seed: int | None = None,
     verbose: bool = False,
 ) -> dict:
-    """Estimate multivariable exposure effects via MVMR-cML and adjust conditional GWAS `betaGYC`."""
+    """Estimate multivariable exposure effects via MVMR-cML(-MA/-DP) and adjust conditional GWAS `betaGYC`."""
     betaGX_a = np.atleast_2d(np.asarray(betaGX, dtype=float).T).T if np.ndim(betaGX) == 1 else np.asarray(betaGX, dtype=float)
     sdGX_a = np.asarray(sdGX, dtype=float).reshape(betaGX_a.shape)
     betaGYC_a, sdGYC_a = np.asarray(betaGYC, dtype=float), np.asarray(sdGYC, dtype=float)
@@ -233,7 +414,10 @@ def mvcml_adjust(
     R = make_corr(p, rho_yx, rho_xx)
     D = np.concatenate([sdGYC_a[iv_idx, None], sdGX_a[iv_idx]], axis=1)
     SIG = D[:, :, None] * R[None] * D[:, None, :]
-    fit = cml_ma(N, betaGX_a[iv_idx], betaGYC_a[iv_idx], SIG, threshold=threshold, maxit=maxit, verbose=verbose)
+    if dp:
+        fit = mvcml_dp(N, betaGX_a[iv_idx], betaGYC_a[iv_idx], SIG, num_pert=num_pert, threshold=threshold, maxit=maxit, seed=seed, verbose=verbose)
+    else:
+        fit = cml_ma(N, betaGX_a[iv_idx], betaGYC_a[iv_idx], SIG, threshold=threshold, maxit=maxit, verbose=verbose)
     covb = fit["Covb"]
     ev = float(np.linalg.eigvalsh((covb + covb.T) / 2.0).min())
     if ev < 0:
@@ -241,8 +425,12 @@ def mvcml_adjust(
         fit["Covb"] = covb
     b = fit["b"]
     ybeta_adj = betaGYC_a - betaGX_a @ b
+    ld_iv = None
+    if ld is not None:
+        ld_arr = np.asarray(ld, dtype=float)
+        ld_iv = ld_arr[:, iv_idx] if ld_arr.shape == (S, S) else ld_arr
     v_simple, v_ld = adjusted_variances(
-        betaGX_a, sdGX_a, betaGYC_a, sdGYC_a, fit, R, iv_idx, None if ld is None else np.asarray(ld, dtype=float), legacy_sigma_gzh
+        betaGX_a, sdGX_a, betaGYC_a, sdGYC_a, fit, R, iv_idx, ld_iv, legacy_sigma_gzh
     )
     return dict(
         b=b,

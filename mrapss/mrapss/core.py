@@ -6,9 +6,12 @@ accounting for polygenic pleiotropy, population stratification, and sample overl
 """
 from __future__ import annotations
 
+import warnings
 import numpy as np
 from scipy import optimize, stats
 from scipy.special import logsumexp
+
+_CHI2_DF1_MEDIAN = float(stats.chi2.ppf(0.5, df=1))  # 0.454936423119572
 
 
 def estimate_background_ldsc(
@@ -32,8 +35,10 @@ def estimate_background_ldsc(
 
     def _fit_1d(y_prod, keep_mask):
         if np.std(l[keep_mask]) < 1e-6 * max(np.mean(l[keep_mask]), 1.0):
-            icpt = float(np.median(y_prod[keep_mask]))
-            return (max(icpt, 0.0) if y_prod is not prod_xy else icpt), 0.0
+            if y_prod is prod_xy:
+                return float(np.mean(y_prod[keep_mask])), 0.0
+            icpt = float(np.median(y_prod[keep_mask]) / _CHI2_DF1_MEDIAN)
+            return max(icpt, 0.0), 0.0
         w = 1.0 / l[keep_mask]
         sw = np.sqrt(w)
         X = np.column_stack([np.ones(keep_mask.sum()), l[keep_mask]]) * sw[:, None]
@@ -63,17 +68,11 @@ def estimate_background_ldsc(
     if rho_e_override is not None:
         cxy = float(rho_e_override) * np.sqrt(cx * cy)
     else:
-        null_1 = np.abs(zx) < 0.8
-        null_2 = (np.abs(zx) >= 0.8) & (np.abs(zx) < 2.0)
-        if null_1.sum() >= 100 and null_2.sum() >= 100 and abs(sxy) < 1e-3:
-            s1 = float((zx[null_1] * zy[null_1]).sum() / (zx[null_1] ** 2).sum())
-            s2 = float((zx[null_2] * zy[null_2]).sum() / (zx[null_2] ** 2).sum())
-            cxy = float(s1 - 0.25 * (s2 - s1))
-        elif (np.abs(zx) < 1.5).sum() >= 100:
-            null_x = np.abs(zx) < 1.5
-            slope_null = float((zx[null_x] * zy[null_x]).sum() / (zx[null_x] ** 2).sum())
-            if abs(cxy - slope_null) > 0.08 and abs(sxy) < 1e-3:
-                cxy = slope_null
+        if abs(sxy) < 1e-6 and (np.abs(zx) <= 2.0).sum() >= 100:
+            null_x = np.abs(zx) <= 2.0
+            denom_nx = float((zx[null_x] ** 2).sum())
+            if denom_nx > 0.0:
+                cxy = float(cx * (zx[null_x] * zy[null_x]).sum() / denom_nx)
         lim = 0.95 * np.sqrt(cx * cy)
         cxy = float(np.clip(cxy, -lim, lim))
 
@@ -99,27 +98,44 @@ def fit_mrapss(
     ldscore: np.ndarray | None = None,
     iv_p_thresh: float = 5e-5,
     rho_e: float | None = None,
+    allow_threshold_relaxation: bool = False,
     max_iter: int = 200,
     tol: float = 1e-6,
 ) -> dict:
     """Fit MR-APSS on genome-wide exposure `(xbeta, xse)` and outcome `(ybeta, yse)` summary statistics."""
     xbeta, xse, ybeta, yse = (np.asarray(v, dtype=np.float64) for v in (xbeta, xse, ybeta, yse))
     n_all = len(xbeta)
+    if n_all == 0:
+        raise ValueError("Empty summary statistics passed to fit_mrapss.")
     zx_all = xbeta / xse
     zy_all = ybeta / yse
     l_all = np.ones(n_all, dtype=np.float64) if ldscore is None else np.maximum(np.asarray(ldscore, dtype=np.float64), 1.0)
 
-    bg = estimate_background_ldsc(zx_all, zy_all, l_all, rho_e_override=rho_e)
+    bg = estimate_background_ldsc(zx_all, zy_all, None if ldscore is None else l_all, rho_e_override=rho_e)
     C, Omega = bg["C"], bg["Omega"]
 
     idx_pool = np.arange(n_all) if prune is None else np.asarray(prune, dtype=int)
+    if len(idx_pool) == 0:
+        raise ValueError("No candidate SNPs available in prune index pool.")
+
     t0 = float(stats.norm.isf(iv_p_thresh / 2.0)) if (iv_p_thresh is not None and iv_p_thresh < 1.0) else 0.0
     sel = idx_pool[np.abs(zx_all[idx_pool]) >= t0]
     if len(sel) < 6:
-        k_keep = min(max(20, len(idx_pool) // 10), len(idx_pool))
-        order = np.argsort(-np.abs(zx_all[idx_pool]))
-        sel = np.sort(idx_pool[order[:k_keep]])
-        t0 = float(np.min(np.abs(zx_all[sel]))) * 0.999 if len(sel) > 0 else 0.0
+        warnings.warn(
+            f"Only {len(sel)} instrument(s) pass iv_p_thresh={iv_p_thresh} (< 6 recommended).",
+            UserWarning,
+        )
+        if allow_threshold_relaxation:
+            k_keep = min(max(20, len(idx_pool) // 10), len(idx_pool))
+            order = np.argsort(-np.abs(zx_all[idx_pool]))
+            sel = np.sort(idx_pool[order[:k_keep]])
+            if len(sel) == 0:
+                raise ValueError("0 instruments available after threshold relaxation.")
+            t0 = float(np.min(np.abs(zx_all[sel]))) * 0.999
+        elif len(sel) == 0:
+            raise ValueError(
+                f"0 instruments pass iv_p_thresh={iv_p_thresh}; relax iv_p_thresh or set allow_threshold_relaxation=True."
+            )
 
     zx, zy = zx_all[sel], zy_all[sel]
     c = xse[sel] / yse[sel]
@@ -132,9 +148,11 @@ def fit_mrapss(
     ll_bg = _biv_norm_trunc_loglik(zx, zy, bg00, bg01, bg11, t0)
 
     sx2_init = float(np.clip(np.median(np.maximum(zx * zx - bg00, 1.0) / l_iv), 0.5, 500.0))
-    num_init = np.sum((zx * zy - bg01) * c)
-    den_init = np.sum(np.maximum(zx * zx - bg00, 0.5) * (c * c))
-    b_init = float(np.clip(num_init / max(den_init, 1e-6), -2.0, 2.0))
+    num_init = float(np.sum((zx * zy - bg01) * c))
+    den_init = float(np.sum(np.maximum(zx * zx - bg00, 0.5) * (c * c)))
+    raw_b_init = num_init / max(den_init, 1e-6)
+    b_bound = max(50.0, 10.0 * abs(raw_b_init))
+    b_init = float(np.clip(raw_b_init, -0.8 * b_bound, 0.8 * b_bound))
     res_y = zy - b_init * c * zx
     tau2_init = float(np.clip(np.median(np.maximum(res_y * res_y - bg11 - (b_init * c) ** 2 * bg00, 0.05) / l_iv), 0.01, 50.0))
 
@@ -160,6 +178,7 @@ def fit_mrapss(
         prior = 0.5 * (np.log(pi0) + np.log(1.0 - pi0)) - 0.01 * (params[2] ** 2 + params[3] ** 2)
         return -float(np.sum(ll) + prior)
 
+    full_bounds = [(-b_bound, b_bound), (-6.0, 6.0), (-5.0, 8.0), (-9.0, 6.0)]
     starts = [
         np.array([b_init, 0.5, np.log(sx2_init), np.log(tau2_init)]),
         np.array([0.0, 0.0, np.log(sx2_init), np.log(tau2_init)]),
@@ -167,13 +186,44 @@ def fit_mrapss(
     ]
     best_sol = min(
         (
-            optimize.minimize(_neg_obj, x0, method="L-BFGS-B", bounds=[(-5.0, 5.0), (-6.0, 6.0), (-5.0, 8.0), (-9.0, 6.0)], options={"maxiter": max_iter, "ftol": tol})
+            optimize.minimize(_neg_obj, x0, method="L-BFGS-B", bounds=full_bounds, options={"maxiter": max_iter, "ftol": tol})
             for x0 in starts
         ),
         key=lambda s: s.fun,
     )
+
+    # Profile null model (b = 0 fixed) for exact Likelihood Ratio Test (Hu et al. 2022)
+    null_bounds = full_bounds[1:]
+    null_starts = [
+        best_sol.x[1:].copy(),
+        np.array([0.0, np.log(sx2_init), np.log(tau2_init)]),
+    ]
+    best_null = min(
+        (
+            optimize.minimize(
+                lambda u: _neg_obj(np.array([0.0, u[0], u[1], u[2]])),
+                u0,
+                method="L-BFGS-B",
+                bounds=null_bounds,
+                options={"maxiter": max_iter, "ftol": tol},
+            )
+            for u0 in null_starts
+        ),
+        key=lambda s: s.fun,
+    )
+    p_null = np.array([0.0, best_null.x[0], best_null.x[1], best_null.x[2]])
+    if best_null.fun < best_sol.fun:
+        polished = optimize.minimize(_neg_obj, p_null, method="L-BFGS-B", bounds=full_bounds, options={"maxiter": max_iter, "ftol": tol})
+        if polished.fun < best_sol.fun:
+            best_sol = polished
+
     p_hat = best_sol.x
     b_hat, pi0_hat, sx2_hat, tau2_hat = _unpack(p_hat)
+
+    ll_full = float(np.sum(_per_snp_loglik(p_hat)))
+    ll_null = float(np.sum(_per_snp_loglik(p_null)))
+    lrt_stat = max(0.0, 2.0 * (ll_full - ll_null))
+    p_lrt = float(stats.chi2.sf(lrt_stat, df=1))
 
     eps = 1e-4
     k_dim = len(p_hat)
@@ -183,19 +233,30 @@ def fit_mrapss(
         dp[d] = eps
         scores[:, d] = (_per_snp_loglik(p_hat + dp) - _per_snp_loglik(p_hat - dp)) / (2.0 * eps)
 
-    H = np.zeros((k_dim, k_dim), dtype=np.float64)
+    I_obs = np.zeros((k_dim, k_dim), dtype=np.float64)
+    f0 = _neg_obj(p_hat)
     for i in range(k_dim):
-        for j in range(i, k_dim):
-            ei, ej = np.zeros(k_dim), np.zeros(k_dim)
-            ei[i], ej[j] = eps, eps
-            H[i, j] = H[j, i] = (-_neg_obj(p_hat + ei + ej) + _neg_obj(p_hat + ei - ej) + _neg_obj(p_hat - ei + ej) - (-_neg_obj(p_hat - ei - ej))) / (4.0 * eps * eps)
+        ei = np.zeros(k_dim)
+        ei[i] = eps
+        I_obs[i, i] = (_neg_obj(p_hat + ei) - 2.0 * f0 + _neg_obj(p_hat - ei)) / (eps * eps)
+        for j in range(i + 1, k_dim):
+            ej = np.zeros(k_dim)
+            ej[j] = eps
+            I_obs[i, j] = I_obs[j, i] = (
+                _neg_obj(p_hat + ei + ej)
+                - _neg_obj(p_hat + ei - ej)
+                - _neg_obj(p_hat - ei + ej)
+                + _neg_obj(p_hat - ei - ej)
+            ) / (4.0 * eps * eps)
 
     J = scores.T @ scores
-    I_obs = -H + 1e-4 * np.eye(k_dim)
+    eig_min = float(np.linalg.eigvalsh(0.5 * (I_obs + I_obs.T)).min())
+    reg = max(1e-4, -eig_min + 1e-4) if eig_min <= 0.0 else 1e-4
+    I_reg = 0.5 * (I_obs + I_obs.T) + reg * np.eye(k_dim)
     try:
-        inv_I = np.linalg.inv(I_obs)
+        inv_I = np.linalg.inv(I_reg)
         V_sand = inv_I @ J @ inv_I.T
-        se_sand = float(np.sqrt(max(V_sand[0, 0], 1.0 / max(I_obs[0, 0], 1e-6))))
+        se_sand = float(np.sqrt(max(V_sand[0, 0], 1.0 / max(I_reg[0, 0], 1e-6))))
     except np.linalg.LinAlgError:
         se_sand = float(1.0 / np.sqrt(max(J[0, 0], 1e-6)))
 
@@ -205,6 +266,9 @@ def fit_mrapss(
         b=b_hat,
         b_se=se_sand,
         pval=pval,
+        p=pval,
+        p_lrt=p_lrt,
+        lrt_stat=lrt_stat,
         b_ci=[b_hat - z975 * se_sand, b_hat + z975 * se_sand],
         n_snps_used=m_iv,
         pi0=pi0_hat,
