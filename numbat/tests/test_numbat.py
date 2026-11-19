@@ -20,6 +20,8 @@ import numbat
 import numbat.hmm as hmm_mod
 import numbat.io as io_mod
 from numbat import (
+    DEFAULT_STATES,
+    S15_STATES,
     CloneAssignment,
     HMMResult,
     NumbatConfig,
@@ -35,6 +37,7 @@ from numbat import (
     phase_switch_prob,
     pln_logpmf,
     reconstruct_phylogeny,
+    retest_bulks,
     run_joint_hmm,
     run_numbat,
     score_single_cells,
@@ -905,4 +908,124 @@ def test_canonical_chromosome_ordering_and_mixed_naming() -> None:
     s_c2, e_c2 = int(loci.chrom_offsets[1]), int(loci.chrom_offsets[2])
     assert list(loci.pos[s_c2:e_c2]) == [100, 200, 300]
     assert list(loci.chrom[s_c2:e_c2]) == ["chr2", "chr2", "chr2"]
+
+
+def test_settings_validation_and_s15_state_catalog_parity() -> None:
+    """
+    Verify strict `settings` validation, 15-state `s15` catalog (`S15_STATES`),
+    and Numba/NumPy HMM parity under `settings="R_default"`.
+    """
+    assert len(DEFAULT_STATES) == 11
+    assert len(S15_STATES) == 15
+    assert len(NumbatConfig(settings="default").states) == 11
+    assert len(NumbatConfig(settings="R_default").states) == 15
+
+    collapsed_counts = pd.Series([s.collapsed for s in S15_STATES]).value_counts().to_dict()
+    assert collapsed_counts == {
+        "del": 4,
+        "loh": 4,
+        "amp": 4,
+        "neu": 1,
+        "bamp": 1,
+        "bdel": 1,
+    }
+    bdel_spec = [s for s in S15_STATES if s.collapsed == "bdel"][0]
+    assert bdel_spec.phi < 1.0 and bdel_spec.mu == pytest.approx(0.50)
+
+    with pytest.raises(ValueError, match="settings"):
+        NumbatConfig(settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        run_joint_hmm(np.zeros((5, 11)), [0, 5], settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        fit_allele_hmm([5.0], [10.0], settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        fit_expression_hmm([10.0], [1.0], settings="bad")  # type: ignore[arg-type]
+
+    rng = np.random.default_rng(1515)
+    adata_tiny, allele_tiny, _, _ = _simulate_cohort(
+        rng, n_ref=6, n_unlabeled_normal=4, clone_specs=[], n_genes_per_chrom=10, n_snps_per_chrom=10, chroms=("chr1",)
+    )
+    with pytest.raises(ValueError, match="settings"):
+        run_numbat(adata_tiny, allele_df=allele_tiny, ref_cells="is_ref", settings="bad")  # type: ignore[arg-type]
+
+    emit_15 = rng.normal(-3.0, 1.0, size=(80, 15))
+    offsets = [0, 40, 80]
+    ps = np.asarray(phase_switch_prob(rng.uniform(0.0, 5.0, size=80), nu=1.0))
+    ps[0] = 0.0
+    ps[40] = 0.0
+    res_np = run_joint_hmm(emit_15, offsets, p_switch=ps, backend="numpy", settings="R_default")
+    assert res_np.posteriors.shape == (80, 15)
+    if has_numba():
+        res_nb = run_joint_hmm(emit_15, offsets, p_switch=ps, backend="numba", settings="R_default")
+        np.testing.assert_allclose(res_nb.posteriors, res_np.posteriors, rtol=1e-12, atol=1e-12)
+        np.testing.assert_array_equal(res_nb.viterbi_states, res_np.viterbi_states)
+
+
+def test_r_default_s15_continuous_mle_and_retest_bulks_end_to_end() -> None:
+    """
+    Verify `run_numbat(..., settings="R_default")` recovers clonal LOH, homozygous
+    deletion (`bdel`), high-level amplification with continuous `phi_mle` refinement,
+    subclonal deletion, and zero false positives on pure diploid data.
+    """
+    rng = np.random.default_rng(2026)
+    adata, allele_df, true_comp, _ = _simulate_cohort(
+        rng,
+        n_ref=35,
+        n_unlabeled_normal=25,
+        clone_specs=[
+            (
+                30,
+                {
+                    "chr3": ("loh", 1.00, 0.85),   # clonal CN-neutral LOH across both clones
+                    "chr7": ("amp", 3.10, 0.78),   # high-level amp (> discrete 2.25)
+                    "chr10": ("bdel", 0.18, 0.50), # homozygous deletion 00
+                },
+            ),
+            (
+                30,
+                {
+                    "chr3": ("loh", 1.00, 0.85),   # shared clonal LOH
+                    "chr7": ("amp", 3.10, 0.78),
+                    "chr10": ("bdel", 0.18, 0.50),
+                    "chr1": ("del", 0.50, 0.90),   # subclonal mono-allelic deletion
+                },
+            ),
+        ],
+        n_genes_per_chrom=35,
+        n_snps_per_chrom=30,
+        chroms=("chr1", "chr3", "chr7", "chr10"),
+        mean_snp_dp=10.0,
+    )
+
+    res_r = run_numbat(adata, allele_df=allele_df, ref_cells="is_ref", init_k=3, settings="R_default")
+    assert res_r.config.settings == "R_default"
+    assert len(res_r.config.states) == 15
+    assert callable(retest_bulks)
+
+    by_chrom = {s.chrom: s for s in res_r.segments}
+    assert by_chrom["chr3"].cnv_state == "loh"
+    assert by_chrom["chr10"].cnv_state == "bdel"
+    assert by_chrom["chr10"].phi_mle < 0.40
+    assert by_chrom["chr7"].cnv_state == "amp"
+    # Continuous MLE refinement captures >2.25 fold change on chr7
+    assert by_chrom["chr7"].phi_state > 2.25
+    assert by_chrom["chr1"].cnv_state == "del"
+
+    unlabeled = ~adata.obs["is_ref"].to_numpy(dtype=bool)
+    auc_r = roc_auc_score((true_comp[unlabeled] == "tumor").astype(int), res_r.clones.p_cnv[unlabeled])
+    assert auc_r >= 0.98
+
+    # Null calibration under settings="R_default"
+    adata_null, allele_null, _, _ = _simulate_cohort(
+        np.random.default_rng(2027),
+        n_ref=25,
+        n_unlabeled_normal=35,
+        clone_specs=[],
+        n_genes_per_chrom=30,
+        n_snps_per_chrom=25,
+        chroms=("chr1", "chr2"),
+    )
+    res_null_r = run_numbat(adata_null, allele_df=allele_null, ref_cells="is_ref", settings="R_default")
+    assert len(res_null_r.segments) == 0
+
 

@@ -133,6 +133,34 @@ def _canonical_state_params(
     return float(spec.phi), float(abs(spec.mu - 0.5))
 
 
+def _continuous_state_params(
+    cnv_state: str,
+    phi_mle: float,
+    theta_mle: float,
+    has_expr: bool = True,
+    has_allele: bool = True,
+) -> tuple[float, float]:
+    """Refine continuous (phi_state, theta_state) from segment MLEs within state domain."""
+    if cnv_state == "bdel":
+        phi_eff = float(np.clip(phi_mle, 0.05, 0.38)) if has_expr else 0.20
+        return phi_eff, 0.0
+    if cnv_state == "del":
+        phi_eff = float(np.clip(phi_mle, 0.25, 0.85)) if has_expr else 0.50
+        theta_eff = float(np.clip(theta_mle, 0.08, 0.48)) if has_allele else 0.0
+        return phi_eff, theta_eff
+    if cnv_state == "loh":
+        theta_eff = float(np.clip(theta_mle, 0.08, 0.48)) if has_allele else 0.40
+        return 1.0, theta_eff
+    if cnv_state == "amp":
+        phi_eff = float(np.clip(phi_mle, 1.15, 5.0)) if has_expr else 1.50
+        theta_eff = float(np.clip(theta_mle, 0.08, 0.48)) if has_allele else 0.0
+        return phi_eff, theta_eff
+    if cnv_state == "bamp":
+        phi_eff = float(np.clip(phi_mle, 1.30, 5.0)) if has_expr else 2.00
+        return phi_eff, 0.0
+    return 1.0, 0.0
+
+
 def extract_segments(
     hmm_result: HMMResult,
     loci: OrderedLoci,
@@ -251,7 +279,10 @@ def extract_segments(
 
             opt_phi = minimize_scalar(_neg_ll_phi, bounds=(0.1, 5.0), method="bounded")
             phi_mle = float(opt_phi.x)
-            llr_x = ll_x_state - ll_x_neu
+            if config.settings == "R_default":
+                llr_x = max(ll_x_state - ll_x_neu, -float(opt_phi.fun) - ll_x_neu)
+            else:
+                llr_x = ll_x_state - ll_x_neu
         else:
             phi_mle = phi_state
             llr_x = 0.0
@@ -272,7 +303,10 @@ def extract_segments(
 
                 opt_theta = minimize_scalar(_neg_ll_theta, bounds=(0.0, 0.495), method="bounded")
                 theta_mle = float(opt_theta.x)
-                llr_y = ll_y_state - ll_y_neu
+                if config.settings == "R_default":
+                    llr_y = max(ll_y_state - ll_y_neu, -float(opt_theta.fun) - ll_y_neu)
+                else:
+                    llr_y = ll_y_state - ll_y_neu
             else:
                 theta_mle = theta_state
                 llr_y = 0.0
@@ -280,13 +314,29 @@ def extract_segments(
             theta_mle = theta_state
             llr_y = 0.0
 
+        if config.settings == "R_default":
+            state_eff = cnv_state_post
+            phi_state, theta_state = _continuous_state_params(
+                state_eff,
+                phi_mle,
+                theta_mle,
+                has_expr=(n_genes > 0),
+                has_allele=(
+                    n_snps > 0
+                    and bulk_dp is not None
+                    and float(np.sum(bulk_dp[loci.snp_index[s_idx:e_idx][snp_mask]])) > 0.0
+                ),
+            )
+        else:
+            state_eff = state
+
         log_bf = config.w_expr * llr_x + config.w_allele * llr_y
         if log_bf < config.min_log_bf:
             continue
 
         seg_num = seg_counter_per_chrom.get(chrom, 0) + 1
         seg_counter_per_chrom[chrom] = seg_num
-        seg_id = f"{chrom}_{seg_num}_{state}"
+        seg_id = f"{chrom}_{seg_num}_{state_eff}"
 
         calls.append(
             SegmentCall(
@@ -296,7 +346,7 @@ def extract_segments(
                 end=int(loci.end[e_idx - 1]),
                 n_genes=n_genes,
                 n_snps=n_snps,
-                cnv_state=state,
+                cnv_state=state_eff,
                 cnv_state_post=cnv_state_post,
                 phi_mle=phi_mle,
                 theta_mle=theta_mle,
@@ -316,6 +366,339 @@ def extract_segments(
         )
 
     return tuple(calls)
+
+
+def retest_bulks(
+    candidates: Sequence[SegmentCall],
+    pseudobulks: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]],
+    loci: OrderedLoci,
+    sigma_g: np.ndarray,
+    p_switch: np.ndarray,
+    config: NumbatConfig,
+) -> tuple[SegmentCall, ...]:
+    """
+    Re-evaluate consensus CNV intervals across all pseudobulks (`retest_bulks` in
+    `kharchenkolab/numbat` v1.5.2) to compute exact per-segment continuous MLEs
+    `(phi_mle, theta_mle)`, Bayesian state posteriors, log-likelihood ratios (`log_bf`),
+    and detect clonal CN-neutral LOH across pooled pseudobulks.
+    """
+    if not pseudobulks or loci.n_loci == 0:
+        return ()
+
+    # 1. Deduplicate candidate intervals into disjoint consensus intervals
+    ordered_cands = sorted(candidates, key=lambda s: (-s.log_bf, s.chrom, s.start_locus))
+    intervals: list[tuple[str, int, int]] = []
+    for cand in ordered_cands:
+        cand_len = max(1, cand.end_locus - cand.start_locus)
+        overlaps = False
+        for ex_chrom, ex_s, ex_e in intervals:
+            if ex_chrom != cand.chrom:
+                continue
+            ov = min(cand.end_locus, ex_e) - max(cand.start_locus, ex_s)
+            if ov > 0 and ov / float(min(cand_len, max(1, ex_e - ex_s))) >= 0.3:
+                overlaps = True
+                break
+        if not overlaps:
+            intervals.append((cand.chrom, int(cand.start_locus), int(cand.end_locus)))
+
+    # 2. Scan unsegmented chromosomes on the primary pooled pseudobulk for clonal LOH
+    bulk0_counts, bulk0_mu, bulk0_ad, bulk0_dp = pseudobulks[0]
+    if bulk0_ad is not None and bulk0_dp is not None and config.w_allele > 0.0:
+        for c_i in range(len(loci.chrom_offsets) - 1):
+            cs = int(loci.chrom_offsets[c_i])
+            ce = int(loci.chrom_offsets[c_i + 1])
+            if ce - cs < config.min_loci:
+                continue
+            c_name = str(loci.chrom[cs])
+            already_cov = any(
+                ic == c_name
+                and (min(ce, ie) - max(cs, is_)) / float(max(1, ce - cs)) >= 0.3
+                for ic, is_, ie in intervals
+            )
+            if already_cov:
+                continue
+            s_mask = loci.has_allele[cs:ce]
+            n_snps_c = int(np.sum(s_mask))
+            if n_snps_c < config.min_loci:
+                continue
+            s_indices = loci.snp_index[cs:ce][s_mask]
+            ad_c = bulk0_ad[s_indices]
+            dp_c = bulk0_dp[s_indices]
+            if float(np.sum(dp_c)) <= 0.0:
+                continue
+            ps_c = p_switch[cs:ce][s_mask].copy()
+            ps_c[0] = 0.0
+            ll_y0 = float(np.sum(beta_binomial_logpmf(ad_c, dp_c, 0.5, config.gamma)))
+            opt_th = minimize_scalar(
+                lambda th: -phase_hmm_loglik(ad_c, dp_c, ps_c, float(th), config.gamma),
+                bounds=(0.0, 0.495),
+                method="bounded",
+            )
+            th_c = float(opt_th.x)
+            llr_yc = config.w_allele * (-float(opt_th.fun) - ll_y0)
+            if th_c >= 0.12 and llr_yc >= max(config.min_log_bf, 8.0):
+                intervals.append((c_name, cs, ce))
+
+    if not intervals:
+        return ()
+
+    intervals.sort(key=lambda item: (item[1], item[2]))
+    states = config.states
+    assert states is not None
+    collapsed_idx = {name: i for i, name in enumerate(COLLAPSED_STATES)}
+    non_neu_states = ("amp", "del", "loh", "bamp", "bdel")
+
+    # Precompute segment state prior log-weights matching config.seg_prior
+    subclasses = list(dict.fromkeys(s.subclass for s in states))
+    sub_counts = {sub: sum(1 for s in states if s.subclass == sub) for sub in subclasses}
+    n_non_neu_sub = max(1, sum(1 for sub in subclasses if sub != "neu"))
+    prior_vec = np.array(
+        [
+            (1.0 - config.seg_prior) / sub_counts[s.subclass]
+            if s.subclass == "neu"
+            else config.seg_prior / (n_non_neu_sub * sub_counts[s.subclass])
+            for s in states
+        ],
+        dtype=np.float64,
+    )
+    prior_vec /= np.sum(prior_vec)
+    log_prior = np.log(np.maximum(prior_vec, 1e-300))
+
+    unique_phis = sorted({float(s.phi) for s in states})
+    unique_thetas = sorted({round(abs(float(s.mu) - 0.5), 8) for s in states})
+
+    per_chrom_num: dict[str, int] = {}
+    final_calls: list[SegmentCall] = []
+
+    for chrom, s_idx, e_idx in intervals:
+        gene_mask = loci.has_expr[s_idx:e_idx]
+        snp_mask = loci.has_allele[s_idx:e_idx]
+        n_genes = int(np.sum(gene_mask))
+        n_snps = int(np.sum(snp_mask))
+        if n_genes + n_snps < config.min_loci:
+            continue
+
+        g_indices = loci.gene_index[s_idx:e_idx][gene_mask]
+        snp_indices = loci.snp_index[s_idx:e_idx][snp_mask]
+        ps_seg = p_switch[s_idx:e_idx][snp_mask].copy()
+        if ps_seg.size > 0:
+            ps_seg[0] = 0.0
+
+        best_bulk_score = -math.inf
+        best_record: dict[str, object] | None = None
+
+        for b_counts, b_mu, b_ad, b_dp in pseudobulks:
+            has_valid_expr = (
+                n_genes > 0
+                and config.w_expr > 0.0
+                and np.any(np.isfinite(b_mu[g_indices]))
+            )
+            if has_valid_expr:
+                xg = b_counts[g_indices]
+                mug = b_mu[g_indices]
+                sg = sigma_g[g_indices]
+                if config.expr_model == "pln":
+                    phi_cache = {
+                        p_v: float(
+                            np.sum(
+                                pln_logpmf(
+                                    xg,
+                                    mug + math.log(p_v),
+                                    sg,
+                                    n_quadrature=config.n_quadrature,
+                                )
+                            )
+                        )
+                        for p_v in unique_phis
+                    }
+                    ll_x_neu = phi_cache.get(
+                        1.0,
+                        float(
+                            np.sum(pln_logpmf(xg, mug, sg, n_quadrature=config.n_quadrature))
+                        ),
+                    )
+                    opt_p = minimize_scalar(
+                        lambda pv: -float(
+                            np.sum(
+                                pln_logpmf(
+                                    xg,
+                                    mug + math.log(float(pv)),
+                                    sg,
+                                    n_quadrature=config.n_quadrature,
+                                )
+                            )
+                        ),
+                        bounds=(0.05, 5.0),
+                        method="bounded",
+                    )
+                else:
+                    phi_cache = {
+                        p_v: float(np.sum(gaussian_logratio_logpdf(xg, p_v, sg)))
+                        for p_v in unique_phis
+                    }
+                    ll_x_neu = phi_cache.get(
+                        1.0, float(np.sum(gaussian_logratio_logpdf(xg, 1.0, sg)))
+                    )
+                    opt_p = minimize_scalar(
+                        lambda pv: -float(np.sum(gaussian_logratio_logpdf(xg, float(pv), sg))),
+                        bounds=(0.05, 5.0),
+                        method="bounded",
+                    )
+                phi_mle_b = float(opt_p.x)
+                llr_x_mle = max(0.0, -float(opt_p.fun) - ll_x_neu)
+            else:
+                phi_cache = {p_v: 0.0 for p_v in unique_phis}
+                ll_x_neu = 0.0
+                phi_mle_b = 1.0
+                llr_x_mle = 0.0
+
+            has_valid_allele = (
+                n_snps > 0
+                and config.w_allele > 0.0
+                and b_ad is not None
+                and b_dp is not None
+                and float(np.sum(b_dp[snp_indices])) > 0.0
+            )
+            if has_valid_allele:
+                assert b_ad is not None and b_dp is not None
+                ad_s = b_ad[snp_indices]
+                dp_s = b_dp[snp_indices]
+                theta_cache = {
+                    th_v: (
+                        float(np.sum(beta_binomial_logpmf(ad_s, dp_s, 0.5, config.gamma)))
+                        if th_v <= 0.0
+                        else phase_hmm_loglik(ad_s, dp_s, ps_seg, th_v, config.gamma)
+                    )
+                    for th_v in unique_thetas
+                }
+                ll_y_neu = theta_cache.get(
+                    0.0,
+                    float(np.sum(beta_binomial_logpmf(ad_s, dp_s, 0.5, config.gamma))),
+                )
+                opt_t = minimize_scalar(
+                    lambda tv: -phase_hmm_loglik(ad_s, dp_s, ps_seg, float(tv), config.gamma),
+                    bounds=(0.0, 0.495),
+                    method="bounded",
+                )
+                theta_mle_b = float(opt_t.x)
+                llr_y_mle = max(0.0, -float(opt_t.fun) - ll_y_neu)
+            else:
+                theta_cache = {th_v: 0.0 for th_v in unique_thetas}
+                ll_y_neu = 0.0
+                theta_mle_b = 0.0
+                llr_y_mle = 0.0
+
+            ll_states = np.array(
+                [
+                    config.w_expr * phi_cache[float(st.phi)]
+                    + config.w_allele * theta_cache[round(abs(float(st.mu) - 0.5), 8)]
+                    for st in states
+                ],
+                dtype=np.float64,
+            )
+            ll_neu_tot = config.w_expr * ll_x_neu + config.w_allele * ll_y_neu
+            non_neu_mask = np.array([st.collapsed != "neu" for st in states], dtype=bool)
+            best_state_llr = float(np.max(ll_states[non_neu_mask]) - ll_neu_tot)
+
+            log_post_k = log_prior + ll_states
+            m_lp = float(np.max(log_post_k))
+            post_k = np.exp(log_post_k - m_lp)
+            post_k /= float(np.sum(post_k))
+
+            col_post = np.zeros(len(COLLAPSED_STATES), dtype=np.float64)
+            for k_i, st in enumerate(states):
+                col_post[collapsed_idx[st.collapsed]] += post_k[k_i]
+
+            llr_cont = config.w_expr * llr_x_mle + config.w_allele * llr_y_mle
+            if best_state_llr > best_bulk_score:
+                best_bulk_score = best_state_llr
+                best_record = {
+                    "col_post": col_post,
+                    "phi_mle": phi_mle_b,
+                    "theta_mle": theta_mle_b,
+                    "best_state_llr": best_state_llr,
+                    "llr_cont": max(best_state_llr, llr_cont),
+                    "has_expr": has_valid_expr,
+                    "has_allele": has_valid_allele,
+                }
+
+        if best_record is None:
+            continue
+
+        col_post_arr = np.asarray(best_record["col_post"], dtype=np.float64)
+        p_neu = float(col_post_arr[collapsed_idx["neu"]])
+        p_amp = float(col_post_arr[collapsed_idx["amp"]])
+        p_del = float(col_post_arr[collapsed_idx["del"]])
+        p_loh = float(col_post_arr[collapsed_idx["loh"]])
+        p_bamp = float(col_post_arr[collapsed_idx["bamp"]])
+        p_bdel = float(col_post_arr[collapsed_idx["bdel"]])
+
+        if (1.0 - p_neu) < config.min_seg_prob:
+            continue
+
+        entropy = float(-np.sum(col_post_arr * np.log(np.maximum(col_post_arr, 1e-12))))
+        if n_snps == 0:
+            expr_regimes = np.array(
+                [p_neu + p_loh, p_del, p_amp + p_bamp, p_bdel], dtype=np.float64
+            )
+            eff_entropy = float(
+                -np.sum(expr_regimes * np.log(np.maximum(expr_regimes, 1e-12)))
+            )
+        else:
+            eff_entropy = entropy
+        if eff_entropy > config.max_entropy:
+            continue
+
+        best_state_llr_val = float(best_record["best_state_llr"])  # type: ignore[arg-type]
+        if best_state_llr_val < config.min_log_bf:
+            continue
+
+        cnv_state_post = max(
+            non_neu_states,
+            key=lambda st: float(col_post_arr[collapsed_idx[st]]),
+        )
+        phi_mle_val = float(best_record["phi_mle"])  # type: ignore[arg-type]
+        theta_mle_val = float(best_record["theta_mle"])  # type: ignore[arg-type]
+        phi_state, theta_state = _continuous_state_params(
+            cnv_state_post,
+            phi_mle_val,
+            theta_mle_val,
+            has_expr=bool(best_record["has_expr"]),
+            has_allele=bool(best_record["has_allele"]),
+        )
+        log_bf_val = float(best_record["llr_cont"])  # type: ignore[arg-type]
+
+        seg_num = per_chrom_num.get(chrom, 0) + 1
+        per_chrom_num[chrom] = seg_num
+        seg_id = f"{chrom}_{seg_num}_{cnv_state_post}"
+        final_calls.append(
+            SegmentCall(
+                seg_id=seg_id,
+                chrom=chrom,
+                start=int(loci.start[s_idx]),
+                end=int(loci.end[e_idx - 1]),
+                n_genes=n_genes,
+                n_snps=n_snps,
+                cnv_state=cnv_state_post,
+                cnv_state_post=cnv_state_post,
+                phi_mle=phi_mle_val,
+                theta_mle=theta_mle_val,
+                p_neu=p_neu,
+                p_amp=p_amp,
+                p_del=p_del,
+                p_loh=p_loh,
+                p_bamp=p_bamp,
+                p_bdel=p_bdel,
+                entropy=entropy,
+                log_bf=log_bf_val,
+                start_locus=int(s_idx),
+                end_locus=int(e_idx),
+                phi_state=phi_state,
+                theta_state=theta_state,
+            )
+        )
+
+    return tuple(final_calls)
 
 
 def score_single_cells(

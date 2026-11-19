@@ -6,6 +6,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 COLLAPSED_STATES: tuple[str, ...] = ("neu", "amp", "del", "loh", "bamp", "bdel")
+SettingsType = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsType:
+    """Validate `settings` mode strictly ('default' or 'R_default')."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"`settings` must be 'default' or 'R_default', got {settings!r}."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,36 @@ DEFAULT_STATES: tuple[CNVStateSpec, ...] = (
     CNVStateSpec(name="bdel", collapsed="bdel", subclass="bdel", orientation=0, mu=0.50, phi=0.15),
 )
 
+# Exact 15-state catalog matching kharchenkolab/numbat v1.5.2 (hahmmr::run_joint_hmm_s15):
+# 3 balanced unphased states (neu, bamp, bdel [00, phi < 1]) + 6 mirrored phased pairs
+# covering clonal/subclonal mono-allelic deletions, clonal/subclonal CN-neutral LOH,
+# and single/multi-level unbalanced amplifications.
+S15_STATES: tuple[CNVStateSpec, ...] = (
+    CNVStateSpec(name="neu", collapsed="neu", subclass="neu", orientation=0, mu=0.50, phi=1.00),
+    CNVStateSpec(name="bamp", collapsed="bamp", subclass="bamp", orientation=0, mu=0.50, phi=2.00),
+    CNVStateSpec(name="bdel", collapsed="bdel", subclass="bdel", orientation=0, mu=0.50, phi=0.20),
+    CNVStateSpec(name="del_1_p", collapsed="del", subclass="del_1", orientation=1, mu=0.90, phi=0.50),
+    CNVStateSpec(name="del_1_m", collapsed="del", subclass="del_1", orientation=-1, mu=0.10, phi=0.50),
+    CNVStateSpec(
+        name="del_2_p", collapsed="del", subclass="del_2", orientation=1, mu=2.0 / 3.0, phi=0.75
+    ),
+    CNVStateSpec(
+        name="del_2_m", collapsed="del", subclass="del_2", orientation=-1, mu=1.0 / 3.0, phi=0.75
+    ),
+    CNVStateSpec(name="loh_1_p", collapsed="loh", subclass="loh_1", orientation=1, mu=0.90, phi=1.00),
+    CNVStateSpec(name="loh_1_m", collapsed="loh", subclass="loh_1", orientation=-1, mu=0.10, phi=1.00),
+    CNVStateSpec(name="loh_2_p", collapsed="loh", subclass="loh_2", orientation=1, mu=0.75, phi=1.00),
+    CNVStateSpec(name="loh_2_m", collapsed="loh", subclass="loh_2", orientation=-1, mu=0.25, phi=1.00),
+    CNVStateSpec(
+        name="amp_1_p", collapsed="amp", subclass="amp_1", orientation=1, mu=2.0 / 3.0, phi=1.50
+    ),
+    CNVStateSpec(
+        name="amp_1_m", collapsed="amp", subclass="amp_1", orientation=-1, mu=1.0 / 3.0, phi=1.50
+    ),
+    CNVStateSpec(name="amp_2_p", collapsed="amp", subclass="amp_2", orientation=1, mu=0.75, phi=2.25),
+    CNVStateSpec(name="amp_2_m", collapsed="amp", subclass="amp_2", orientation=-1, mu=0.25, phi=2.25),
+)
+
 
 @dataclass(frozen=True)
 class NumbatConfig:
@@ -80,9 +120,19 @@ class NumbatConfig:
     sigma_max: float = 2.5
     default_sigma: float = 0.4
     backend: Literal["auto", "numba", "numpy"] = "auto"
-    states: tuple[CNVStateSpec, ...] = DEFAULT_STATES
+    states: tuple[CNVStateSpec, ...] | None = None
+    settings: SettingsType = "default"
 
     def __post_init__(self) -> None:
+        validate_settings(self.settings)
+        if self.states is None:
+            object.__setattr__(
+                self,
+                "states",
+                S15_STATES if self.settings == "R_default" else DEFAULT_STATES,
+            )
+        else:
+            object.__setattr__(self, "states", tuple(self.states))
         if not (0.0 < self.t_cnv < 0.5):
             raise ValueError(f"t_cnv must be in (0, 0.5), got {self.t_cnv}.")
         if self.gamma <= 0.0:

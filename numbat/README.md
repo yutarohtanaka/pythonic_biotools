@@ -6,45 +6,29 @@ Standalone Python implementation of **Numbat** (Gao et al., *Nature Biotechnolog
 
 > Gao, T., Soldatov, R., Sarkar, H., Kurkiewicz, A., Biederstedt, E., Loh, P.-R., & Kharchenko, P. V. "Haplotype-aware analysis of somatic copy number variations from single-cell transcriptomes." *Nature Biotechnology* 41, 417–426 (2023). https://doi.org/10.1038/s41587-022-01468-y
 
-## Mathematical & Algorithmic Overview
+## `settings` Modes (`"default"` vs `"R_default"`)
 
-1. **Beta-Binomial Phased Allele Model**:
-   Heterozygous phased SNP counts $(Y_t, N_t)$ follow a Beta-Binomial distribution $\text{BB}(Y_t; N_t, \gamma \mu_k, \gamma(1 - \mu_k))$ across an 11-state phased CNV space (`neu`, `del_p/m`, `amp_p/m`, `amp2_p/m`, `loh_p/m`, `bamp`, `bdel`) collapsing onto 6 biological states (`neu`, `amp`, `del`, `loh`, `bamp`, `bdel`).
-2. **Haldane Haplotype Phase-Switch Transitions**:
-   Population phasing switch errors along genetic distance $d_t$ (in cM) follow Haldane's mapping function:
-   $$p_s(t) = \frac{1 - \exp(-2 \nu d_t)}{2}$$
-   allowing symmetric mirrored haplotype states (`+1`/`-1`) to flip seamlessly inside continuous CNV segments while resetting state priors at chromosome boundaries.
-3. **Poisson-LogNormal (PLN) Expression Model**:
-   Gene UMI counts $X_{c,g}$ are modeled via $Q$-point Gauss-Hermite quadrature in log-space:
-   $$X_{c,g} \mid z \sim \text{Poisson}\!\left(\exp(\log(L_c \lambda_g^{\text{ref}}) + \delta_c + \log \phi_k + \sigma_g z)\right), \quad z \sim \mathcal{N}(0, 1).$$
-4. **Haplotype-Aware HMM (`numba` + NumPy Parity)**:
-   Log-space Forward-Backward and Viterbi algorithms execute identically via optional `@numba.njit` acceleration (`backend="numba"`) or pure vectorized NumPy/SciPy (`backend="numpy"`).
-5. **Single-Cell Scoring & NJ + NNI ML Phylogeny**:
-   Per-cell segment Bayes factors (`p_cnv_x`, `p_cnv_y`, `p_cnv`) feed into Neighbor-Joining initialization (rooted at a diploid outgroup), $O(C \cdot M)$ post-order infinite-sites branch likelihood scoring, steepest-ascent Nearest-Neighbor Interchange (NNI) refinement, and EM subclonal posterior assignment.
+`run_numbat`, `run_joint_hmm`, `fit_allele_hmm`, `fit_expression_hmm`, and `NumbatConfig` accept `settings: Literal["default", "R_default"] = "default"`:
 
-## Installation
-
-```bash
-pip install -e ./numbat
-# Optional Numba acceleration:
-pip install -e "./numbat[accel]"
-```
+| Component | `settings="default"` (Pythonic Default) | `settings="R_default"` (`kharchenkolab/numbat` v1.5.2 Parity) |
+| :--- | :--- | :--- |
+| **Joint HMM State Catalog** | 11-state phased CNV space (`DEFAULT_STATES`: `neu`, `del_p/m`, `amp_p/m`, `amp2_p/m`, `loh_p/m`, `bamp`, `bdel`). | 15-state `s15` catalog (`S15_STATES`, matching `hahmmr::run_joint_hmm_s15`): `neu`, `bamp`, `bdel` (`00`, $\phi < 1$), clonal & subclonal mono-allelic deletions, clonal & subclonal CN-neutral LOH, and single & multi-level unbalanced amplifications. |
+| **Segment Refinement** | Discrete state parameters $(\phi_k, \theta_k)$ used for segment LLR and single-cell scoring alongside reported $(\hat{\phi}_{\text{mle}}, \hat{\theta}_{\text{mle}})$. | Continuous $(\hat{\phi}_{\text{mle}}, \hat{\theta}_{\text{mle}})$ optimization refines segment log-likelihood ratios and continuous single-cell scoring parameters. |
+| **Multi-Pseudobulk Consensus (`retest_bulks`)** | Greedy highest-`log_bf` non-overlapping segment deduplication across pseudobulk HMM runs. | Full `retest_bulks` pass re-evaluating consensus CNV intervals across pooled tumor and per-clone pseudobulks to compute exact per-segment LLRs, Bayesian 6-state posteriors, and clonal CN-neutral LOH. |
 
 ## Quickstart
 
 ```python
 from numbat import NumbatConfig, annotate_anndata, run_numbat
 
-res = run_numbat(
-    adata,
-    allele_df=allele_df,
-    ref_cells="is_ref",
-    config=NumbatConfig(backend="auto"),
-)
-print(res.summary())
-print(res.segments_dataframe())
-print(res.to_dataframe().head())
-adata = annotate_anndata(adata, res)
+# Default Pythonic pipeline
+res = run_numbat(adata, allele_df=allele_df, ref_cells="is_ref", settings="default")
+
+# Exact kharchenkolab/numbat v1.5.2 (s15 + continuous MLE + retest_bulks) parity mode
+res_r = run_numbat(adata, allele_df=allele_df, ref_cells="is_ref", settings="R_default")
+print(res_r.summary())
+print(res_r.segments_dataframe())
+adata = annotate_anndata(adata, res_r)
 ```
 
 ## Matrix Orientation

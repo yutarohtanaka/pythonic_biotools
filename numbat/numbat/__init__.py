@@ -3,8 +3,8 @@
 phylogenies from single-cell transcriptomes (Gao et al., Nature Biotechnology 2023).
 """
 
-from .clones import SegmentCall, score_single_cells
-from .config import COLLAPSED_STATES, DEFAULT_STATES, CNVStateSpec, NumbatConfig
+from .clones import SegmentCall, retest_bulks, score_single_cells
+from .config import COLLAPSED_STATES, DEFAULT_STATES, S15_STATES, CNVStateSpec, NumbatConfig
 from .core import NumbatResult, annotate_anndata, run_numbat
 from .expression import (
     compute_diploid_offset,
@@ -32,6 +32,7 @@ from .phylogeny import (
 __all__ = [
     "COLLAPSED_STATES",
     "DEFAULT_STATES",
+    "S15_STATES",
     "CNVStateSpec",
     "NumbatConfig",
     "HMMResult",
@@ -43,6 +44,7 @@ __all__ = [
     "run_joint_hmm",
     "fit_allele_hmm",
     "fit_expression_hmm",
+    "retest_bulks",
     "reconstruct_phylogeny",
     "score_single_cells",
     "compute_clone_posteriors",

@@ -10,7 +10,14 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy
 
-from .config import COLLAPSED_STATES, CNVStateSpec, DEFAULT_STATES, NumbatConfig
+from .config import (
+    COLLAPSED_STATES,
+    CNVStateSpec,
+    DEFAULT_STATES,
+    NumbatConfig,
+    S15_STATES,
+    validate_settings,
+)
 
 try:
     from numba import njit as _numba_njit
@@ -605,19 +612,34 @@ def run_joint_hmm(
     p_switch: Sequence[float] | np.ndarray | None = None,
     t_cnv: float = 1e-5,
     p_init_cnv: float = 0.15,
-    states: Sequence[CNVStateSpec] = DEFAULT_STATES,
+    states: Sequence[CNVStateSpec] | None = None,
     backend: Literal["auto", "numba", "numpy"] = "auto",
     locus_id: Sequence[str] | None = None,
     chrom: Sequence[str] | None = None,
     pos: Sequence[int] | np.ndarray | None = None,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> HMMResult:
-    """Run haplotype-aware Forward-Backward and Viterbi HMM across chromosome slices."""
+    """
+    Run haplotype-aware Forward-Backward and Viterbi HMM across chromosome slices.
+
+    When `states is None`, uses `DEFAULT_STATES` (11 states) for `settings="default"`
+    and `S15_STATES` (15 states, matching `hahmmr::run_joint_hmm_s15`) for `settings="R_default"`.
+    """
+    validate_settings(settings)
+    eff_states = (
+        tuple(states)
+        if states is not None
+        else (S15_STATES if settings == "R_default" else DEFAULT_STATES)
+    )
     emit = np.ascontiguousarray(np.asarray(log_emit, dtype=np.float64))
     if emit.ndim != 2 or emit.shape[0] == 0:
         raise ValueError("log_emit must be a non-empty 2D (n_loci x n_states) array.")
     n_loci, k_states = emit.shape
-    if k_states != len(states):
-        raise ValueError(f"log_emit has {k_states} state columns, expected {len(states)}.")
+    if k_states != len(eff_states):
+        raise ValueError(
+            f"log_emit has {k_states} state columns, expected {len(eff_states)}."
+        )
     if not np.all(np.isfinite(emit)):
         raise ValueError("log_emit contains non-finite values.")
 
@@ -651,7 +673,7 @@ def run_joint_hmm(
         n_subclasses,
         state_to_collapsed,
         log_init_prior,
-    ) = _encode_states(states, p_init_cnv)
+    ) = _encode_states(eff_states, p_init_cnv)
 
     if resolved == "numba":
         posteriors, total_ll = _hmm_forward_backward_numba(
@@ -705,7 +727,7 @@ def run_joint_hmm(
         collapsed_post[:, c_idx] += posteriors[:, k_idx]
 
     viterbi_collapsed = tuple(COLLAPSED_STATES[state_to_collapsed[int(s)]] for s in viterbi_states)
-    state_names = tuple(s.name for s in states)
+    state_names = tuple(s.name for s in eff_states)
 
     return HMMResult(
         posteriors=posteriors,
@@ -806,9 +828,12 @@ def fit_allele_hmm(
     chrom: Sequence[str] | None = None,
     pos: Sequence[int] | np.ndarray | None = None,
     config: NumbatConfig | None = None,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> HMMResult:
     """Convenience wrapper running the haplotype-aware HMM on allele counts alone."""
-    cfg = config if config is not None else NumbatConfig()
+    validate_settings(settings)
+    cfg = config if config is not None else NumbatConfig(settings=settings)
     ad_arr = np.asarray(ad, dtype=np.float64)
     dp_arr = np.asarray(dp, dtype=np.float64)
     if ad_arr.ndim != 1 or ad_arr.shape != dp_arr.shape or ad_arr.size == 0:
@@ -871,11 +896,14 @@ def fit_expression_hmm(
     chrom: Sequence[str] | None = None,
     pos: Sequence[int] | np.ndarray | None = None,
     config: NumbatConfig | None = None,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> HMMResult:
     """Convenience wrapper running the HMM on pseudobulk/cell gene expression counts alone."""
     from .expression import compute_diploid_offset, pln_logpmf
 
-    cfg = config if config is not None else NumbatConfig()
+    validate_settings(settings)
+    cfg = config if config is not None else NumbatConfig(settings=settings)
     x_arr = np.asarray(counts, dtype=np.float64)
     lam_arr = np.asarray(ref_lambda, dtype=np.float64)
     if x_arr.ndim != 1 or x_arr.shape != lam_arr.shape or x_arr.size == 0:

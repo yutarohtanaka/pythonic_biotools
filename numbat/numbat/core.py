@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Literal, Sequence
 
 import anndata as ad
 import numpy as np
@@ -17,9 +17,10 @@ from .clones import (
     SEGMENTS_COLUMNS,
     SegmentCall,
     extract_segments,
+    retest_bulks,
     score_single_cells,
 )
-from .config import NumbatConfig
+from .config import DEFAULT_STATES, NumbatConfig, S15_STATES, validate_settings
 from .expression import (
     compute_diploid_offset,
     compute_diploid_offsets_batch,
@@ -204,6 +205,7 @@ def _compute_pseudobulk_hmm(
         locus_id=loci.locus_id,
         chrom=loci.chrom.tolist(),
         pos=loci.pos,
+        settings=config.settings,
     )
     return hmm_res, bulk_counts, bulk_base_mu, bulk_ad, bulk_dp
 
@@ -369,9 +371,26 @@ def run_numbat(
     gene_ids: Sequence[str] | None = None,
     init_k: int = 3,
     config: NumbatConfig | None = None,
+    *,
+    settings: Literal["default", "R_default"] = "default",
 ) -> NumbatResult:
-    """Run full haplotype-aware Numbat single-cell CNV, malignancy, and phylogeny analysis."""
-    cfg = config if config is not None else NumbatConfig()
+    """
+    Run full haplotype-aware Numbat single-cell CNV, malignancy, and phylogeny analysis.
+
+    Supports `settings="default"` (11-state joint HMM) and `settings="R_default"`
+    (15-state `s15` joint HMM matching `kharchenkolab/numbat` v1.5.2, continuous
+    `(phi_mle, theta_mle)` segment refinement, and multi-pseudobulk `retest_bulks`).
+    """
+    validate_settings(settings)
+    if config is None:
+        cfg = NumbatConfig(settings=settings)
+    elif settings == "R_default" and config.settings == "default":
+        if config.states == DEFAULT_STATES:
+            cfg = replace(config, settings="R_default", states=S15_STATES)
+        else:
+            cfg = replace(config, settings="R_default")
+    else:
+        cfg = config
     resolved_backend = resolve_backend(cfg.backend)
 
     if allele_df is None and isinstance(data, ad.AnnData) and "numbat_alleles" in data.uns:
@@ -431,6 +450,9 @@ def run_numbat(
     global_hmm, bulk_counts, bulk_base_mu, bulk_ad, bulk_dp = _compute_pseudobulk_hmm(
         non_ref_indices, expr, alleles, loci, ref_lambda, sigma_g, p_switch, cfg
     )
+    round1_bulks: list[tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]] = [
+        (bulk_counts, bulk_base_mu, bulk_ad, bulk_dp)
+    ]
     cand_segments: list[SegmentCall] = list(
         extract_segments(
             global_hmm,
@@ -461,12 +483,16 @@ def run_numbat(
                 cl_hmm, cl_counts, cl_mu, cl_ad, cl_dp = _compute_pseudobulk_hmm(
                     cl_idx, expr, alleles, loci, ref_lambda, sigma_g, p_switch, cfg
                 )
+                round1_bulks.append((cl_counts, cl_mu, cl_ad, cl_dp))
                 cl_segs = extract_segments(
                     cl_hmm, loci, cl_counts, cl_mu, sigma_g, cl_ad, cl_dp, p_switch, cfg
                 )
                 cand_segments.extend(cl_segs)
 
-    segments = _merge_candidate_segments(cand_segments)
+    if cfg.settings == "R_default":
+        segments = retest_bulks(cand_segments, round1_bulks, loci, sigma_g, p_switch, cfg)
+    else:
+        segments = _merge_candidate_segments(cand_segments)
     joint_post, prob_mat, llr_mat, aneuploidy_score = score_single_cells(
         segments=segments,
         loci=loci,
@@ -531,6 +557,21 @@ def run_numbat(
         tumor_mask = np.array([c == "tumor" for c in clones.compartment_opt], dtype=bool)
         if int(np.sum(tumor_mask)) >= max(5, eff_min_cells):
             refined_cands: list[SegmentCall] = []
+            round2_bulks: list[
+                tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]
+            ] = []
+            if cfg.settings == "R_default":
+                t_idx = np.flatnonzero(tumor_mask)
+                t_hmm, t_counts, t_mu, t_ad, t_dp = _compute_pseudobulk_hmm(
+                    t_idx, expr, alleles, loci, ref_lambda, sigma_g, p_switch, cfg
+                )
+                round2_bulks.append((t_counts, t_mu, t_ad, t_dp))
+                refined_cands.extend(
+                    extract_segments(
+                        t_hmm, loci, t_counts, t_mu, sigma_g, t_ad, t_dp, p_switch, cfg
+                    )
+                )
+
             for cid in clones.clone_ids:
                 if cid == 1:
                     continue
@@ -539,13 +580,24 @@ def run_numbat(
                     cl_hmm, cl_counts, cl_mu, cl_ad, cl_dp = _compute_pseudobulk_hmm(
                         c_idx, expr, alleles, loci, ref_lambda, sigma_g, p_switch, cfg
                     )
+                    round2_bulks.append((cl_counts, cl_mu, cl_ad, cl_dp))
                     refined_cands.extend(
                         extract_segments(
                             cl_hmm, loci, cl_counts, cl_mu, sigma_g, cl_ad, cl_dp, p_switch, cfg
                         )
                     )
-            if refined_cands:
-                segments_ref = _merge_candidate_segments(refined_cands)
+            if refined_cands or (cfg.settings == "R_default" and round2_bulks):
+                if cfg.settings == "R_default":
+                    segments_ref = retest_bulks(
+                        list(segments) + refined_cands,
+                        round2_bulks,
+                        loci,
+                        sigma_g,
+                        p_switch,
+                        cfg,
+                    )
+                else:
+                    segments_ref = _merge_candidate_segments(refined_cands)
                 if segments_ref:
                     segments = segments_ref
                     joint_post, prob_mat, llr_mat, aneuploidy_score = score_single_cells(
