@@ -4,7 +4,9 @@ Survival analysis, competing-risks regression, and heteroskedasticity-robust WLS
 Implements Pythonic equivalents of:
   - `survival::coxph(..., ties="efron")`: Efron-tie Cause-Specific Cox Proportional Hazards
   - `cmprsk::crr`: IPCW Fine-Gray subdistribution hazard regression for competing risks
-  - `sandwich::vcovHC(..., type="HC3")`: White-Huber HC3 leverage-corrected weighted regression
+    (Fine & Gray, JASA 1999, Eqs. 6-10: exact time-varying risk-set weights and
+    robust score + censoring-martingale sandwich covariance)
+  - `sandwich::vcovHC(..., type="HC3")`: MacKinnon-White HC3 leverage-corrected weighted regression
   - `compute_mdes_interaction_hr`: Analytical minimum detectable interaction hazard ratio
 """
 
@@ -75,27 +77,55 @@ class RobustWLSResult:
         )
 
 
+def _km_censoring_curves(
+    times: np.ndarray,
+    event_types: np.ndarray,
+    eps_g: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute both right-continuous G(t) and left-continuous G(t-) KM censoring curves.
+
+    Returns `(uniq_t, g_left_uniq, g_right_uniq, dc_uniq, yc_uniq)` over sorted unique times.
+    """
+    t = np.asarray(times, dtype=np.float64).ravel()
+    is_cens = np.asarray(event_types, dtype=int).ravel() == 0
+    uniq_t = np.unique(t)
+    m = uniq_t.size
+    g_left = np.ones(m, dtype=np.float64)
+    g_right = np.ones(m, dtype=np.float64)
+    dc_arr = np.zeros(m, dtype=np.float64)
+    yc_arr = np.zeros(m, dtype=np.float64)
+
+    curr_g = 1.0
+    for idx, ut in enumerate(uniq_t):
+        g_left[idx] = max(curr_g, eps_g)
+        at_risk = float(np.sum(t >= ut))
+        c_events = float(np.sum((t == ut) & is_cens))
+        yc_arr[idx] = at_risk
+        dc_arr[idx] = c_events
+        if at_risk > 0.0 and c_events > 0.0:
+            curr_g = max(curr_g * (1.0 - c_events / at_risk), eps_g)
+        g_right[idx] = max(curr_g, eps_g)
+    return uniq_t, g_left, g_right, dc_arr, yc_arr
+
+
 def kaplan_meier_censoring_survival(
     times: Sequence[float],
     event_types: Sequence[int],
     eps_g: float = 0.05,
+    left_continuous: bool = False,
 ) -> np.ndarray:
-    r"""Estimate Kaplan-Meier censoring survival $\hat{G}(t)$ (`event_type == 0` = censored)
-    with lower clamp $\epsilon_G$ to prevent inverse-probability weight explosion.
+    r"""Estimate Kaplan-Meier censoring survival $\hat{G}(t)$ (or left-continuous $\hat{G}(t-)$
+    when `left_continuous=True`, `event_type == 0` = censored) with lower clamp $\epsilon_G$
+    to prevent inverse-probability weight explosion.
     """
     t = np.asarray(times, dtype=np.float64)
-    is_censored = (np.asarray(event_types, dtype=int) == 0).astype(np.float64)
-    uniq_t = np.unique(t)
-    g_surv = np.ones_like(t, dtype=np.float64)
-    curr_g = 1.0
-    for ut in uniq_t:
-        at_risk = float(np.sum(t >= ut))
-        c_events = float(np.sum((t == ut) & (is_censored == 1.0)))
-        if at_risk > 0.0 and c_events > 0.0:
-            curr_g *= 1.0 - (c_events / at_risk)
-        curr_g = max(curr_g, eps_g)
-        g_surv[t >= ut] = curr_g
-    return np.maximum(g_surv, eps_g)
+    ev = np.asarray(event_types, dtype=int)
+    if t.size == 0:
+        return np.array([], dtype=np.float64)
+    uniq_t, g_left, g_right, _, _ = _km_censoring_curves(t.ravel(), ev.ravel(), eps_g=eps_g)
+    pos = np.searchsorted(uniq_t, t)
+    curve = g_left if left_continuous else g_right
+    return np.maximum(curve[pos], eps_g)
 
 
 def _efron_partial_loglik_and_derivatives(
@@ -104,13 +134,13 @@ def _efron_partial_loglik_and_derivatives(
     times: np.ndarray,
     is_event: np.ndarray,
     sample_weights: np.ndarray | None = None,
-    ridge_lambda: float = 1e-4,
+    ridge_lambda: float = 0.0,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Compute Efron-tie Cox partial log-likelihood, gradient, and negative Hessian."""
     n, p = x.shape
     w_samp = np.ones(n, dtype=np.float64) if sample_weights is None else np.asarray(sample_weights, dtype=np.float64)
 
-    eta = np.clip(x @ beta, -25.0, 25.0)
+    eta = np.clip(x @ beta, -35.0, 35.0)
     theta = w_samp * np.exp(eta)
     tx = x * theta[:, None]
 
@@ -160,10 +190,161 @@ def _efron_partial_loglik_and_derivatives(
             grad -= w_tie_mean * v1
             info += w_tie_mean * (v2 - np.outer(v1, v1))
 
-    loglik -= 0.5 * ridge_lambda * float(np.sum(beta**2))
-    grad -= ridge_lambda * beta
-    info += ridge_lambda * np.eye(p)
+    if ridge_lambda > 0.0:
+        loglik -= 0.5 * ridge_lambda * float(np.sum(beta**2))
+        grad -= ridge_lambda * beta
+        info += ridge_lambda * np.eye(p)
     return loglik, grad, info
+
+
+def _fine_gray_loglik_and_derivatives(
+    beta: np.ndarray,
+    x: np.ndarray,
+    times: np.ndarray,
+    is_target: np.ndarray,
+    is_competing: np.ndarray,
+    g_minus_subj: np.ndarray,
+    uniq_target_times: np.ndarray,
+    g_minus_target_times: np.ndarray,
+    ridge_lambda: float = 0.0,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    r"""Compute Fine-Gray (1999, Eq. 6-7) IPCW log-pseudo-likelihood, score, and observed information.
+
+    At each unique target failure time $t_k$, subject $i$ belongs to the subdistribution risk set
+    with time-varying weight:
+      - $w_i(t_k) = 1$ if $T_i \ge t_k$,
+      - $w_i(t_k) = \hat{G}(t_k-) / \hat{G}(T_i-)$ if $T_i < t_k$ and subject $i$ had a competing event,
+      - $w_i(t_k) = 0$ otherwise.
+    """
+    n, p = x.shape
+    eta = np.clip(x @ beta, -35.0, 35.0)
+    exp_eta = np.exp(eta)
+
+    loglik = 0.0
+    grad = np.zeros(p, dtype=np.float64)
+    info = np.zeros((p, p), dtype=np.float64)
+
+    for k_idx, tk in enumerate(uniq_target_times):
+        at_event = (times == tk) & (is_target == 1)
+        d_k = int(np.sum(at_event))
+        if d_k == 0:
+            continue
+
+        gk = g_minus_target_times[k_idx]
+        w_k = np.zeros(n, dtype=np.float64)
+        w_k[times >= tk] = 1.0
+        comp_mask = is_competing & (times < tk)
+        if np.any(comp_mask):
+            w_k[comp_mask] = np.clip(gk / g_minus_subj[comp_mask], 0.0, 1.0)
+
+        theta_k = w_k * exp_eta
+        s0 = max(float(np.sum(theta_k)), 1e-12)
+        tx_k = x * theta_k[:, None]
+        s1 = np.sum(tx_k, axis=0)
+        s2 = tx_k.T @ x
+        x_bar = s1 / s0
+
+        loglik += float(np.sum(eta[at_event])) - d_k * np.log(s0)
+        grad += np.sum(x[at_event], axis=0) - d_k * x_bar
+        info += d_k * ((s2 / s0) - np.outer(x_bar, x_bar))
+
+    if ridge_lambda > 0.0:
+        loglik -= 0.5 * ridge_lambda * float(np.sum(beta**2))
+        grad -= ridge_lambda * beta
+        info += ridge_lambda * np.eye(p)
+    return loglik, grad, info
+
+
+def _fine_gray_sandwich_covariance(
+    beta: np.ndarray,
+    info: np.ndarray,
+    x: np.ndarray,
+    times: np.ndarray,
+    is_target: np.ndarray,
+    is_competing: np.ndarray,
+    is_censored: np.ndarray,
+    g_minus_subj: np.ndarray,
+    uniq_target_times: np.ndarray,
+    g_minus_target_times: np.ndarray,
+    uniq_t: np.ndarray,
+    dc_uniq: np.ndarray,
+    yc_uniq: np.ndarray,
+    censoring_correction: bool = True,
+) -> np.ndarray:
+    r"""Compute Fine-Gray (1999, Eqs. 8-10) robust sandwich covariance $I(\hat{\beta})^{-1} \Omega I(\hat{\beta})^{-1}$.
+
+    Decomposes per-subject asymptotic score influence into:
+      - $\hat{\eta}_i$: subdistribution counting-process score residual
+      - $\hat{\psi}_i$: IPCW Kaplan-Meier censoring-martingale residual correction
+    """
+    n, p = x.shape
+    eta = np.clip(x @ beta, -35.0, 35.0)
+    exp_eta = np.exp(eta)
+
+    eta_subj = np.zeros((n, p), dtype=np.float64)
+    k_count = uniq_target_times.size
+    d_lam_vec = np.zeros(k_count, dtype=np.float64)
+    x_bar_mat = np.zeros((k_count, p), dtype=np.float64)
+    theta_mat = np.zeros((k_count, n), dtype=np.float64)
+
+    for k_idx, tk in enumerate(uniq_target_times):
+        at_event = (times == tk) & (is_target == 1)
+        d_k = int(np.sum(at_event))
+        if d_k == 0:
+            continue
+
+        gk = g_minus_target_times[k_idx]
+        w_k = np.zeros(n, dtype=np.float64)
+        w_k[times >= tk] = 1.0
+        comp_mask = is_competing & (times < tk)
+        if np.any(comp_mask):
+            w_k[comp_mask] = np.clip(gk / g_minus_subj[comp_mask], 0.0, 1.0)
+
+        theta_k = w_k * exp_eta
+        s0 = max(float(np.sum(theta_k)), 1e-12)
+        x_bar = np.sum(x * theta_k[:, None], axis=0) / s0
+        d_lam = d_k / s0
+
+        d_lam_vec[k_idx] = d_lam
+        x_bar_mat[k_idx] = x_bar
+        theta_mat[k_idx] = theta_k
+
+        x_centered = x - x_bar[None, :]
+        eta_subj[at_event] += x_centered[at_event]
+        eta_subj -= x_centered * (theta_k * d_lam)[:, None]
+
+    psi_subj = np.zeros((n, p), dtype=np.float64)
+    if censoring_correction and np.any(is_competing) and np.any(dc_uniq > 0.0):
+        cens_indices = np.flatnonzero((dc_uniq > 0.0) & (yc_uniq > 0.0))
+        for c_idx in cens_indices:
+            u_c = uniq_t[c_idx]
+            dc = dc_uniq[c_idx]
+            yc = yc_uniq[c_idx]
+            later_k = np.flatnonzero(uniq_target_times > u_c)
+            if later_k.size == 0:
+                continue
+            comp_le_u = is_competing & (times <= u_c)
+            if not np.any(comp_le_u):
+                continue
+
+            x_comp = x[comp_le_u]
+            q_u = np.zeros(p, dtype=np.float64)
+            for k_idx in later_k:
+                d_lam = d_lam_vec[k_idx]
+                if d_lam <= 0.0:
+                    continue
+                th_comp = theta_mat[k_idx, comp_le_u]
+                q_u += d_lam * np.sum((x_comp - x_bar_mat[k_idx][None, :]) * th_comp[:, None], axis=0)
+
+            at_cens = (times == u_c) & is_censored
+            in_cens_risk = times >= u_c
+            psi_subj[at_cens] += q_u / yc
+            psi_subj[in_cens_risk] -= (dc / (yc * yc)) * q_u
+
+    total_scores = eta_subj + psi_subj
+    meat = total_scores.T @ total_scores
+    h_inv = np.linalg.pinv(info)
+    return h_inv @ meat @ h_inv
 
 
 def _extract_design(
@@ -181,14 +362,63 @@ def _extract_design(
     return x, names
 
 
+def _newton_maximize_with_backtracking(
+    beta_init: np.ndarray,
+    eval_fn,
+    max_iter: int = 60,
+    max_step_halving: int = 15,
+    max_step_norm: float = 2.5,
+    tol: float = 1e-7,
+) -> tuple[np.ndarray, bool]:
+    """Maximize a concave log-(pseudo-)likelihood via Newton-Raphson with monotone step-halving."""
+    beta = beta_init.copy()
+    converged = False
+
+    for _ in range(max_iter):
+        ll, grad, info = eval_fn(beta)
+        if float(np.max(np.abs(grad))) < tol * 1e-2:
+            converged = True
+            break
+
+        step = np.linalg.pinv(info) @ grad
+        step_norm = float(np.max(np.abs(step)))
+        if step_norm < tol:
+            beta = beta + step
+            converged = True
+            break
+        if step_norm > max_step_norm:
+            step = step * (max_step_norm / step_norm)
+
+        alpha = 1.0
+        beta_new = beta + step
+        for _ in range(max_step_halving):
+            cand = beta + alpha * step
+            ll_cand, _, _ = eval_fn(cand)
+            if np.isfinite(ll_cand) and ll_cand >= ll - 1e-12:
+                beta_new = cand
+                break
+            alpha *= 0.5
+        else:
+            beta_new = beta + alpha * step
+
+        if float(np.max(np.abs(beta_new - beta))) < tol:
+            beta = beta_new
+            converged = True
+            break
+        beta = beta_new
+
+    return beta, converged
+
+
 def fit_cox_ph_efron(
     X: np.ndarray | pd.DataFrame,
     times: Sequence[float],
     event_types: Sequence[int],
     target_event: int = 1,
     coef_names: Sequence[str] | None = None,
-    ridge_lambda: float = 1e-4,
+    ridge_lambda: float = 0.0,
     max_iter: int = 60,
+    max_step_halving: int = 15,
     tol: float = 1e-7,
 ) -> HazardModelResult:
     """Fit an Efron-tie Cause-Specific Cox Proportional Hazards model (`survival::coxph`).
@@ -211,27 +441,21 @@ def fit_cox_ph_efron(
 
     is_event = (ev == target_event).astype(int)
     p = x.shape[1]
-    beta = np.zeros(p, dtype=np.float64)
-    converged = False
+    beta0 = np.zeros(p, dtype=np.float64)
 
-    for _ in range(max_iter):
-        _, grad, info = _efron_partial_loglik_and_derivatives(
-            beta, x, t, is_event, sample_weights=None, ridge_lambda=ridge_lambda
+    def _eval(b: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        return _efron_partial_loglik_and_derivatives(
+            b, x, t, is_event, sample_weights=None, ridge_lambda=ridge_lambda
         )
-        step = np.linalg.pinv(info) @ grad
-        step_norm = float(np.max(np.abs(step)))
-        if step_norm > 2.0:
-            step = step * (2.0 / step_norm)
-        beta_new = beta + step
-        if float(np.max(np.abs(beta_new - beta))) < tol:
-            beta = beta_new
-            converged = True
-            break
-        beta = beta_new
 
-    ll, _, info = _efron_partial_loglik_and_derivatives(
-        beta, x, t, is_event, sample_weights=None, ridge_lambda=ridge_lambda
-    )
+    if int(is_event.sum()) == 0:
+        beta, converged = beta0, True
+    else:
+        beta, converged = _newton_maximize_with_backtracking(
+            beta0, _eval, max_iter=max_iter, max_step_halving=max_step_halving, tol=tol
+        )
+
+    ll, _, info = _eval(beta)
     cov = np.linalg.pinv(info)
     se = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     z_stat = beta / se
@@ -264,14 +488,19 @@ def fit_fine_gray_ipcw(
     target_event: int = 1,
     coef_names: Sequence[str] | None = None,
     eps_g: float = 0.05,
-    ridge_lambda: float = 1e-4,
+    ridge_lambda: float = 0.0,
+    censoring_correction: bool = True,
     max_iter: int = 60,
+    max_step_halving: int = 15,
     tol: float = 1e-7,
 ) -> HazardModelResult:
-    r"""Fit an IPCW Fine-Gray subdistribution hazard model (`cmprsk::crr`).
+    r"""Fit an IPCW Fine-Gray subdistribution hazard model (`cmprsk::crr`; Fine & Gray, JASA 1999).
 
-    Subjects experiencing a competing event ($E_i \notin \{0, \text{target\_event}\}$) remain in
-    the subdistribution risk set with Kaplan-Meier inverse-probability-of-censoring weights.
+    Subjects experiencing a competing event ($E_i \notin \{0, \text{target\_event}\}$) at $T_i < t_k$
+    remain in the subdistribution risk set at target failure time $t_k$ with exact time-varying
+    weight $w_i(t_k) = \hat{G}(t_k-) / \hat{G}(T_i-)$, using left-continuous Kaplan-Meier censoring
+    survival $\hat{G}(t-)$. Standard errors use the Fine-Gray robust Huber-White score sandwich
+    estimator incorporating censoring-martingale estimation uncertainty (Eqs. 8-10).
     """
     x, names = _extract_design(X, coef_names)
     t = np.asarray(times, dtype=np.float64).ravel().copy()
@@ -279,40 +508,60 @@ def fit_fine_gray_ipcw(
     if x.shape[0] != t.size or t.size != ev.size:
         raise ValueError("X, times, and event_types must share the same sample count.")
 
-    g_hat = kaplan_meier_censoring_survival(t, ev, eps_g=eps_g)
+    uniq_t, g_left_uniq, _, dc_uniq, yc_uniq = _km_censoring_curves(t, ev, eps_g=eps_g)
+    g_minus_subj = g_left_uniq[np.searchsorted(uniq_t, t)]
+
     is_target = (ev == target_event).astype(int)
     is_competing = (ev != 0) & (ev != target_event)
+    is_censored = ev == 0
 
-    t_sub = t.copy()
-    t_max = float(np.max(t)) + 0.01
-    t_sub[is_competing] = t_max
-
-    g_tmax = float(np.min(g_hat))
-    weights = np.ones_like(t, dtype=np.float64)
-    weights[is_competing] = np.clip(g_tmax / g_hat[is_competing], eps_g, 1.0)
+    uniq_target_times = np.unique(t[is_target == 1])
+    g_minus_target_times = g_left_uniq[np.searchsorted(uniq_t, uniq_target_times)]
 
     p = x.shape[1]
-    beta = np.zeros(p, dtype=np.float64)
-    converged = False
-    for _ in range(max_iter):
-        _, grad, info = _efron_partial_loglik_and_derivatives(
-            beta, x, t_sub, is_target, sample_weights=weights, ridge_lambda=ridge_lambda
-        )
-        step = np.linalg.pinv(info) @ grad
-        step_norm = float(np.max(np.abs(step)))
-        if step_norm > 2.0:
-            step = step * (2.0 / step_norm)
-        beta_new = beta + step
-        if float(np.max(np.abs(beta_new - beta))) < tol:
-            beta = beta_new
-            converged = True
-            break
-        beta = beta_new
+    beta0 = np.zeros(p, dtype=np.float64)
 
-    ll, _, info = _efron_partial_loglik_and_derivatives(
-        beta, x, t_sub, is_target, sample_weights=weights, ridge_lambda=ridge_lambda
-    )
-    cov = np.linalg.pinv(info)
+    def _eval(b: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        return _fine_gray_loglik_and_derivatives(
+            b,
+            x,
+            t,
+            is_target,
+            is_competing,
+            g_minus_subj,
+            uniq_target_times,
+            g_minus_target_times,
+            ridge_lambda=ridge_lambda,
+        )
+
+    if uniq_target_times.size == 0:
+        beta, converged = beta0, True
+    else:
+        beta, converged = _newton_maximize_with_backtracking(
+            beta0, _eval, max_iter=max_iter, max_step_halving=max_step_halving, tol=tol
+        )
+
+    ll, _, info = _eval(beta)
+    if uniq_target_times.size == 0:
+        cov = np.zeros((p, p), dtype=np.float64)
+    else:
+        cov = _fine_gray_sandwich_covariance(
+            beta=beta,
+            info=info,
+            x=x,
+            times=t,
+            is_target=is_target,
+            is_competing=is_competing,
+            is_censored=is_censored,
+            g_minus_subj=g_minus_subj,
+            uniq_target_times=uniq_target_times,
+            g_minus_target_times=g_minus_target_times,
+            uniq_t=uniq_t,
+            dc_uniq=dc_uniq,
+            yc_uniq=yc_uniq,
+            censoring_correction=censoring_correction,
+        )
+
     se = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     z_stat = beta / se
     p_val = 2.0 * stats.norm.sf(np.abs(z_stat))
@@ -362,9 +611,11 @@ def fit_wls_hc3(
         w_sqrt = np.ones(x.shape[0], dtype=np.float64)
     else:
         w = np.asarray(weights, dtype=np.float64).ravel()
-        if np.any(w < 0.0):
-            raise ValueError("Weights must be non-negative.")
-        w_sqrt = np.sqrt(np.maximum(w, 1e-6))
+        if w.size != x.shape[0]:
+            raise ValueError("weights and X must share the same sample count.")
+        if np.any(w < 0.0) or not np.all(np.isfinite(w)):
+            raise ValueError("Weights must be finite and non-negative.")
+        w_sqrt = np.sqrt(w)
 
     xw = x * w_sqrt[:, None]
     yw = y_vec * w_sqrt
@@ -372,12 +623,12 @@ def fit_wls_hc3(
     beta = xtx_inv @ (xw.T @ yw)
     resid = yw - xw @ beta
 
-    h_diag = np.clip(np.sum((xw @ xtx_inv) * xw, axis=1), 0.0, 0.99)
+    h_diag = np.clip(np.sum((xw @ xtx_inv) * xw, axis=1), 0.0, 1.0 - 1e-12)
     hc3_scale = (resid / (1.0 - h_diag)) ** 2
     meat = (xw * hc3_scale[:, None]).T @ xw
     cov_hc3 = xtx_inv @ meat @ xtx_inv
 
-    se = np.sqrt(np.maximum(np.diag(cov_hc3), 1e-12))
+    se = np.sqrt(np.maximum(np.diag(cov_hc3), 1e-24))
     df_resid = max(int(x.shape[0] - x.shape[1]), 1)
     t_stat = beta / se
     p_val = 2.0 * stats.t.sf(np.abs(t_stat), df=df_resid)

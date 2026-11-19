@@ -1,7 +1,7 @@
 """
 Vectorized high-dimensional correlation scans, memory-bounded pooled-null
-permutation empirical FDR, bootstrap CIs, partial correlations, and NaN-safe
-statistical test wrappers.
+permutation empirical FDR, Storey-Tibshirani natural cubic spline q-values,
+bootstrap CIs, partial correlations, and NaN-safe statistical test wrappers.
 """
 
 from __future__ import annotations
@@ -58,6 +58,77 @@ def bh_fdr(pvals: Sequence[float] | np.ndarray) -> np.ndarray:
     return _st.false_discovery_control(np.clip(p, 0.0, 1.0), method="bh")
 
 
+def _natural_cubic_spline_basis_df3(x: np.ndarray, knots: np.ndarray) -> np.ndarray:
+    """Exact 3-df natural cubic spline basis `[1, x, N_1(x), N_2(x)]` (Hastie, Tibshirani & Friedman Eq. 5.4)."""
+    xv = np.asarray(x, dtype=np.float64).ravel()
+    k0, k1, k2, k3 = (float(knots[0]), float(knots[1]), float(knots[2]), float(knots[3]))
+
+    def _dk(knot: float) -> np.ndarray:
+        return (np.maximum(xv - knot, 0.0) ** 3 - np.maximum(xv - k3, 0.0) ** 3) / max(k3 - knot, 1e-12)
+
+    d0 = _dk(k0)
+    d1 = _dk(k1)
+    d2 = _dk(k2)
+    return np.column_stack([np.ones_like(xv), xv, d0 - d2, d1 - d2])
+
+
+def storey_qvalue(
+    pvals: Sequence[float] | np.ndarray,
+    lambdas: Sequence[float] | np.ndarray | None = None,
+) -> tuple[np.ndarray, float]:
+    r"""Storey & Tibshirani (*PNAS* 2003) natural cubic spline $\hat{\pi}_0(\lambda)$ and monotone $q$-values.
+
+    Estimates the true null proportion $\pi_0$ by evaluating $\hat{\pi}_0(\lambda) = \#\{p_j > \lambda\} / (m(1 - \lambda))$
+    over a $\lambda$ grid, smoothing with a 3-df natural cubic spline, and computing monotone step-down $q$-values.
+
+    Returns `(qvalues, pi0_hat)`.
+    """
+    p = np.asarray(pvals, dtype=np.float64).ravel()
+    m = p.size
+    if m == 0:
+        return np.array([], dtype=np.float64), 1.0
+    if np.any(~np.isfinite(p)):
+        raise ValueError("Non-finite p-values passed to storey_qvalue.")
+    if np.any((p < 0.0) | (p > 1.0)):
+        raise ValueError("p-values passed to storey_qvalue must lie in [0, 1].")
+
+    lam_grid = np.arange(0.05, 0.96, 0.05) if lambdas is None else np.sort(np.asarray(lambdas, dtype=np.float64).ravel())
+    lam_grid = lam_grid[(lam_grid >= 0.0) & (lam_grid < 1.0)]
+
+    order = np.argsort(p, kind="mergesort")
+    p_sorted = p[order]
+
+    if m < 4 or lam_grid.size == 0:
+        pi0 = 1.0
+    elif lam_grid.size == 1:
+        exceed_cnt = m - np.searchsorted(p_sorted, lam_grid[0], side="right")
+        pi0 = float(np.clip(exceed_cnt / (m * (1.0 - lam_grid[0])), 0.0, 1.0))
+        if pi0 <= 0.0:
+            pi0 = 1.0
+    else:
+        exceed_cnts = m - np.searchsorted(p_sorted, lam_grid, side="right")
+        pi0_lam = exceed_cnts / (m * (1.0 - lam_grid))
+        if lam_grid.size >= 4:
+            knots = np.quantile(lam_grid, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+            B = _natural_cubic_spline_basis_df3(lam_grid, knots)
+            coef, *_ = np.linalg.lstsq(B, pi0_lam, rcond=None)
+            pred_last = float((B[-1] @ coef))
+            pi0 = float(np.clip(pred_last, 0.0, 1.0))
+        else:
+            pi0 = float(np.clip(np.mean(pi0_lam), 0.0, 1.0))
+
+        if not np.isfinite(pi0) or pi0 <= 0.0:
+            pos = pi0_lam[pi0_lam > 0.0]
+            pi0 = float(np.clip(pos.min(), 0.0, 1.0)) if pos.size > 0 else 1.0
+
+    ranks = np.arange(1, m + 1, dtype=np.float64)
+    q_sorted = pi0 * m * p_sorted / ranks
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q = np.empty_like(p)
+    q[order] = np.clip(q_sorted, 0.0, 1.0)
+    return q, pi0
+
+
 def permutation_empirical_fdr(
     X: np.ndarray,
     y: Sequence[float] | np.ndarray,
@@ -76,11 +147,17 @@ def permutation_empirical_fdr(
     """
     mat = np.asarray(X, dtype=np.float64)
     vec = np.asarray(y, dtype=np.float64).ravel()
+    if mat.shape[0] != vec.size:
+        raise ValueError(f"X has {mat.shape[0]} rows, but y has length {vec.size}.")
+
+    has_nan_col = ~np.all(np.isfinite(mat), axis=0)
+    zero_var_col = has_nan_col | (np.nanstd(mat, axis=0) == 0.0)
+
     if method == "spearman":
-        Xr = _st.rankdata(mat, axis=0)
+        Xr = _st.rankdata(np.where(np.isfinite(mat), mat, 0.0), axis=0)
         yr = _st.rankdata(vec)
     elif method == "pearson":
-        Xr = mat
+        Xr = np.where(np.isfinite(mat), mat, 0.0)
         yr = vec
     else:
         raise ValueError("method must be 'spearman' or 'pearson'.")
@@ -88,11 +165,14 @@ def permutation_empirical_fdr(
     Xc = Xr - Xr.mean(axis=0)
     yc = yr - yr.mean()
     denom = np.sqrt((Xc**2).sum(axis=0) * (yc**2).sum())
+    denom = np.where(zero_var_col, 0.0, denom)
+
     if observed_rho is None:
         with np.errstate(invalid="ignore", divide="ignore"):
             obs_rho = (Xc.T @ yc) / denom
+        obs_rho = np.where(zero_var_col | (denom <= 0.0), np.nan, obs_rho)
     else:
-        obs_rho = np.asarray(observed_rho, dtype=np.float64).ravel()
+        obs_rho = np.asarray(observed_rho, dtype=np.float64).ravel().copy()
 
     rng = np.random.default_rng(random_state)
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
@@ -103,16 +183,23 @@ def permutation_empirical_fdr(
         with np.errstate(invalid="ignore", divide="ignore"):
             null_rho = np.abs((Xc.T @ yc_perm) / denom)
         null_rho = null_rho[np.isfinite(null_rho)]
-        counts, _ = np.histogram(np.clip(null_rho, 0.0, 1.0), bins=bin_edges)
-        pooled_counts += counts
+        if null_rho.size > 0:
+            counts, _ = np.histogram(np.clip(null_rho, 0.0, 1.0), bins=bin_edges)
+            pooled_counts += counts
 
     total_null = int(pooled_counts.sum())
-    cum_from_right = np.cumsum(pooled_counts[::-1])[::-1]
+    invalid_obs = (~np.isfinite(obs_rho)) | zero_var_col | (denom <= 0.0)
 
-    obs_abs = np.where(np.isfinite(obs_rho), np.abs(obs_rho), 0.0)
-    bin_idx = np.clip(np.searchsorted(bin_edges, obs_abs, side="left") - 1, 0, n_bins - 1)
-    exceed = np.where(bin_idx + 1 < n_bins, cum_from_right[np.minimum(bin_idx + 1, n_bins - 1)], 0)
-    empirical_p = (exceed + 1.0) / (total_null + 1.0)
+    if total_null == 0:
+        empirical_p = np.ones_like(obs_rho, dtype=np.float64)
+    else:
+        cum_from_right = np.cumsum(pooled_counts[::-1])[::-1]
+        obs_abs = np.where(invalid_obs, 0.0, np.clip(np.abs(obs_rho), 0.0, 1.0))
+        bin_idx = np.clip(np.searchsorted(bin_edges, obs_abs, side="right") - 1, 0, n_bins - 1)
+        exceed = cum_from_right[bin_idx]
+        empirical_p = np.clip((exceed + 1.0) / (total_null + 1.0), 0.0, 1.0)
+        empirical_p = np.where(invalid_obs, 1.0, empirical_p)
+
     fdr = bh_fdr(empirical_p)
     return obs_rho, empirical_p, fdr
 
@@ -145,15 +232,17 @@ def partial_corr_pval(
     y: Sequence[float],
     covariates: np.ndarray,
 ) -> tuple[float, float]:
-    """Partial Pearson correlation of `x` and `y` controlling for `covariates` (`df = n - 2 - k`)."""
+    """Partial Pearson correlation of `x` and `y` controlling for `covariates` (`df = n - 1 - rank([1, C])`)."""
     xv, yv = _require_finite(x, y)
-    cov = np.asarray(covariates, dtype=np.float64).reshape(xv.size, -1)
+    cov_raw = np.asarray(covariates, dtype=np.float64)
+    cov = np.empty((xv.size, 0), dtype=np.float64) if cov_raw.size == 0 else cov_raw.reshape(xv.size, -1)
     if not np.all(np.isfinite(cov)):
         raise ValueError("Non-finite values in covariates.")
     C = np.column_stack([np.ones(xv.size, dtype=np.float64), cov])
+    rank_c = int(np.linalg.matrix_rank(C))
     rx = xv - C @ np.linalg.lstsq(C, xv, rcond=None)[0]
     ry = yv - C @ np.linalg.lstsq(C, yv, rcond=None)[0]
-    df = xv.size - C.shape[1] - 1
+    df = int(xv.size - rank_c - 1)
     if df < 1 or np.std(rx) == 0.0 or np.std(ry) == 0.0:
         return float("nan"), float("nan")
     r = float(np.clip(np.corrcoef(rx, ry)[0, 1], -1.0, 1.0))

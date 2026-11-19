@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pythonic-biostats"
 version = "0.1.0"
-description = "Pythonic implementations of R biostatistics & survival methods (limma eBayes, logistf Firth logistic, coxph Efron, cmprsk Fine-Gray IPCW, HC3 WLS, and genome-wide pooled-null permutation FDR)"
+description = "Pythonic implementations of survival, competing-risks, robust regression, and FDR methods (coxph Efron, cmprsk Fine-Gray IPCW, HC3 WLS, Storey-Tibshirani q-values, and pooled-null permutation FDR)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
