@@ -344,6 +344,87 @@ def fit_hl_gene(
     return beta_hat, sigma2_hat, phi_hat, ll, conv, n_iter
 
 
+def fit_hl_sigma2_1d(
+    X: np.ndarray,
+    log_offset: np.ndarray,
+    subj: np.ndarray,
+    m: int,
+    y_nz: np.ndarray,
+    cell_idx: np.ndarray,
+    subj_nz: np.ndarray,
+    Y_subj: np.ndarray,
+    Y_nz: np.ndarray,
+    const_y_fact: float,
+    beta_fixed: np.ndarray,
+    phi_fixed: float,
+    min_overdisp: float,
+    max_overdisp: float,
+    max_iter: int,
+    tol: float,
+    *,
+    gaussian_prior: bool = False,
+    laplace_order: int = 1,
+    sigma2_init: float = 0.5,
+    kappa_obs: float = 100.0,
+) -> tuple[float, float, int, int]:
+    """
+    Optimize only subject-level overdispersion ``sigma^2`` (``eta_s = -log(sigma^2)``)
+    under the NEBULA-HL marginal log-likelihood while holding ``beta_fixed`` and
+    ``phi_fixed`` fixed (`NBGMM (LN+HL)` intermediate ``kappa`` refit tier in ``nebula.R``).
+
+    Returns ``(sigma2_hat, loglik, convergence, n_iter)``.
+    """
+    p = X.shape[1]
+    eta_lo = -float(np.log(max_overdisp))
+    eta_hi = -float(np.log(min_overdisp))
+    eta_c_fixed = float(
+        np.clip(-np.log(max(phi_fixed, min_overdisp)), eta_lo, eta_hi)
+    )
+    s_s = 1.0 / max(1.0, float(np.sqrt(0.25 * max(1, m))))
+
+    def _hl_1d_scaled(z_1d: np.ndarray) -> tuple[float, np.ndarray]:
+        eta_s = float(z_1d[0]) * s_s
+        th = np.empty(p + 2, dtype=np.float64)
+        th[:p] = beta_fixed
+        th[p] = eta_s
+        th[p + 1] = eta_c_fixed
+        f, g = _hl_nll_and_grad(
+            th,
+            X,
+            log_offset,
+            subj,
+            m,
+            y_nz,
+            cell_idx,
+            subj_nz,
+            Y_subj,
+            Y_nz,
+            const_y_fact,
+            gaussian_prior=gaussian_prior,
+            laplace_order=laplace_order,
+        )
+        return f, np.array([g[p] * s_s], dtype=np.float64)
+
+    cand_s2 = [
+        float(np.clip(sigma2_init, min_overdisp * 2.0, max_overdisp * 0.5)),
+        float(np.clip(2.0 / max(kappa_obs, 1.0), min_overdisp * 2.0, max_overdisp * 0.5)),
+    ]
+    best_eta_s0 = float(np.clip(-np.log(cand_s2[0]), eta_lo + 0.01, eta_hi - 0.01))
+    best_f0 = _hl_1d_scaled(np.array([best_eta_s0 / s_s], dtype=np.float64))[0]
+    for c_s2 in cand_s2[1:]:
+        eta_try = float(np.clip(-np.log(c_s2), eta_lo + 0.01, eta_hi - 0.01))
+        f_try = _hl_1d_scaled(np.array([eta_try / s_s], dtype=np.float64))[0]
+        if np.isfinite(f_try) and f_try < best_f0:
+            best_f0 = f_try
+            best_eta_s0 = eta_try
+
+    z0 = np.array([best_eta_s0 / s_s], dtype=np.float64)
+    bounds: list[tuple[float | None, float | None]] = [(eta_lo / s_s, eta_hi / s_s)]
+    z_hat, ll, conv, n_iter = run_lbfgsb(_hl_1d_scaled, z0, bounds, max_iter, tol)
+    sigma2_hat = float(np.exp(-(float(z_hat[0]) * s_s)))
+    return sigma2_hat, ll, conv, n_iter
+
+
 def compute_schur_covariance(
     beta: np.ndarray,
     sigma2: float,

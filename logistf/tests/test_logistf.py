@@ -68,3 +68,33 @@ def test_quasi_complete_and_complete_separation_profile_ci_and_plrt():
     res_auto = fit_firth_logistic(X_with_const, y_quasi)
     assert res_auto.beta.shape == (2,)
     np.testing.assert_allclose(res_auto.beta, res_sep.beta, rtol=1e-6)
+
+
+def test_r_default_settings():
+    from logistf.core import _firth_eval
+
+    x = np.array([-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0])
+    y = (x > 0).astype(int)
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        fit_firth_logistic(x, y, settings="invalid")  # type: ignore[arg-type]
+
+    # 2. Exact 1-step check: R_default uses augmented X^T diag(w_i (1 + h_i)) X during scoring updates
+    X_des = np.column_stack([np.ones_like(x), x])
+    _, sc0, _, _, info_aug0 = _firth_eval(np.zeros(2), X_des, y.astype(float))
+    expected_step1_r = np.linalg.solve(info_aug0, sc0)
+    res_1iter_r = fit_firth_logistic(x, y, max_iter=1, pl=False, ci_method="wald", settings="R_default")
+    np.testing.assert_allclose(res_1iter_r.beta, expected_step1_r, rtol=1e-12, atol=1e-12)
+
+    # 3. Full convergence within max_iter=25, tol=1e-5 on complete 2x2 separation (OR == 81)
+    y_sep = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    x_sep = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    res_r = fit_firth_logistic(x_sep, y_sep, settings="R_default")
+    res_def = fit_firth_logistic(x_sep, y_sep, settings="default")
+    assert res_r.converged is True and res_r.n_iter <= 25
+    assert res_r.odds_ratio[1] == pytest.approx(81.0, rel=1e-4)
+    np.testing.assert_allclose(res_r.beta, res_def.beta, rtol=1e-4)
+    np.testing.assert_allclose(res_r.p_value, res_def.p_value, rtol=1e-4)
+    np.testing.assert_allclose(res_r.ci_low_or, res_def.ci_low_or, rtol=1e-4)
+

@@ -14,13 +14,22 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize, minimize_scalar
 
 from .formula import DesignSpec, coerce_expression_and_weights
+
+
+def validate_settings(settings: str) -> Literal["default", "R_default"]:
+    """Validate `settings` mode strictly ('default' or 'R_default')."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"`settings` must be 'default' or 'R_default', got {settings!r}."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -142,16 +151,19 @@ def _mme_profile_eval(
     s_Zy_resid: np.ndarray,
     s_yy_resid: float,
     df_resid: float,
+    n_obs: float | None = None,
+    reml: bool = True,
     block_sizes: np.ndarray,
     block_slices: list[slice],
     gamma_max: float,
     need_full: bool = False,
 ):
-    """Evaluate profiled REML objective and exact analytical gradient in m x m MME space."""
+    """Evaluate profiled REML or ML objective and exact analytical gradient in m x m MME space."""
     R = len(block_slices)
     m = S_ZZ.shape[0]
     r_x = S_XX.shape[0]
     I_rx = np.eye(r_x, dtype=np.float64)
+    eff_df = df_resid if reml else float(n_obs if n_obs is not None else (df_resid + r_x))
 
     g = np.clip(np.asarray(gamma, dtype=np.float64), 0.0, gamma_max)
     d_gamma = np.sqrt(g)
@@ -190,8 +202,8 @@ def _mme_profile_eval(
     delta_alpha = sol_X[:, r_x]
 
     q_val = max((s_yy_resid - float(r_y @ Minv_ry)) - float(delta_alpha @ XtHinv_y), 1e-300)
-    sigma_e_sq = q_val / df_resid
-    f_prof = df_resid * np.log(sigma_e_sq) + logdet_M + logdet_X
+    sigma_e_sq = q_val / eff_df
+    f_prof = eff_df * np.log(sigma_e_sq) + logdet_M + (logdet_X if reml else 0.0)
 
     A_Z = S_ZZ - SZZ_D @ Minv_SZZ_Dt
     A_ZX = S_XZ.T - SZZ_D @ Minv_RX
@@ -207,7 +219,8 @@ def _mme_profile_eval(
         tr_r = float(np.trace(S[sl, sl]))
         tr_S[r_idx] = tr_r
         psi_r = psi[sl]
-        grad[r_idx] = tr_r - float(psi_r @ psi_r) / sigma_e_sq
+        tr_grad = tr_r if reml else float(np.trace(A_Z[sl, sl]))
+        grad[r_idx] = tr_grad - float(psi_r @ psi_r) / sigma_e_sq
 
     if not need_full:
         return f_prof, grad
@@ -233,6 +246,8 @@ def _solve_mme_single_gene(
     compute_fisher: bool,
     gamma_override: np.ndarray | None = None,
     is_zero_resid: bool = False,
+    n_obs: float | None = None,
+    reml: bool = True,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -282,6 +297,8 @@ def _solve_mme_single_gene(
             s_Zy_resid=s_Zy_resid,
             s_yy_resid=s_yy_resid,
             df_resid=df_resid,
+            n_obs=n_obs,
+            reml=reml,
             block_sizes=block_sizes,
             block_slices=block_slices,
             gamma_max=gamma_max,
@@ -376,7 +393,8 @@ def _solve_mme_single_gene(
     alpha_hat = alpha_ols + delta_alpha
     sigma_r_sq = gamma_hat * sigma_e_sq
     u_hat = np.repeat(gamma_hat, block_sizes) * psi
-    reml_nll = 0.5 * (df_resid * np.log(2.0 * np.pi) + f_prof + df_resid - logdet_w)
+    eff_df_nll = df_resid if reml else float(n_obs if n_obs is not None else (df_resid + r_x))
+    reml_nll = 0.5 * (eff_df_nll * np.log(2.0 * np.pi) + f_prof + eff_df_nll - logdet_w)
     singular = bool(np.any(gamma_hat <= 1e-8))
 
     fisher_info: np.ndarray | None = None
@@ -656,8 +674,10 @@ def fit_lmm(
     max_iter: int = 200,
     tol: float = 1e-8,
     gamma_max: float = 1e6,
+    reml: bool = True,
     compute_fisher: bool = False,
     n_jobs: int = 1,
+    settings: Literal["default", "R_default"] = "default",
     _force_mme: bool = False,
 ) -> LMMFitResult:
     """Fit batched REML linear mixed models across G genes.
@@ -698,6 +718,7 @@ def fit_lmm(
     n_jobs : int
         Number of parallel workers (uses ``joblib`` if installed, else ``ThreadPoolExecutor``).
     """
+    validate_settings(settings)
     Y, W, shared_weights, design_spec, resolved_gene_names = coerce_expression_and_weights(
         expr,
         formula=formula,
@@ -814,15 +835,16 @@ def fit_lmm(
                 | ((rss_c / df_res) <= 1e-24 * tss_c)
                 | (rss_c <= 1e-27 * y_norm_c)
             )
-            se2_norm = np.where(zero_c, 0.0, rss_c / df_res)
+            df_div = df_res if reml else float(N)
+            se2_norm = np.where(zero_c, 0.0, rss_c / df_div)
             se2_vec = se2_norm * w_scale
-            logdet_xtx = 2.0 * float(np.sum(np.log(np.abs(np.diag(R_qr)))))
+            logdet_xtx = 2.0 * float(np.sum(np.log(np.abs(np.diag(R_qr))))) if reml else 0.0
             with np.errstate(divide="ignore"):
                 nll_raw = 0.5 * (
-                    df_res * np.log(2.0 * np.pi)
-                    + df_res * np.log(np.maximum(se2_norm, 1e-300))
+                    df_div * np.log(2.0 * np.pi)
+                    + df_div * np.log(np.maximum(se2_norm, 1e-300))
                     + logdet_xtx
-                    + df_res
+                    + df_div
                     - logdet_w
                 )
             nll_vec = np.where(zero_c, np.nan, nll_raw)
@@ -843,10 +865,10 @@ def fit_lmm(
                 fisher_info[complete_idx, 0, 0] = np.where(
                     zero_c,
                     0.0,
-                    df_res / np.maximum(2.0 * se2_vec * se2_vec, 1e-300),
+                    df_div / np.maximum(2.0 * se2_vec * se2_vec, 1e-300),
                 )
 
-        elif R == 1 and not _force_mme:
+        elif R == 1 and reml and not _force_mme:
             Z_w = d_w[:, None] * Z_full
             (
                 alpha_out,
@@ -934,6 +956,8 @@ def fit_lmm(
                     tol=tol,
                     compute_fisher=compute_fisher,
                     is_zero_resid=bool(zero_c[local_i]),
+                    n_obs=float(N),
+                    reml=reml,
                 )
 
             results_list = _parallel_map(_fit_one_complete, range(n_comp), n_jobs=n_jobs)
@@ -1039,18 +1063,19 @@ def fit_lmm(
                     nll_g = float("nan")
                     fi_g = np.zeros((1, 1), dtype=np.float64) if compute_fisher else None
                 else:
-                    se2_norm = rss_g / df_res_g
+                    df_div_g = df_res_g if reml else float(n_g)
+                    se2_norm = rss_g / df_div_g
                     se2_g = se2_norm * w_scale_g
-                    logdet_xtx = 2.0 * float(np.sum(np.log(np.abs(np.diag(R_qr)))))
+                    logdet_xtx = 2.0 * float(np.sum(np.log(np.abs(np.diag(R_qr))))) if reml else 0.0
                     nll_g = 0.5 * (
-                        df_res_g * np.log(2.0 * np.pi)
-                        + df_res_g * np.log(max(se2_norm, 1e-300))
+                        df_div_g * np.log(2.0 * np.pi)
+                        + df_div_g * np.log(max(se2_norm, 1e-300))
                         + logdet_xtx
-                        + df_res_g
+                        + df_div_g
                         - logdet_w_g
                     )
                     fi_g = (
-                        np.array([[df_res_g / max(2.0 * se2_g * se2_g, 1e-300)]], dtype=np.float64)
+                        np.array([[df_div_g / max(2.0 * se2_g * se2_g, 1e-300)]], dtype=np.float64)
                         if compute_fisher
                         else None
                     )
@@ -1114,6 +1139,8 @@ def fit_lmm(
                 tol=tol,
                 compute_fisher=compute_fisher,
                 is_zero_resid=is_zero_g,
+                n_obs=float(n_g),
+                reml=reml,
             )
             b_g, Vb_g, azx_lifted = _lift_estimates(
                 alpha_g, Va_g, azx_g, is_full_rank, lift_mat, T_proj

@@ -840,7 +840,8 @@ def test_constant_genes_invariance_and_missing_layer_and_weighted_fixed_var() ->
             "cond": pd.Categorical(cond, categories=["ctrl", "trt"]),
             "subject": subj,
             "batch": batch,
-        }
+        },
+        index=[f"cell_{i}" for i in range(N)],
     )
 
     G_real = 40
@@ -1362,4 +1363,112 @@ def test_collinear_random_effect_blocks_and_partial_nan_confounding() -> None:
         assert dr_d.lmm_fit.fisher_info is not None
         assert_allclose(dr_d.lmm_fit.fisher_info[:, 0, :], 0.0, atol=1e-12)
         assert_allclose(dr_d.lmm_fit.fisher_info[:, :, 0], 0.0, atol=1e-12)
+
+
+def _naive_nn_ml_nll(
+    y: np.ndarray,
+    X: np.ndarray,
+    Z_list: list[np.ndarray],
+    w: np.ndarray,
+    sigma_r_sq: np.ndarray,
+    sigma_e_sq: float,
+) -> float:
+    """Brute-force O(N^3) Maximum Likelihood (REML=False) negative log-likelihood oracle."""
+    N = X.shape[0]
+    V = np.diag(sigma_e_sq / w)
+    for sr2, Z_r in zip(sigma_r_sq, Z_list):
+        V = V + sr2 * (Z_r @ Z_r.T)
+    L_V, _ = cho_factor(V, lower=True)
+    logdet_V = 2.0 * float(np.sum(np.log(np.diag(L_V))))
+    Vinv_X = cho_solve((L_V, True), X)
+    XtVinvX = X.T @ Vinv_X
+    L_X, _ = cho_factor(XtVinvX, lower=True)
+    Vinv_y = cho_solve((L_V, True), y)
+    beta = cho_solve((L_X, True), X.T @ Vinv_y)
+    r = y - X @ beta
+    Vinv_r = cho_solve((L_V, True), r)
+    quad = float(r @ Vinv_r)
+    return 0.5 * (N * np.log(2.0 * np.pi) + logdet_V + quad)
+
+
+def test_settings_validation_and_r_default_ml_and_calcvarpart() -> None:
+    """
+    Verify `settings="R_default"` matches `GabrielHoffman/variancePartition`:
+      1. Strict `ValueError` on invalid `settings`.
+      2. ML (`reml=False`) default in `fit_extract_var_part_model` and exact match
+         against brute-force O(N^3) ML NLL & finite-difference ML gradient.
+      3. `calcVarPart.R` `(N-1)/N` fixed-effect variances rescaled so correlated
+         fixed predictors sum to `var_pop(X @ beta)`, and unweighted `sigma_e^2`.
+    """
+    rng = np.random.default_rng(2026)
+    N, G = 48, 12
+    z_lat = rng.normal(0.0, 1.0, size=N)
+    cov1 = z_lat + rng.normal(0.0, 0.4, size=N)
+    cov2 = -0.85 * z_lat + rng.normal(0.0, 0.4, size=N)  # strongly correlated with cov1
+    subj = np.repeat([f"S{i}" for i in range(12)], 4)
+    batch = np.tile(["B1", "B2", "B3", "B4"], 12)
+    meta = pd.DataFrame(
+        {"cov1": cov1, "cov2": cov2, "subject": subj, "batch": batch},
+        index=[f"samp_{i}" for i in range(N)],
+    )
+    W = rng.uniform(0.5, 3.0, size=N)
+    subj_codes = np.repeat(np.arange(12), 4)
+    Y = (
+        3.0
+        + 1.1 * cov1[:, None]
+        + 0.9 * cov2[:, None]
+        + rng.normal(0.0, 0.9, size=(12, G))[subj_codes]
+        + rng.normal(0.0, 0.6, size=(N, G)) / np.sqrt(W)[:, None]
+    )
+
+    with pytest.raises(ValueError, match="settings"):
+        fit_extract_var_part_model(Y, "~ cov1 + (1 | subject)", data=meta, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        dream(Y, "~ cov1 + (1 | subject)", data=meta, contrasts="cov1", settings="bad")  # type: ignore[arg-type]
+
+    # Verify ML (reml=False) exact NLL & analytical gradient vs O(N^3) ML oracle
+    spec2 = build_design("~ cov1 + cov2 + (1 | subject) + (1 | batch)", meta)
+    fit_ml = fit_lmm(Y[:, :4], spec2, weights=W, reml=False)
+    for g in range(4):
+        nll_ml_oracle = _naive_nn_ml_nll(
+            Y[:, g],
+            spec2.X,
+            spec2.random_matrices,
+            W,
+            fit_ml.sigma_r_sq[g],
+            float(fit_ml.sigma_e_sq[g]),
+        )
+        assert_allclose(fit_ml.reml_nll[g], nll_ml_oracle, atol=1e-8, rtol=1e-8)
+
+    # Verify R=0 ML divides RSS by N (not N - p)
+    fit_r0_ml = fit_lmm(Y[:, :4], "~ cov1 + cov2", data=meta, reml=False)
+    fit_r0_reml = fit_lmm(Y[:, :4], "~ cov1 + cov2", data=meta, reml=True)
+    assert_allclose(fit_r0_ml.sigma_e_sq, fit_r0_reml.sigma_e_sq * ((N - 3) / N), atol=1e-12)
+
+    # Verify fit_extract_var_part_model(..., settings="R_default") defaults to ML + calcVarPart.R
+    vp_r = fit_extract_var_part_model(
+        Y, "~ cov1 + cov2 + (1 | subject) + (1 | batch)", data=meta, weights=W, settings="R_default"
+    )
+    vp_def = fit_extract_var_part_model(
+        Y, "~ cov1 + cov2 + (1 | subject) + (1 | batch)", data=meta, weights=W, settings="default"
+    )
+    fit_full_ml = fit_lmm(
+        Y, "~ cov1 + cov2 + (1 | subject) + (1 | batch)", data=meta, weights=W, reml=False
+    )
+
+    # Check exact calcVarPart.R equations on fit_full_ml:
+    # sum of rescaled fixed-effect variances == var_pop(X @ beta), and residual == unweighted sigma_e_sq
+    X_mat = fit_full_ml.design.X
+    eta_tot = X_mat @ fit_full_ml.betas.T
+    expected_fixed_tot = np.var(eta_tot, axis=0, ddof=0)
+    assert_allclose(np.sum(vp_r.variances[:, :2], axis=1), expected_fixed_tot, atol=1e-11, rtol=1e-11)
+    assert_allclose(vp_r.variances[:, -1], fit_full_ml.sigma_e_sq, atol=1e-11, rtol=1e-11)
+    assert_allclose(vp_r.fractions.sum(axis=1), 1.0, atol=1e-12)
+    # Correlated cov1 & cov2 + unweighted sigma_e_sq produce measurably distinct fractions vs default
+    assert not np.allclose(vp_r.fractions, vp_def.fractions)
+
+    # dream accepts settings="R_default" cleanly
+    dr_r = dream(Y, "~ cov1 + cov2 + (1 | subject)", data=meta, contrasts="cov1", settings="R_default")
+    assert isinstance(dr_r, DreamResult)
+
 

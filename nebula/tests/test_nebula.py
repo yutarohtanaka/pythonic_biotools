@@ -1080,3 +1080,86 @@ def test_extreme_offsets_recovery_without_clamping() -> None:
             np.testing.assert_allclose(r_ext.se[0], r_base.se[0], rtol=1e-4, atol=1e-5)
             np.testing.assert_allclose(r_ext.p_value[0, 1:], r_base.p_value[0, 1:], rtol=1e-4, atol=1e-10)
 
+
+def test_settings_r_default_multi_tier_switching_and_validation() -> None:
+    """
+    Verify `settings="R_default"` vs `settings="default"` in `nebula`:
+    1. Strict `ValueError` on invalid `settings`.
+    2. Default `method_requested == "LN"` under `settings="R_default"`.
+    3. Cohort-wide `"HL"` when `mfs < 30` (`20 <= mfs < 30` stays `"LN"` in `"default"`
+       for low `phi`, but forces `"HL"` in `"R_default"`).
+    4. Multi-tier per-gene switching when `mfs >= 30`:
+       - `kappa_obs < 20`: full 2D `"HL"` refit
+       - `20 <= kappa_obs < 800` and `sigma2_ln < 8 / kappa_obs`: `"NBGMM (LN+HL)"` 1D-`sigma^2`
+         refit fixing `phi_hat = phi_ln`
+       - `sigma2_ln >= 8 / kappa_obs` or `kappa_obs >= 800`: stays `"LN"`
+    5. Automatic 2nd-order Laplace (`laplace_order=2`) for ultra-sparse genes with
+       `mean_count * mfs < 3` vs 1st-order Laplace (`laplace_order=1`) for `mean_count * mfs >= 3`.
+    """
+    rng = np.random.default_rng(202611)
+
+    # 1. Invalid settings raises ValueError
+    m_small, ni_small = 25, 24  # mfs = 24 (< 30, >= 20)
+    counts_24, subj_24, X_24, off_24 = _simulate_nbgmm(
+        rng,
+        m=m_small,
+        n_per_subj=ni_small,
+        beta_true=np.array([[0.4, 0.3, -0.2], [-3.2, 0.2, -0.1]], dtype=np.float64),
+        sigma2_true=np.array([0.4, 0.4]),
+        phi_true=np.array([0.2, 0.2]),
+    )
+    with pytest.raises(ValueError, match="settings"):
+        nebula(counts_24, id=subj_24, pred=X_24[:, 1:], settings="bad_mode")  # type: ignore[arg-type]
+
+    # 2 & 3 & 5. Cohort-wide mfs=24 < 30 forces "HL", with laplace_order=1 for abundant gene 0
+    # (mean_count * 24 >> 3) and laplace_order=2 for ultra-sparse gene 1 (mean_count * 24 < 3)
+    res_24_def = nebula(counts_24, id=subj_24, pred=X_24[:, 1:], offset=off_24, settings="default")
+    res_24_r = nebula(counts_24, id=subj_24, pred=X_24[:, 1:], offset=off_24, settings="R_default")
+    assert res_24_def.method_requested == "auto"
+    assert res_24_r.method_requested == "LN"
+    assert res_24_def.algorithm == ["LN", "LN"]
+    assert res_24_r.algorithm == ["HL", "HL"]
+    assert res_24_r.cpc[0] * 24.0 >= 3.0
+    assert res_24_r.cpc[1] * 24.0 < 3.0
+    assert res_24_r.laplace_orders is not None
+    assert list(res_24_r.laplace_orders) == [1, 2]
+    assert np.all(res_24_r.converged)
+
+    # 4. Multi-tier switching at mfs = 40 (>= 30) across 4 distinct regimes:
+    # Gene 0: phi=0.4 (kappa_obs ~ 100 in [20,800)), sigma2=0.8 (>= 8/100=0.08) -> "LN"
+    # Gene 1: phi=4.5 (kappa_obs ~ 9 < 20), sigma2=0.5 -> full 2D "HL"
+    # Gene 2: phi=0.5 (kappa_obs ~ 80 in [20,800)), sigma2=0.015 (< 8/80=0.10) -> "NBGMM (LN+HL)"
+    # Gene 3: phi=0.0 (kappa_obs >> 800), sigma2=0.01 -> stays "LN"
+    m_40, ni_40 = 45, 40
+    beta_4 = np.array(
+        [
+            [0.3, 0.4, -0.3],
+            [0.3, 0.4, -0.3],
+            [0.3, 0.4, -0.3],
+            [0.3, 0.4, -0.3],
+        ],
+        dtype=np.float64,
+    )
+    counts_40, subj_40, X_40, off_40 = _simulate_nbgmm(
+        rng,
+        m=m_40,
+        n_per_subj=ni_40,
+        beta_true=beta_4,
+        sigma2_true=np.array([0.8, 0.5, 0.015, 0.01]),
+        phi_true=np.array([0.4, 4.5, 0.5, 0.0]),
+    )
+    res_40_r = nebula(counts_40, id=subj_40, pred=X_40[:, 1:], offset=off_40, settings="R_default")
+    res_40_pure_ln = nebula(
+        counts_40, id=subj_40, pred=X_40[:, 1:], offset=off_40, method="LN", settings="default"
+    )
+
+    assert res_40_r.algorithm == ["LN", "HL", "NBGMM (LN+HL)", "LN"]
+    assert np.all(res_40_r.converged)
+    # In NBGMM (LN+HL), phi_hat and beta_hat are fixed at their LN estimates while sigma^2 is refit via HL
+    np.testing.assert_allclose(
+        res_40_r.overdispersion_cell[2], res_40_pure_ln.overdispersion_cell[2], rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_allclose(res_40_r.log_fc[2], res_40_pure_ln.log_fc[2], rtol=1e-12, atol=1e-12)
+    assert np.isfinite(res_40_r.overdispersion_subject[2]) and res_40_r.overdispersion_subject[2] > 0.0
+
+

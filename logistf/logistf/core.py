@@ -10,11 +10,19 @@ Likelihood confidence intervals under complete or quasi-complete separation
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import optimize, special, stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -56,8 +64,8 @@ def _firth_eval(
     x: np.ndarray,
     y_bin: np.ndarray,
     ridge_lambda: float = 0.0,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate exact Firth penalized log-likelihood, modified score U*(beta), I(beta), and I(beta)^{-1}."""
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate Firth penalized log-likelihood, modified score U*(beta), I(beta), I(beta)^{-1}, and augmented I_aug."""
     p = x.shape[1]
     eta = x @ beta
     pi = special.expit(eta)
@@ -70,7 +78,8 @@ def _firth_eval(
 
     sign_det, logdet = np.linalg.slogdet(info)
     if sign_det <= 0.0 or not np.isfinite(logdet):
-        return float("-inf"), np.zeros(p, dtype=np.float64), info, np.zeros((p, p), dtype=np.float64)
+        zeros_m = np.zeros((p, p), dtype=np.float64)
+        return float("-inf"), np.zeros(p, dtype=np.float64), info, zeros_m, info
 
     try:
         info_inv = np.linalg.inv(info)
@@ -78,6 +87,10 @@ def _firth_eval(
         info_inv = np.linalg.pinv(info)
 
     h_diag = w * np.sum((x @ info_inv) * x, axis=1)
+    info_aug = x.T @ (x * (w * (1.0 + h_diag))[:, None])
+    if ridge_lambda > 0.0:
+        info_aug = info_aug + ridge_lambda * np.eye(p)
+
     score_star = x.T @ (y_bin - pi + h_diag * (0.5 - pi))
     if ridge_lambda > 0.0:
         score_star = score_star - ridge_lambda * beta
@@ -89,7 +102,7 @@ def _firth_eval(
     if ridge_lambda > 0.0:
         ll_pen -= 0.5 * ridge_lambda * float(np.sum(beta**2))
 
-    return ll_pen, score_star, info, info_inv
+    return ll_pen, score_star, info, info_inv, info_aug
 
 
 def _maximize_constrained(
@@ -102,12 +115,13 @@ def _maximize_constrained(
     max_iter: int = 60,
     max_step_halving: int = 15,
     tol: float = 1e-6,
+    use_augmented_info: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Maximize full-matrix Firth penalized log-likelihood holding `beta[fixed_idx] = fixed_val`."""
     p = x.shape[1]
     if p == 1:
         b_full = np.array([fixed_val], dtype=np.float64)
-        ll, _, _, _ = _firth_eval(b_full, x, y_bin, ridge_lambda=ridge_lambda)
+        ll, _, _, _, _ = _firth_eval(b_full, x, y_bin, ridge_lambda=ridge_lambda)
         return ll, b_full
 
     free_idx = [k for k in range(p) if k != fixed_idx]
@@ -119,10 +133,10 @@ def _maximize_constrained(
         return b
 
     b_free = free_init.copy()
-    ll, score, info, _ = _firth_eval(_assemble(b_free), x, y_bin, ridge_lambda=ridge_lambda)
+    ll, score, info, _, info_aug = _firth_eval(_assemble(b_free), x, y_bin, ridge_lambda=ridge_lambda)
     if not np.isfinite(ll):
         b_free = np.zeros(len(free_idx), dtype=np.float64)
-        ll, score, info, _ = _firth_eval(_assemble(b_free), x, y_bin, ridge_lambda=ridge_lambda)
+        ll, score, info, _, info_aug = _firth_eval(_assemble(b_free), x, y_bin, ridge_lambda=ridge_lambda)
 
     converged = False
     for _ in range(max_iter):
@@ -130,7 +144,8 @@ def _maximize_constrained(
         if np.isfinite(ll) and float(np.max(np.abs(score_sub))) < tol:
             converged = True
             break
-        info_sub = info[np.ix_(free_idx, free_idx)]
+        cur_mat = info_aug if use_augmented_info else info
+        info_sub = cur_mat[np.ix_(free_idx, free_idx)]
         step = np.linalg.pinv(info_sub) @ score_sub
         step_norm = float(np.max(np.abs(step)))
         if step_norm > 5.0:
@@ -140,28 +155,32 @@ def _maximize_constrained(
         accepted = False
         for _ in range(max_step_halving):
             cand_free = b_free + alpha * step
-            ll_cand, sc_cand, inf_cand, _ = _firth_eval(_assemble(cand_free), x, y_bin, ridge_lambda=ridge_lambda)
+            ll_cand, sc_cand, inf_cand, _, inf_aug_cand = _firth_eval(
+                _assemble(cand_free), x, y_bin, ridge_lambda=ridge_lambda
+            )
             if np.isfinite(ll_cand) and ll_cand >= ll - 1e-12:
-                if float(np.max(np.abs(cand_free - b_free))) < tol and float(np.max(np.abs(sc_cand[free_idx]))) < 1e-4:
-                    b_free, ll, score, info = cand_free, ll_cand, sc_cand, inf_cand
+                if float(np.max(np.abs(cand_free - b_free))) < tol and float(np.max(np.abs(sc_cand[free_idx]))) < max(
+                    tol, 1e-4
+                ):
+                    b_free, ll, score, info, info_aug = cand_free, ll_cand, sc_cand, inf_cand, inf_aug_cand
                     converged = True
                 else:
-                    b_free, ll, score, info = cand_free, ll_cand, sc_cand, inf_cand
+                    b_free, ll, score, info, info_aug = cand_free, ll_cand, sc_cand, inf_cand, inf_aug_cand
                 accepted = True
                 break
             alpha *= 0.5
         if converged or not accepted:
             break
 
-    if not converged and np.isfinite(ll):
+    if not converged and not use_augmented_info and np.isfinite(ll):
         def _neg_obj(bf: np.ndarray) -> tuple[float, np.ndarray]:
-            val, sc, _, _ = _firth_eval(_assemble(bf), x, y_bin, ridge_lambda=ridge_lambda)
+            val, sc, _, _, _ = _firth_eval(_assemble(bf), x, y_bin, ridge_lambda=ridge_lambda)
             if not np.isfinite(val):
                 return 1e100, np.zeros_like(bf)
             return -val, -sc[free_idx]
 
         opt = optimize.minimize(_neg_obj, b_free, method="BFGS", jac=True, options={"gtol": 1e-6, "maxiter": 60})
-        val_opt, _, _, _ = _firth_eval(_assemble(opt.x), x, y_bin, ridge_lambda=ridge_lambda)
+        val_opt, _, _, _, _ = _firth_eval(_assemble(opt.x), x, y_bin, ridge_lambda=ridge_lambda)
         if np.isfinite(val_opt) and val_opt > ll:
             b_free = opt.x
             ll = val_opt
@@ -180,6 +199,9 @@ def _profile_ci_bound(
     y_bin: np.ndarray,
     ridge_lambda: float,
     alpha: float,
+    use_augmented_info: bool = False,
+    max_iter: int = 60,
+    tol: float = 1e-6,
 ) -> float:
     """Find one-sided profile penalized likelihood CI root `tilde_ell*(b) == ll_target` along `direction` (-1 or +1)."""
     p = x.shape[1]
@@ -197,14 +219,21 @@ def _profile_ci_bound(
 
     delta = step0
     b_out = b_in + direction * delta
-    warm_out = warm_in
     found_bracket = False
 
     for _ in range(16):
         b_try = float(beta_hat[j]) + direction * delta
         warm_guess = warm_in + tangent * (b_try - b_in) if free_idx else warm_in
         ll_try, full_try = _maximize_constrained(
-            j, b_try, warm_guess, x, y_bin, ridge_lambda=ridge_lambda
+            j,
+            b_try,
+            warm_guess,
+            x,
+            y_bin,
+            ridge_lambda=ridge_lambda,
+            max_iter=max_iter,
+            tol=tol,
+            use_augmented_info=use_augmented_info,
         )
         if not np.isfinite(ll_try) or ll_try <= ll_target:
             b_out = b_try
@@ -225,7 +254,15 @@ def _profile_ci_bound(
     def _root_fn(b_val: float) -> float:
         guess = warm_in + tangent * (b_val - b_in) if free_idx else warm_cache[0]
         ll_val, full_val = _maximize_constrained(
-            j, float(b_val), guess, x, y_bin, ridge_lambda=ridge_lambda
+            j,
+            float(b_val),
+            guess,
+            x,
+            y_bin,
+            ridge_lambda=ridge_lambda,
+            max_iter=max_iter,
+            tol=tol,
+            use_augmented_info=use_augmented_info,
         )
         if np.isfinite(ll_val) and free_idx:
             warm_cache[0] = full_val[free_idx].copy()
@@ -235,7 +272,7 @@ def _profile_ci_bound(
 
     lo_b, hi_b = (b_out, b_in) if direction < 0.0 else (b_in, b_out)
     try:
-        return float(optimize.brentq(_root_fn, lo_b, hi_b, xtol=1e-6, maxiter=60))
+        return float(optimize.brentq(_root_fn, lo_b, hi_b, xtol=tol, maxiter=60))
     except ValueError:
         return float(b_out)
 
@@ -249,9 +286,11 @@ def fit_firth_logistic(
     ci_method: str = "profile",
     pl: bool = True,
     alpha: float = 0.05,
-    max_iter: int = 80,
+    max_iter: int | None = None,
     max_step_halving: int = 15,
-    tol: float = 1e-7,
+    tol: float | None = None,
+    *,
+    settings: SettingsMode = "default",
 ) -> FirthLogisticResult:
     """Fit Firth-penalized (Jeffreys-prior) logistic regression via modified Fisher scoring with step-halving.
 
@@ -270,9 +309,18 @@ def fit_firth_logistic(
     pl : bool, default True
         When `True`, computes `p_value` via the 1-df Penalized Likelihood Ratio Test (PLRT);
         when `False`, uses two-sided Wald normal p-values.
+    settings : {'default', 'R_default'}, default 'default'
+        When `'R_default'`, matches `georgheinze/logistf` (`src/logistf.c`): uses the augmented
+        Newton-Fisher information matrix `X^T diag(w_i (1 + h_i)) X` during scoring updates with
+        `max_iter=25, tol=1e-5`.
     """
+    _validate_settings(settings)
     if ci_method not in ("profile", "wald"):
         raise ValueError(f"ci_method must be 'profile' or 'wald', got {ci_method!r}.")
+
+    use_aug = settings == "R_default"
+    max_iter_eff = (25 if use_aug else 80) if max_iter is None else int(max_iter)
+    tol_eff = (1e-5 if use_aug else 1e-7) if tol is None else float(tol)
 
     if isinstance(X, pd.DataFrame):
         names = [str(c) for c in X.columns] if coef_names is None else [str(c) for c in coef_names]
@@ -301,20 +349,27 @@ def fit_firth_logistic(
 
     _, p = x.shape
     beta = np.zeros(p, dtype=np.float64)
-    ll, score_star, info, info_inv = _firth_eval(beta, x, y_bin, ridge_lambda=ridge_lambda)
+    ll, score_star, info, info_inv, info_aug = _firth_eval(beta, x, y_bin, ridge_lambda=ridge_lambda)
     if not np.isfinite(ll):
         raise ValueError("Design matrix X is rank-deficient at initialization (det(X^T W X) == 0).")
 
     converged = False
     n_iter = 0
 
-    for it in range(1, max_iter + 1):
+    for it in range(1, max_iter_eff + 1):
         n_iter = it
-        if float(np.max(np.abs(score_star))) < tol:
+        if float(np.max(np.abs(score_star))) < tol_eff:
             converged = True
             break
 
-        step = info_inv @ score_star
+        if use_aug:
+            try:
+                step = np.linalg.solve(info_aug, score_star)
+            except np.linalg.LinAlgError:
+                step = np.linalg.pinv(info_aug) @ score_star
+        else:
+            step = info_inv @ score_star
+
         step_norm = float(np.max(np.abs(step)))
         if step_norm > 5.0:
             step = step * (5.0 / step_norm)
@@ -323,32 +378,39 @@ def fit_firth_logistic(
         accepted = False
         for _ in range(max_step_halving):
             beta_cand = beta + step_scale * step
-            ll_cand, sc_cand, inf_cand, inf_inv_cand = _firth_eval(
+            ll_cand, sc_cand, inf_cand, inf_inv_cand, inf_aug_cand = _firth_eval(
                 beta_cand, x, y_bin, ridge_lambda=ridge_lambda
             )
             if np.isfinite(ll_cand) and ll_cand >= ll - 1e-12:
                 delta_b = float(np.max(np.abs(beta_cand - beta)))
-                beta, ll, score_star, info, info_inv = beta_cand, ll_cand, sc_cand, inf_cand, inf_inv_cand
+                beta, ll, score_star, info, info_inv, info_aug = (
+                    beta_cand,
+                    ll_cand,
+                    sc_cand,
+                    inf_cand,
+                    inf_inv_cand,
+                    inf_aug_cand,
+                )
                 accepted = True
-                if delta_b < tol and float(np.max(np.abs(score_star))) < 1e-5:
+                if delta_b < tol_eff and float(np.max(np.abs(score_star))) < max(tol_eff, 1e-5):
                     converged = True
                 break
             step_scale *= 0.5
 
-        if converged:
-            break
-        if not accepted:
+        if converged or not accepted:
             break
 
-    if not converged:
+    if not converged and not use_aug:
         def _neg_ll_and_grad(b: np.ndarray) -> tuple[float, np.ndarray]:
-            val, sc, _, _ = _firth_eval(b, x, y_bin, ridge_lambda=ridge_lambda)
+            val, sc, _, _, _ = _firth_eval(b, x, y_bin, ridge_lambda=ridge_lambda)
             if not np.isfinite(val):
                 return 1e100, np.zeros_like(b)
             return -val, -sc
 
-        opt = optimize.minimize(_neg_ll_and_grad, beta, method="BFGS", jac=True, options={"gtol": tol, "maxiter": max_iter})
-        ll_opt, sc_opt, inf_opt, inf_inv_opt = _firth_eval(opt.x, x, y_bin, ridge_lambda=ridge_lambda)
+        opt = optimize.minimize(
+            _neg_ll_and_grad, beta, method="BFGS", jac=True, options={"gtol": tol_eff, "maxiter": max_iter_eff}
+        )
+        ll_opt, sc_opt, inf_opt, inf_inv_opt, _ = _firth_eval(opt.x, x, y_bin, ridge_lambda=ridge_lambda)
         if np.isfinite(ll_opt) and ll_opt >= ll - 1e-12:
             beta, ll, score_star, info, info_inv = opt.x, ll_opt, sc_opt, inf_opt, inf_inv_opt
             n_iter += int(opt.nit)
@@ -359,6 +421,9 @@ def fit_firth_logistic(
     z_stat = beta / se
     z_crit = float(stats.norm.isf(alpha / 2.0))
 
+    sub_max_iter = 25 if use_aug else 60
+    sub_tol = 1e-5 if use_aug else 1e-6
+
     if pl:
         p_val = np.empty(p, dtype=np.float64)
         for j in range(p):
@@ -368,7 +433,17 @@ def fit_firth_logistic(
                 warm_null = beta[free_idx] + tangent * (0.0 - beta[j])
             else:
                 warm_null = np.array([], dtype=np.float64)
-            ll_null, _ = _maximize_constrained(j, 0.0, warm_null, x, y_bin, ridge_lambda=ridge_lambda)
+            ll_null, _ = _maximize_constrained(
+                j,
+                0.0,
+                warm_null,
+                x,
+                y_bin,
+                ridge_lambda=ridge_lambda,
+                max_iter=sub_max_iter,
+                tol=sub_tol,
+                use_augmented_info=use_aug,
+            )
             dev = max(0.0, 2.0 * (ll - ll_null)) if np.isfinite(ll_null) else np.inf
             p_val[j] = float(stats.chi2.sf(dev, df=1))
     else:
@@ -381,10 +456,34 @@ def fit_firth_logistic(
         ci_high_b = np.empty(p, dtype=np.float64)
         for j in range(p):
             ci_low_b[j] = _profile_ci_bound(
-                j, -1.0, beta, float(se[j]), info, ll_target, x, y_bin, ridge_lambda, alpha
+                j,
+                -1.0,
+                beta,
+                float(se[j]),
+                info,
+                ll_target,
+                x,
+                y_bin,
+                ridge_lambda,
+                alpha,
+                use_augmented_info=use_aug,
+                max_iter=sub_max_iter,
+                tol=sub_tol,
             )
             ci_high_b[j] = _profile_ci_bound(
-                j, +1.0, beta, float(se[j]), info, ll_target, x, y_bin, ridge_lambda, alpha
+                j,
+                +1.0,
+                beta,
+                float(se[j]),
+                info,
+                ll_target,
+                x,
+                y_bin,
+                ridge_lambda,
+                alpha,
+                use_augmented_info=use_aug,
+                max_iter=sub_max_iter,
+                tol=sub_tol,
             )
     else:
         ci_low_b = beta - z_crit * se

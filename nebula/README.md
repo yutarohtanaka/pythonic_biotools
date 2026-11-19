@@ -41,6 +41,23 @@ print(res.summary())
 print(res.to_dataframe().head())
 ```
 
+## Exact `lhe17/nebula` v1.5.9 Parity (`settings="R_default"`)
+
+`nebula(...)` accepts `settings: Literal["default", "R_default"] = "default"` (strictly validated; raises `ValueError` on unknown values):
+
+| Component | `settings="default"` (Pythonic default) | `settings="R_default"` (`lhe17/nebula` v1.5.9 `nebula.R` parity) |
+| :--- | :--- | :--- |
+| **Default `method`** | `"auto"` | `"LN"` (multi-tier adaptive switcher unless `method="HL"`) |
+| **Cohort-wide `HL` gate** | $\text{mfs} < \text{cutoff\_cell}$ (`20`) | $\text{mfs} < 30$ forces cohort-wide `"HL"` |
+| **Full 2D `HL` refit** | $\text{mfs} / \hat{\phi}_{\text{LN}} < \text{cutoff\_cell}$ (`20`) | $\text{mfs} / \hat{\phi}_{\text{LN}} < 20$ (`cutoff_cell`) refits full 2D `"HL"` |
+| **`NBGMM (LN+HL)` 1D-$\sigma^2$ tier** | Not triggered | When $20 \le \kappa_{\text{obs}} < 800$ (`kappa`) and $\hat{\sigma}^2_{\text{LN}} < 8 / \kappa_{\text{obs}}$, fixes $(\hat{\beta}_{\text{LN}}, \hat{\phi}_{\text{LN}})$ and refits $\sigma^2$ in 1D under h-likelihood |
+| **Laplace order (`laplace_order`)** | `2` (Gamma-saddlepoint) | `1` by default, switching automatically to `2` (2nd-order Laplace / Gamma-saddlepoint) for ultra-sparse genes with $\text{mean\_count} \cdot \text{mfs} < 3$ |
+
+```python
+res_r = nebula(adata, id="subject", pred=["condition", "cell_cov"], settings="R_default")
+print(res_r.overdispersion_dataframe().head())
+```
+
 ## License
 
 MIT (clean-room Python implementation matching the MIT-licensed `lhe17/nebula` algorithm).

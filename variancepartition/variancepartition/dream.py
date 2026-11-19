@@ -7,14 +7,14 @@ of freedom and Empirical Bayes variance moderation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .ebayes import _moderated_p_and_fdr, squeeze_var
 from .formula import DesignSpec, coerce_expression_and_weights, make_contrasts
-from .lmm import LMMFitResult, fit_lmm
+from .lmm import LMMFitResult, fit_lmm, validate_settings
 
 
 def _resolve_coef_index(coef: int | str, contrast_names: Sequence[str]) -> int:
@@ -215,10 +215,12 @@ def dream(
     trend: bool = False,
     winsor_tail_p: tuple[float, float] = (0.05, 0.10),
     min_df: float = 1.0,
+    reml: bool = True,
     max_iter: int = 200,
     tol: float = 1e-8,
     gamma_max: float = 1e6,
     n_jobs: int = 1,
+    settings: Literal["default", "R_default"] = "default",
 ) -> DreamResult | DreamFit:
     """Fit precision-weighted mixed-effects models and test linear contrasts via ``dream``.
 
@@ -230,6 +232,7 @@ def dream(
     degrees of freedom even at boundary fits ``sigma_r^2 = 0`` when ``R >= 1``, and
     reducing identically to ``N_obs - rank(X_obs)`` when ``R = 0``.
     """
+    validate_settings(settings)
     if min_df <= 0.0:
         raise ValueError(f"min_df must be > 0, got {min_df}.")
 
@@ -269,8 +272,10 @@ def dream(
         max_iter=max_iter,
         tol=tol,
         gamma_max=gamma_max,
+        reml=reml,
         compute_fisher=True,
         n_jobs=n_jobs,
+        settings=settings,
     )
 
     N, G = Y.shape

@@ -19,6 +19,14 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
+
 
 @dataclass(frozen=True)
 class ConfidenceBandResult:
@@ -82,6 +90,7 @@ class TimeROCResult:
     # Internal cohort fingerprint for validating paired `compare_timeroc` calls
     _T: np.ndarray
     _delta: np.ndarray
+    _settings: SettingsMode = "default"
 
     def confidence_intervals(
         self,
@@ -462,6 +471,24 @@ def _compute_auc_iid_single_horizon(
     return (u_known + m_corr) / (p1 * pc)
 
 
+def _iid_cov_and_se(phi_mat: np.ndarray, ddof: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Compute asymptotic covariance and SE of `mean(phi_mat)` (`ddof=0` -> `/n^2`, `ddof=1` -> `/(n*(n-1))`)."""
+    n, k = phi_mat.shape
+    cov = np.full((k, k), np.nan, dtype=np.float64)
+    valid_cols = np.all(np.isfinite(phi_mat), axis=0)
+    if np.any(valid_cols):
+        sub = phi_mat[:, valid_cols]
+        if ddof == 1:
+            sub = sub - np.mean(sub, axis=0, keepdims=True)
+            denom = float(n) * float(max(n - 1, 1))
+        else:
+            denom = float(n) ** 2
+        cov[np.ix_(valid_cols, valid_cols)] = (sub.T @ sub) / denom
+    se = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    se[~valid_cols] = np.nan
+    return cov, se
+
+
 def time_roc(
     T: Sequence[float] | np.ndarray,
     delta: Sequence[int] | np.ndarray,
@@ -473,8 +500,10 @@ def time_roc(
     other_markers: np.ndarray | pd.DataFrame | None = None,
     cutpoints: Sequence[float] | np.ndarray | None = None,
     iid: bool | None = None,
+    settings: SettingsMode = "default",
 ) -> TimeROCResult:
     """Estimate IPCW time-dependent ROC curves, competing-risks AUCs, and IID influence functions."""
+    _validate_settings(settings)
     t_arr = np.asarray(T, dtype=np.float64).ravel()
     d_raw = np.asarray(delta)
     if d_raw.ndim != 1 and d_raw.size != t_arr.size:
@@ -569,7 +598,12 @@ def time_roc(
     cut_pos = np.searchsorted(uniq_m, cuts, side="right")  # in {0, ..., uniq_m.size}
 
     for l_idx, th in enumerate(horizons):
-        case_mask = (t_arr <= th) & (d_arr == cause_int)
+        if settings == "R_default":
+            # CRAN `timeROC` v0.4.1 (`timeROC_3.R`): strict `T < t` for cases in point estimates
+            case_mask = (t_arr < th) & (d_arr == cause_int)
+        else:
+            case_mask = (t_arr <= th) & (d_arr == cause_int)
+        case_mask_iid = (t_arr <= th) & (d_arr == cause_int)
         comp_mask = (t_arr <= th) & (d_arr != 0) & (d_arr != cause_int)
         surv_mask = t_arr > th
 
@@ -578,16 +612,25 @@ def time_roc(
         n_surv_vec[l_idx] = int(np.sum(surv_mask))
 
         g_t_col = g_t_subj[:, l_idx]
-        if np.any(case_mask & (g_minus_subj <= 0.0)) or np.any(comp_mask & (g_minus_subj <= 0.0)):
+        if np.any(case_mask_iid & (g_minus_subj <= 0.0)) or np.any(comp_mask & (g_minus_subj <= 0.0)):
             continue
         if np.any(surv_mask & (g_t_col <= 0.0)):
             continue
 
         w1 = np.where(case_mask, 1.0 / np.maximum(g_minus_subj, 1e-300), 0.0)
+        w1_iid = np.where(case_mask_iid, 1.0 / np.maximum(g_minus_subj, 1e-300), 0.0)
         w2 = np.where(comp_mask, 1.0 / np.maximum(g_minus_subj, 1e-300), 0.0)
         w0 = np.where(surv_mask, 1.0 / np.maximum(g_t_col, 1e-300), 0.0)
-        wc1 = w0 + w2  # Definition 1 controls: survivors + competing events
-        wc2 = w0  # Definition 2 controls: strictly event-free survivors
+
+        if settings == "R_default":
+            # CRAN `timeROC` label convention:
+            #   AUC_1 / Sp_1: strictly event-free survivors (`T > t`)
+            #   AUC_2 / Sp_2: survivors + prior competing events (`T > t` or `(T <= t, delta != cause)`)
+            wc1 = w0
+            wc2 = w0 + w2
+        else:
+            wc1 = w0 + w2  # Definition 1 controls: survivors + competing events
+            wc2 = w0  # Definition 2 controls: strictly event-free survivors
 
         f_1[l_idx] = float(np.mean(w1))
         f_2[l_idx] = float(np.mean(w2))
@@ -619,17 +662,26 @@ def time_roc(
         if sum_w1 > 0.0 and sum_wc1 > 0.0:
             mu1, ac1, b1_1 = _concordance_partials(marker_inv, uniq_m.size, w1, wc1, n)
             auc_1[l_idx] = mu1 / (f_1[l_idx] * float(np.mean(wc1)))
-            if compute_iid and iid_1 is not None:
-                iid_1[:, l_idx] = _compute_auc_iid_single_horizon(
-                    t_arr, d_arr, float(th), w1, wc1, auc_1[l_idx], ac1, b1_1, u_cens, d_cens, y_cens
-                )
 
         if sum_w1 > 0.0 and sum_wc2 > 0.0:
             mu2, ac2, b1_2 = _concordance_partials(marker_inv, uniq_m.size, w1, wc2, n)
             auc_2[l_idx] = mu2 / (f_1[l_idx] * float(np.mean(wc2)))
-            if compute_iid and iid_2 is not None:
+
+        if compute_iid and iid_1 is not None and iid_2 is not None:
+            w1_for_iid = w1_iid if settings == "R_default" else w1
+            sum_w1_iid = float(np.sum(w1_for_iid))
+            f1_iid = float(np.mean(w1_for_iid))
+            if sum_w1_iid > 0.0 and sum_wc1 > 0.0:
+                mu1_i, ac1_i, b1_1_i = _concordance_partials(marker_inv, uniq_m.size, w1_for_iid, wc1, n)
+                auc1_i = mu1_i / (f1_iid * float(np.mean(wc1)))
+                iid_1[:, l_idx] = _compute_auc_iid_single_horizon(
+                    t_arr, d_arr, float(th), w1_for_iid, wc1, auc1_i, ac1_i, b1_1_i, u_cens, d_cens, y_cens
+                )
+            if sum_w1_iid > 0.0 and sum_wc2 > 0.0:
+                mu2_i, ac2_i, b1_2_i = _concordance_partials(marker_inv, uniq_m.size, w1_for_iid, wc2, n)
+                auc2_i = mu2_i / (f1_iid * float(np.mean(wc2)))
                 iid_2[:, l_idx] = _compute_auc_iid_single_horizon(
-                    t_arr, d_arr, float(th), w1, wc2, auc_2[l_idx], ac2, b1_2, u_cens, d_cens, y_cens
+                    t_arr, d_arr, float(th), w1_for_iid, wc2, auc2_i, ac2_i, b1_2_i, u_cens, d_cens, y_cens
                 )
 
     cov_1: np.ndarray | None = None
@@ -637,10 +689,9 @@ def time_roc(
     se_1: np.ndarray | None = None
     se_2: np.ndarray | None = None
     if compute_iid and iid_1 is not None and iid_2 is not None:
-        cov_1 = (iid_1.T @ iid_1) / (float(n) ** 2)
-        cov_2 = (iid_2.T @ iid_2) / (float(n) ** 2)
-        se_1 = np.sqrt(np.maximum(np.diag(cov_1), 0.0))
-        se_2 = np.sqrt(np.maximum(np.diag(cov_2), 0.0))
+        ddof_se = 1 if settings == "R_default" else 0
+        cov_1, se_1 = _iid_cov_and_se(iid_1, ddof=ddof_se)
+        cov_2, se_2 = _iid_cov_and_se(iid_2, ddof=ddof_se)
 
     return TimeROCResult(
         n_subjects=n,
@@ -670,6 +721,7 @@ def time_roc(
         fp_2=fp2_mat,
         _T=t_arr.copy(),
         _delta=d_arr.copy(),
+        _settings=settings,
     )
 
 
@@ -680,30 +732,35 @@ def compare_timeroc(
     definition: Literal[1, 2] = 1,
     n_sim: int = 2000,
     seed: int | np.random.Generator | None = 42,
+    settings: SettingsMode = "default",
 ) -> CompareTimeROCResult:
     """Compare two rival biomarkers measured on the same cohort via paired IID influence differences."""
+    _validate_settings(settings)
     if definition not in (1, 2):
         raise ValueError("definition must be 1 or 2.")
     if fit1.n_subjects != fit2.n_subjects or fit1.cause != fit2.cause:
         raise ValueError("fit1 and fit2 must be fit on the exact same cohort and primary cause.")
+    if fit1._settings != fit2._settings:
+        raise ValueError(f"fit1 ({fit1._settings!r}) and fit2 ({fit2._settings!r}) were fit with different settings.")
     if not (np.allclose(fit1._T, fit2._T, atol=1e-12) and np.array_equal(fit1._delta, fit2._delta)):
         raise ValueError("fit1 and fit2 follow-up times T and event indicators delta do not match.")
     if fit1.times.shape != fit2.times.shape or not np.allclose(fit1.times, fit2.times, atol=1e-12):
         raise ValueError("fit1 and fit2 must be evaluated at identical horizons `times`.")
 
-    phi1 = fit1.iid_auc_1 if definition == 1 else fit1.iid_auc_2
-    phi2 = fit2.iid_auc_1 if definition == 1 else fit2.iid_auc_2
+    slot = definition if fit1._settings == settings else (2 if definition == 1 else 1)
+    phi1 = fit1.iid_auc_1 if slot == 1 else fit1.iid_auc_2
+    phi2 = fit2.iid_auc_1 if slot == 1 else fit2.iid_auc_2
     if phi1 is None or phi2 is None:
         raise ValueError("Both fit1 and fit2 must have IID representations (iid=True, weighting='marginal').")
 
-    auc1 = fit1.auc_1 if definition == 1 else fit1.auc_2
-    auc2 = fit2.auc_1 if definition == 1 else fit2.auc_2
+    auc1 = fit1.auc_1 if slot == 1 else fit1.auc_2
+    auc2 = fit2.auc_1 if slot == 1 else fit2.auc_2
     delta_auc = auc1 - auc2
     delta_phi = phi1 - phi2  # (n, L)
 
     n = fit1.n_subjects
-    cov_delta = (delta_phi.T @ delta_phi) / (float(n) ** 2)
-    se_delta = np.sqrt(np.maximum(np.diag(cov_delta), 0.0))
+    ddof_se = 1 if settings == "R_default" else 0
+    cov_delta, se_delta = _iid_cov_and_se(delta_phi, ddof=ddof_se)
 
     z_stat = np.full_like(delta_auc, np.nan)
     p_vals = np.full_like(delta_auc, np.nan)

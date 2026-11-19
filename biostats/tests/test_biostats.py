@@ -199,3 +199,60 @@ def test_storey_qvalue_pi0_recovery_and_monotonicity():
     p_pure_null = rng.uniform(0.0, 1.0, size=2000)
     _, pi0_null = storey_qvalue(p_pure_null)
     assert 0.90 <= pi0_null <= 1.0
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(2025)
+    x_tiny = rng.normal(size=(20, 2))
+    t_tiny = rng.uniform(0.5, 5.0, size=20)
+    ev_tiny = np.array([1, 2, 0, 1] * 5)
+
+    # 1. Invalid settings raises ValueError across all 4 functions
+    for fn in (
+        lambda: fit_cox_ph_efron(x_tiny, t_tiny, ev_tiny, settings="bad"),  # type: ignore[arg-type]
+        lambda: fit_fine_gray_ipcw(x_tiny, t_tiny, ev_tiny, settings="bad"),  # type: ignore[arg-type]
+        lambda: fit_wls_hc3(x_tiny, t_tiny, settings="bad"),  # type: ignore[arg-type]
+        lambda: storey_qvalue([0.01, 0.2, 0.5, 0.8, 0.9], settings="bad"),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="settings"):
+            fn()
+
+    # 2. Cox PH & WLS HC3 R_default parity
+    cox_def = fit_cox_ph_efron(x_tiny, t_tiny, ev_tiny, settings="default")
+    cox_r = fit_cox_ph_efron(x_tiny, t_tiny, ev_tiny, settings="R_default")
+    np.testing.assert_allclose(cox_r.beta, cox_def.beta, rtol=1e-12)
+
+    wls_def = fit_wls_hc3(x_tiny, t_tiny, add_intercept=True, settings="default")
+    wls_r = fit_wls_hc3(x_tiny, t_tiny, add_intercept=True, settings="R_default")
+    np.testing.assert_allclose(wls_r.se_hc3, wls_def.se_hc3, rtol=1e-12)
+
+    # 3. Fine-Gray R_default: eps_g = 0.0 (unclamped KM below 0.05) + strict `< u_c` at tied competing/censoring time
+    # Construct 48 censorings before a late target event so G(t_late-) = 2/50 = 0.04 < 0.05, plus a tie at t=2.0
+    times_fg = np.concatenate([[1.0, 1.5, 2.0, 2.0], np.linspace(2.1, 4.9, 46), [5.5, 6.0]])
+    events_fg = np.concatenate([[2, 1, 2, 0], np.zeros(46, dtype=int), [1, 0]])
+    x_fg = rng.normal(size=(times_fg.size, 1))
+
+    fg_def = fit_fine_gray_ipcw(x_fg, times_fg, events_fg, settings="default")
+    fg_r = fit_fine_gray_ipcw(x_fg, times_fg, events_fg, settings="R_default")
+    fg_def_eps0 = fit_fine_gray_ipcw(x_fg, times_fg, events_fg, eps_g=0.0, settings="default")
+
+    # Point estimates in R_default match eps_g=0.0 exactly (differing from default's eps_g=0.05 floor)
+    np.testing.assert_allclose(fg_r.beta, fg_def_eps0.beta, rtol=1e-12)
+    assert not np.allclose(fg_r.beta, fg_def.beta, atol=1e-6)
+    # Sandwich SE in R_default uses strict `times < u_c` at the t=2.0 competing+censoring tie (`crr.f:347`)
+    assert fg_r.se[0] != pytest.approx(fg_def_eps0.se[0], rel=1e-9)
+
+    # 4. storey_qvalue R_default: `p >= lam` (`pi0est.R:118`) and Reinsch `smooth.spline(df=3)`
+    p_tied = np.array([0.01, 0.02, 0.50, 0.50, 0.50, 0.50, 0.80, 0.90])
+    _, pi0_def_1 = storey_qvalue(p_tied, lambdas=[0.50], settings="default")  # strict > 0.50 -> 2 / (8 * 0.5) = 0.5
+    _, pi0_r_1 = storey_qvalue(p_tied, lambdas=[0.50], settings="R_default")  # >= 0.50 -> 6 / (8 * 0.5) -> clipped 1.0
+    assert pi0_def_1 == pytest.approx(0.5, rel=1e-12)
+    assert pi0_r_1 == pytest.approx(1.0, rel=1e-12)
+
+    p_mix = np.concatenate([rng.beta(0.15, 8.0, size=2400), rng.uniform(0.0, 1.0, size=5600)])
+    q_def, pi0_def = storey_qvalue(p_mix, settings="default")
+    q_r, pi0_r = storey_qvalue(p_mix, settings="R_default")
+    assert abs(pi0_r - 0.70) < 0.05
+    assert abs(pi0_r - pi0_def) < 0.02
+    np.testing.assert_allclose(q_r, pi0_r * bh_fdr(p_mix), rtol=1e-12, atol=1e-12)
+

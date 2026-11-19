@@ -6,10 +6,20 @@ bootstrap CIs, partial correlations, and NaN-safe statistical test wrappers.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 from scipy import stats as _st
+from scipy.interpolate import make_smoothing_spline
+from scipy.optimize import brentq
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 def _require_finite(*arrays: Sequence[float] | np.ndarray) -> list[np.ndarray]:
@@ -72,17 +82,57 @@ def _natural_cubic_spline_basis_df3(x: np.ndarray, knots: np.ndarray) -> np.ndar
     return np.column_stack([np.ones_like(xv), xv, d0 - d2, d1 - d2])
 
 
+def _reinsch_smoothing_spline_df(x: np.ndarray, y: np.ndarray, df: float = 3.0) -> np.ndarray:
+    """Fit exact Reinsch penalized natural cubic smoothing spline matching R `smooth.spline(x, y, df=3)`."""
+    n = x.size
+    if n <= 2 or df <= 2.0:
+        B_lin = np.column_stack([np.ones(n, dtype=np.float64), x])
+        coef, *_ = np.linalg.lstsq(B_lin, y, rcond=None)
+        return B_lin @ coef
+    if df >= float(n):
+        return y.copy()
+
+    h = np.diff(x)
+    Q = np.zeros((n, n - 2), dtype=np.float64)
+    R = np.zeros((n - 2, n - 2), dtype=np.float64)
+    for j in range(n - 2):
+        Q[j, j] = 1.0 / h[j]
+        Q[j + 1, j] = -1.0 / h[j] - 1.0 / h[j + 1]
+        Q[j + 2, j] = 1.0 / h[j + 1]
+        R[j, j] = (h[j] + h[j + 1]) / 3.0
+        if j + 1 < n - 2:
+            R[j, j + 1] = R[j + 1, j] = h[j + 1] / 6.0
+
+    K = Q @ np.linalg.solve(R, Q.T)
+    K = 0.5 * (K + K.T)
+    # Exactly n - 2 positive eigenvalues; exclude the 2 null eigenvalues for [1, x]
+    pos_eigs = np.maximum(np.sort(np.linalg.eigvalsh(K))[::-1][: n - 2], 1e-30)
+
+    hi = 100.0 * float(n - 2) / max(float(pos_eigs[-1]) * max(df - 2.0, 1e-6), 1e-30)
+    while 2.0 + float(np.sum(1.0 / (1.0 + hi * pos_eigs))) > df:
+        hi *= 10.0
+
+    mu = float(brentq(lambda m: 2.0 + float(np.sum(1.0 / (1.0 + m * pos_eigs))) - df, 0.0, hi, xtol=1e-13, rtol=1e-13))
+    spl = make_smoothing_spline(x, y, lam=mu)
+    return np.asarray(spl(x), dtype=np.float64)
+
+
 def storey_qvalue(
     pvals: Sequence[float] | np.ndarray,
     lambdas: Sequence[float] | np.ndarray | None = None,
+    *,
+    settings: SettingsMode = "default",
 ) -> tuple[np.ndarray, float]:
-    r"""Storey & Tibshirani (*PNAS* 2003) natural cubic spline $\hat{\pi}_0(\lambda)$ and monotone $q$-values.
+    r"""Storey & Tibshirani (*PNAS* 2003) cubic spline $\hat{\pi}_0(\lambda)$ and monotone $q$-values.
 
-    Estimates the true null proportion $\pi_0$ by evaluating $\hat{\pi}_0(\lambda) = \#\{p_j > \lambda\} / (m(1 - \lambda))$
-    over a $\lambda$ grid, smoothing with a 3-df natural cubic spline, and computing monotone step-down $q$-values.
+    - `settings='default'`: Evaluates $\hat{\pi}_0(\lambda) = \#\{p_j > \lambda\} / (m(1 - \lambda))$ and smooths
+      with a 3-df regression natural cubic spline.
+    - `settings='R_default'`: Matches Bioconductor `qvalue::pi0est` (`pi0est.R:118`) using `#\{p_j >= lambda\}`
+      and an exact Reinsch penalized cubic smoothing spline (`smooth.spline(df=3)` via `make_smoothing_spline`).
 
     Returns `(qvalues, pi0_hat)`.
     """
+    _validate_settings(settings)
     p = np.asarray(pvals, dtype=np.float64).ravel()
     m = p.size
     if m == 0:
@@ -94,28 +144,38 @@ def storey_qvalue(
 
     lam_grid = np.arange(0.05, 0.96, 0.05) if lambdas is None else np.sort(np.asarray(lambdas, dtype=np.float64).ravel())
     lam_grid = lam_grid[(lam_grid >= 0.0) & (lam_grid < 1.0)]
+    if settings == "R_default" and lam_grid.size > 1:
+        lam_grid = np.unique(lam_grid)
 
     order = np.argsort(p, kind="mergesort")
     p_sorted = p[order]
+    search_side = "left" if settings == "R_default" else "right"
 
     if m < 4 or lam_grid.size == 0:
         pi0 = 1.0
     elif lam_grid.size == 1:
-        exceed_cnt = m - np.searchsorted(p_sorted, lam_grid[0], side="right")
+        exceed_cnt = m - np.searchsorted(p_sorted, lam_grid[0], side=search_side)
         pi0 = float(np.clip(exceed_cnt / (m * (1.0 - lam_grid[0])), 0.0, 1.0))
         if pi0 <= 0.0:
             pi0 = 1.0
     else:
-        exceed_cnts = m - np.searchsorted(p_sorted, lam_grid, side="right")
+        exceed_cnts = m - np.searchsorted(p_sorted, lam_grid, side=search_side)
         pi0_lam = exceed_cnts / (m * (1.0 - lam_grid))
-        if lam_grid.size >= 4:
-            knots = np.quantile(lam_grid, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
-            B = _natural_cubic_spline_basis_df3(lam_grid, knots)
-            coef, *_ = np.linalg.lstsq(B, pi0_lam, rcond=None)
-            pred_last = float((B[-1] @ coef))
-            pi0 = float(np.clip(pred_last, 0.0, 1.0))
+        if settings == "R_default":
+            if lam_grid.size >= 4:
+                fitted = _reinsch_smoothing_spline_df(lam_grid, pi0_lam, df=3.0)
+                pi0 = float(np.clip(fitted[-1], 0.0, 1.0))
+            else:
+                pi0 = float(np.clip(pi0_lam[-1], 0.0, 1.0))
         else:
-            pi0 = float(np.clip(np.mean(pi0_lam), 0.0, 1.0))
+            if lam_grid.size >= 4:
+                knots = np.quantile(lam_grid, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+                B = _natural_cubic_spline_basis_df3(lam_grid, knots)
+                coef, *_ = np.linalg.lstsq(B, pi0_lam, rcond=None)
+                pred_last = float((B[-1] @ coef))
+                pi0 = float(np.clip(pred_last, 0.0, 1.0))
+            else:
+                pi0 = float(np.clip(np.mean(pi0_lam), 0.0, 1.0))
 
         if not np.isfinite(pi0) or pi0 <= 0.0:
             pos = pi0_lam[pi0_lam > 0.0]

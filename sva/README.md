@@ -67,6 +67,23 @@ print(sv_res.summary())
 print(res.to_dataframe(sort_by_pvalue=True).head())
 ```
 
+## Exact Bioconductor `sva` Parity (`settings="R_default"`)
+
+All primary estimators (`num_sv`, `sva`, `irwsva`, `twostepsva`, `svaseq`, and `edge_lfdr`) accept `settings: Literal["default", "R_default"] = "default"` (strictly validated; raises `ValueError` on unknown values):
+
+| Component | `settings="default"` (Pythonic default) | `settings="R_default"` (Bioconductor `sva` exact parity) |
+| :--- | :--- | :--- |
+| **`edge_lfdr` $\hat{\pi}_0$ estimator** | Storey & Tibshirani (2003) cubic polynomial over $\lambda \in [0.05, 0.90]$ | Fixed $\lambda = 0.8$: $\hat{\pi}_0 = \min(1.0, \operatorname{mean}(p \ge 0.8) / 0.2)$ (`helper.R`) |
+| **`edge_lfdr` density ratio** | Direct probit-space Gaussian KDE ratio $\hat{\pi}_0 \phi(z) / \hat{g}(z)$ | GCV cubic smoothing spline interpolation of probit log-density ratio over 512-point `bw.nrd0` KDE grid |
+| **`vfilter` feature selection** | Retains `vfilter` top-variance features | Retains `vfilter - 1` top-variance features (`rank(-var) < vfilter` per `num.sv.R` & `svaseq.R`, filtering pre-log counts in `svaseq`) |
+
+```python
+from sva import num_sv, sva, svaseq
+
+n_r = num_sv(Y, mod, method="be", vfilter=200, seed=42, settings="R_default")
+sv_r = sva(Y, mod, mod0, n_sv=n_r.n_sv, vfilter=200, seed=42, settings="R_default")
+```
+
 ## License
 
 MIT

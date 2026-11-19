@@ -122,3 +122,76 @@ def test_robust_ebayes_and_limma_trend():
     # Direct squeeze_var check
     vp, s20, df0, _ = squeeze_var(np.ones(20), df1=8)
     assert np.isinf(df0) and np.allclose(vp, s20)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(31415)
+
+    # 1. Invalid settings must raise ValueError across public entrypoints
+    X_tiny = rng.normal(size=(6, 10))
+    grp_tiny = [False, False, False, True, True, True]
+    design_tiny = np.column_stack([np.ones(6), np.asarray(grp_tiny, dtype=float)])
+    for fn in (
+        lambda: squeeze_var(np.ones(10), df1=4, settings="bad"),  # type: ignore[arg-type]
+        lambda: moderated_ttest(X_tiny, grp_tiny, settings="bad"),  # type: ignore[arg-type]
+        lambda: moderated_lm_contrast(X_tiny, design_tiny, [0.0, 1.0], settings="bad"),  # type: ignore[arg-type]
+        lambda: limma_trend(X_tiny, grp_tiny, settings="bad"),  # type: ignore[arg-type]
+        lambda: limma_top_table(X_tiny, grp_tiny, settings="bad"),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="settings"):
+            fn()
+
+    # 2. Smyth (2004) B log-odds (`b_stat` / `lods` / `topTable['B']`)
+    n1, n2, n_genes = 6, 6, 200
+    group = np.array([False] * n1 + [True] * n2)
+    X = rng.normal(0.0, 1.0, size=(n1 + n2, n_genes))
+    X[group, :4] += 4.5
+    res_def = moderated_ttest(X, group)
+    res_r = moderated_ttest(X, group, settings="R_default")
+    assert res_def.b_stat is not None and res_r.b_stat is not None
+    np.testing.assert_array_equal(res_r.lods, res_r.b_stat)
+    assert np.all(res_r.b_stat[:4] > 2.0)
+    assert np.median(res_r.b_stat[4:]) < -3.0
+    # Under constant df_total & unscaled_var, B is strictly increasing in |t_stat|
+    order_abs_t = np.argsort(np.abs(res_r.t_stat))
+    assert np.all(np.diff(res_r.b_stat[order_abs_t]) >= -1e-12)
+    top_df = res_r.to_dataframe()
+    assert "B" in top_df.columns
+
+    # 3. evar <= 0: s20 = mean(s^2) and df_total capped at sum(df_resid) in R_default
+    vars_homog = np.linspace(0.95, 1.05, 30)
+    vp_r, s20_r, df0_r, dft_r = squeeze_var(vars_homog, df1=8, settings="R_default")
+    assert np.isinf(df0_r)
+    assert s20_r == pytest.approx(float(np.mean(vars_homog)), rel=1e-12)
+    assert dft_r == pytest.approx(30.0 * 8.0, rel=1e-12)
+    np.testing.assert_allclose(vp_r, s20_r, rtol=1e-12)
+
+    # 4. Flooring tiny positive variances at 1e-5 * median(s^2) in R_default prevents df0 collapse
+    vars_tiny_outlier = rng.chisquare(df=8, size=500) / 8.0
+    vars_tiny_outlier[0] = 1e-40
+    _, _, df0_def_tiny, _ = squeeze_var(vars_tiny_outlier, df1=8, settings="default")
+    _, _, df0_r_tiny, _ = squeeze_var(vars_tiny_outlier, df1=8, settings="R_default")
+    assert df0_def_tiny < 0.6
+    assert df0_r_tiny > 6.0
+
+    # 5. R_default robust=True (128-node Gauss-Legendre Winsorized log-F + df2_outlier mixture)
+    X_rob = rng.normal(0.0, 1.0, size=(n1 + n2, 300))
+    X_rob[:, -6:] = rng.normal(0.0, 20.0, size=(n1 + n2, 6))
+    res_rob_r = moderated_ttest(X_rob, group, robust=True, settings="R_default")
+    assert isinstance(res_rob_r.df_prior, np.ndarray)
+    assert np.median(res_rob_r.df_prior[:-6]) > 15.0
+    # Outliers get positive finite df2_outlier mixture (< 1.0) rather than 0, preserving sample variance
+    assert np.all((res_rob_r.df_prior[-6:] > 0.05) & (res_rob_r.df_prior[-6:] < 1.0))
+    assert np.all(res_rob_r.var_post[-6:] > 50.0)
+
+    # 6. R_default trend=True (4-df natural cubic regression spline ns(covariate, df=4))
+    ave_levels = np.linspace(2.0, 12.0, 200)
+    true_sd = np.exp(-0.25 * (ave_levels - 6.0))
+    X_tr = ave_levels[None, :] + rng.normal(0.0, 1.0, size=(n1 + n2, 200)) * true_sd[None, :]
+    res_tr_def = limma_trend(X_tr, group, settings="default")
+    res_tr_r = limma_trend(X_tr, group, settings="R_default")
+    res_tr_rob_r = limma_trend(X_tr, group, robust=True, settings="R_default")
+    assert res_tr_r.var_prior[0] > 5.0 * res_tr_r.var_prior[-1]
+    assert not np.allclose(res_tr_r.var_prior, res_tr_def.var_prior)
+    assert res_tr_rob_r.var_prior[0] > 5.0 * res_tr_rob_r.var_prior[-1]
+

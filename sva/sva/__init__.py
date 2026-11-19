@@ -4,7 +4,7 @@
 
 from .core import SVAResult, irwsva, sva, svaseq, twostepsva
 from .num_sv import NumSVResult, num_sv
-from .stats import FTestResult, f_pvalue
+from .stats import FTestResult, edge_lfdr, f_pvalue
 
 __all__ = [
     "SVAResult",
@@ -16,6 +16,7 @@ __all__ = [
     "svaseq",
     "num_sv",
     "f_pvalue",
+    "edge_lfdr",
 ]
 
 __version__ = "0.1.0"

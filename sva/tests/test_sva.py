@@ -526,3 +526,93 @@ def test_f_pvalue_scale_invariance_extreme_magnitudes() -> None:
         np.testing.assert_allclose(scaled.p_value, ref.p_value, rtol=1e-12, atol=1e-12, equal_nan=True)
         np.testing.assert_allclose(scaled.q_value, ref.q_value, rtol=1e-12, atol=1e-12, equal_nan=True)
 
+
+def test_settings_r_default_edge_lfdr_vfilter_and_validation() -> None:
+    """
+    Verify `settings="R_default"` vs `settings="default"` across `num_sv`, `sva`,
+    `irwsva`, `twostepsva`, `svaseq`, and `edge_lfdr`:
+    1. Strict `ValueError` on invalid `settings`.
+    2. `edge_lfdr(..., settings="R_default")` uses fixed `lambda = 0.8` (`pi0 = min(1, mean(p >= 0.8) / 0.2)`)
+       and GCV cubic smoothing spline log-density ratio interpolation.
+    3. `num_sv` and `svaseq` (and `sva`/`irwsva`/`twostepsva`) retain `vfilter - 1`
+       top-variance features (`rank(-var) < vfilter`) under `settings="R_default"`,
+       while `settings="default"` retains `vfilter` features.
+    """
+    from sva.stats import estimate_pi0
+
+    rng = np.random.default_rng(1337)
+    m, n = 300, 24
+    treat = np.repeat([0.0, 1.0], n // 2)
+    mod = np.column_stack([np.ones(n), treat])
+    mod0 = np.ones((n, 1))
+    batch = rng.normal(size=n)
+    batch = (batch - batch.mean()) / batch.std()
+
+    Y = rng.normal(size=(m, n))
+    Y[:40] += 2.0 * treat[None, :]
+    Y[40:160] += 2.2 * batch[None, :]
+
+    # Strict validation on unknown settings
+    for fn in (num_sv, sva, irwsva, twostepsva):
+        with pytest.raises(ValueError, match="settings"):
+            fn(Y, mod, settings="invalid_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        svaseq(np.exp(Y), mod, settings="invalid_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        edge_lfdr(np.linspace(0.01, 0.99, 50), settings="invalid_mode")  # type: ignore[arg-type]
+
+    # Exact pi0 = min(1.0, mean(p >= 0.8) / 0.2) under R_default vs cubic spline under default
+    # Construct p-values with 20% in [0.81, 0.84] and 0% above 0.85:
+    # R_default fixed lambda=0.8 yields exact pi0 = 0.20 / 0.20 = 1.0, whereas default evaluates
+    # cubic polynomial at lambda=0.90 (where tail is empty) -> < 0.5
+    p_bump = np.concatenate([np.linspace(0.01, 0.79, 160), np.linspace(0.81, 0.84, 40)])
+    assert np.isclose(estimate_pi0(p_bump, settings="R_default"), 1.0, atol=1e-12)
+    assert estimate_pi0(p_bump, settings="default") < 0.5
+    p_tail_empty = np.concatenate([np.linspace(0.001, 0.02, 40), np.linspace(0.55, 0.78, 160)])
+    assert estimate_pi0(p_tail_empty, settings="R_default") == 0.0
+    np.testing.assert_allclose(edge_lfdr(p_tail_empty, settings="R_default"), 0.0)
+
+    # Realistic mixture of null + alternative p-values: smooth, monotone, bounded in [0, 1]
+    p_mix = np.concatenate([rng.beta(0.1, 20.0, size=80), rng.uniform(0.0, 1.0, size=320)])
+    expected_pi0 = min(1.0, float(np.mean(p_mix >= 0.8) / 0.2))
+    assert np.isclose(estimate_pi0(p_mix, settings="R_default"), expected_pi0, atol=1e-12)
+    lfdr_r = edge_lfdr(p_mix, settings="R_default")
+    assert np.all((lfdr_r >= 0.0) & (lfdr_r <= 1.0))
+    order = np.argsort(p_mix)
+    assert np.all(np.diff(lfdr_r[order]) >= -1e-12)
+    assert float(np.mean(lfdr_r[:80])) < 0.25 < float(np.mean(lfdr_r[80:]))
+
+    # vfilter retains vfilter - 1 features under R_default vs vfilter under default
+    nsv_def = num_sv(Y, mod, method="leek", vfilter=120, settings="default")
+    nsv_r = num_sv(Y, mod, method="leek", vfilter=120, settings="R_default")
+    assert nsv_def.n_features_used == 120
+    assert nsv_r.n_features_used == 119
+    assert nsv_r.n_sv == 1
+
+    with pytest.raises(ValueError, match="vfilter must be >= 3"):
+        num_sv(Y, mod, vfilter=2, settings="R_default")
+
+    # End-to-end irwsva, twostepsva, sva, and svaseq under settings="R_default"
+    irw_r = irwsva(Y, mod, mod0, n_sv=1, vfilter=180, B=5, seed=1337, settings="R_default")
+    irw_def = irwsva(Y, mod, mod0, n_sv=1, vfilter=180, B=5, seed=1337, settings="default")
+    assert len(irw_r.feature_names) == 179
+    assert len(irw_def.feature_names) == 180
+    assert abs(float(np.corrcoef(irw_r.sv[:, 0], batch)[0, 1])) > 0.94
+
+    ts_r = twostepsva(Y, mod, mod0, n_sv=1, vfilter=180, seed=1337, settings="R_default")
+    assert len(ts_r.feature_names) == 179
+    assert abs(float(np.corrcoef(ts_r.sv[:, 0], batch)[0, 1])) > 0.90
+
+    sva_r = sva(Y, mod, mod0, n_sv=1, vfilter=180, seed=1337, settings="R_default")
+    np.testing.assert_allclose(sva_r.sv, irw_r.sv, atol=1e-12)
+
+    # svaseq under settings="R_default": filters rank(-var) < vfilter on counts (retaining vfilter - 1)
+    log_mu = 3.0 + 0.8 * (Y - np.min(Y)) / (np.max(Y) - np.min(Y))
+    counts = rng.poisson(np.exp(log_mu)).astype(float)
+    seq_def = svaseq(counts, mod, mod0, n_sv=1, vfilter=150, seed=1337, settings="default")
+    seq_r = svaseq(counts, mod, mod0, n_sv=1, vfilter=150, seed=1337, settings="R_default")
+    assert len(seq_def.feature_names) == 150
+    assert len(seq_r.feature_names) == 149
+    assert np.all(np.isfinite(seq_r.sv))
+
+

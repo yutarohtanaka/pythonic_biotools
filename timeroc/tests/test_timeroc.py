@@ -257,3 +257,52 @@ def test_invalid_inputs_raise_value_error():
     fit2 = time_roc(T + 0.1, delta, marker, times=[0.6], iid=True)
     with pytest.raises(ValueError, match="do not match"):
         compare_timeroc(fit1, fit2)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(1234)
+    n = 180
+    T, delta, m1 = _simulate_competing_risks(rng, n=n, beta1=0.95, beta2=0.85, cens_rate=0.30)
+    m2 = 0.35 * m1 + rng.standard_normal(n)
+    horizons = [0.45, 0.90]
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        time_roc(T, delta, m1, times=horizons, settings="bad")  # type: ignore[arg-type]
+
+    fit_def = time_roc(T, delta, m1, times=horizons, cause=1, iid=True, settings="default")
+    fit_r = time_roc(T, delta, m1, times=horizons, cause=1, iid=True, settings="R_default")
+    with pytest.raises(ValueError, match="settings"):
+        compare_timeroc(fit_r, fit_r, settings="bad")  # type: ignore[arg-type]
+
+    # 2. CRAN timeROC label convention:
+    # R_default auc_1 / sp_1 == strictly event-free survivors (default's auc_2 / sp_2)
+    # R_default auc_2 / sp_2 == survivors + prior competing events (default's auc_1 / sp_1)
+    np.testing.assert_allclose(fit_r.auc_1, fit_def.auc_2, rtol=1e-13, atol=1e-14)
+    np.testing.assert_allclose(fit_r.auc_2, fit_def.auc_1, rtol=1e-13, atol=1e-14)
+    np.testing.assert_allclose(fit_r.sp_1, fit_def.sp_2, rtol=1e-13, atol=1e-14)
+    np.testing.assert_allclose(fit_r.sp_2, fit_def.sp_1, rtol=1e-13, atol=1e-14)
+
+    # 3. ddof=1 (`sd / sqrt(n)`) in IID SEs and compare_timeroc SEs
+    ddof_factor = np.sqrt(float(n) / float(n - 1))
+    assert fit_r.se_auc_1 is not None and fit_def.se_auc_2 is not None
+    assert fit_r.se_auc_2 is not None and fit_def.se_auc_1 is not None
+    np.testing.assert_allclose(fit_r.se_auc_1, fit_def.se_auc_2 * ddof_factor, rtol=1e-13, atol=1e-14)
+    np.testing.assert_allclose(fit_r.se_auc_2, fit_def.se_auc_1 * ddof_factor, rtol=1e-13, atol=1e-14)
+
+    fit2_def = time_roc(T, delta, m2, times=horizons, cause=1, iid=True, settings="default")
+    fit2_r = time_roc(T, delta, m2, times=horizons, cause=1, iid=True, settings="R_default")
+    cmp_def_surv = compare_timeroc(fit_def, fit2_def, definition=2, settings="default")
+    cmp_r_surv = compare_timeroc(fit_r, fit2_r, definition=1, settings="R_default")
+    np.testing.assert_allclose(cmp_r_surv.delta_auc, cmp_def_surv.delta_auc, rtol=1e-13, atol=1e-14)
+    np.testing.assert_allclose(cmp_r_surv.se_delta, cmp_def_surv.se_delta * ddof_factor, rtol=1e-13, atol=1e-14)
+
+    # 4. Strict `T < t` for case definition at horizon `t` in point estimates (`timeROC_3.R`)
+    T_tie = np.array([0.2, 0.5, 0.8, 1.1, 1.4, 1.8])
+    delta_tie = np.array([1, 1, 2, 0, 1, 0])
+    m_tie = np.array([2.5, 1.9, 0.3, -0.2, -0.8, -1.5])
+    res_tie_def = time_roc(T_tie, delta_tie, m_tie, times=[0.5], settings="default")
+    res_tie_r = time_roc(T_tie, delta_tie, m_tie, times=[0.5], settings="R_default")
+    assert res_tie_def.n_cases[0] == 2  # includes T == 0.5
+    assert res_tie_r.n_cases[0] == 1  # strict T < 0.5
+

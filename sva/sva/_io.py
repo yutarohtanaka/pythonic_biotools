@@ -4,11 +4,22 @@ Input coercion, matrix orientation handling, and linear-algebra design helpers f
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    """Validate `settings` parameter strictly (`'default'` or `'R_default'`)."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unsupported settings={settings!r}; expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 def is_anndata(obj: Any) -> bool:

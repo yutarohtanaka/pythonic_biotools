@@ -78,3 +78,44 @@ def test_single_sample_ulm_exact_ols_pvalues_and_nan_handling():
     )
     assert np.all(np.isfinite(ulm_nan_scores.to_numpy()))
     assert ulm_nan_pvals.loc["SampleA", "P1"] < 1e-6
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(101)
+    genes_all = [f"G{i}" for i in range(40)]
+    expr_df = pd.DataFrame(
+        {
+            "S1": rng.normal(0.0, 1.0, size=40),  # contains negative values!
+            "S2": rng.normal(0.0, 1.0, size=40),
+        },
+        index=genes_all,
+    )
+    expr_df.iloc[:6, 0] += 3.5  # 6 target genes upregulated in S1
+    w_6 = pd.DataFrame({"TF1": [1.5, 1.2, 2.0, 0.8, 1.1, 1.7]}, index=genes_all[:6])
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        project_gep_programs(expr_df, w_6, settings="unknown")  # type: ignore[arg-type]
+
+    # 2. Default requires >= 10 shared genes, whereas R_default requires minsize >= 5 and pads absent genes with 0.0
+    with pytest.raises(ValueError, match="Fewer than 10"):
+        project_gep_programs(expr_df, w_6, settings="default")
+    with pytest.raises(ValueError, match="Fewer than 5"):
+        project_gep_programs(expr_df, w_6.iloc[:4], settings="R_default")
+
+    # 3. R_default uses X directly on input scale (no auto log2(X + 1)), pads 34 non-targets with 0.0,
+    #    and forces center_across_samples=False even if True is passed!
+    scores_r, pvals_r = project_gep_programs(
+        expr_df,
+        w_6,
+        is_log_transformed=False,
+        center_across_samples=True,
+        return_pvalues=True,
+        settings="R_default",
+    )
+    w_padded = w_6.reindex(expr_df.index, fill_value=0.0)["TF1"].to_numpy()
+    lr = stats.linregress(w_padded, expr_df["S1"].to_numpy())
+    expected_t = lr.slope / lr.stderr
+    assert scores_r.loc["S1", "TF1"] == pytest.approx(expected_t, rel=1e-11)
+    assert pvals_r.loc["S1", "TF1"] == pytest.approx(lr.pvalue, rel=1e-11)
+

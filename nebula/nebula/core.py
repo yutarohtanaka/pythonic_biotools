@@ -16,8 +16,18 @@ from scipy import sparse
 from scipy.special import gammaln
 from scipy.stats import norm
 
-from .hl import compute_schur_covariance, fit_hl_gene
+from .hl import compute_schur_covariance, fit_hl_gene, fit_hl_sigma2_1d
 from .ln import fit_ln_gene, initial_beta_guess
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unsupported settings={settings!r}; expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,7 @@ class NebulaResult:
     subject_names: list[str]
     covariance_matrices: np.ndarray | None = None
     random_effects: np.ndarray | None = None
+    laplace_orders: np.ndarray | None = None
 
     @property
     def sigma2(self) -> np.ndarray:
@@ -611,26 +622,29 @@ def nebula(
     mincp: int = 5,
     cutoff_cell: float = 20.0,
     kappa: float = 800.0,
-    laplace_order: Literal[1, 2] = 2,
+    laplace_order: Literal[1, 2] | None = None,
     covariance: bool = False,
     output_re: bool = False,
     max_iter: int = 200,
     tol: float = 1e-6,
     min_overdispersion: float = 1e-6,
     max_overdispersion: float = 1e4,
+    settings: SettingsMode = "default",
 ) -> NebulaResult:
     """
     Fit multi-subject negative binomial / Poisson-Gamma generalized linear mixed
     models across genes using NEBULA-LN and/or NEBULA-HL.
     """
+    eff_mode = _validate_settings(settings)
     if model not in ("NBGMM", "PMM", "NBLMM"):
         raise ValueError(f"Unsupported model {model!r}; expected 'NBGMM', 'PMM', or 'NBLMM'.")
     if method not in ("auto", "LN", "HL"):
         raise ValueError(f"Unsupported method {method!r}; expected 'auto', 'LN', or 'HL'.")
-    if laplace_order not in (1, 2):
+    if laplace_order is not None and laplace_order not in (1, 2):
         raise ValueError(f"Unsupported laplace_order {laplace_order!r}; expected 1 or 2.")
     if min_overdispersion <= 0 or min_overdispersion >= max_overdispersion:
         raise ValueError("Require 0 < min_overdispersion < max_overdispersion.")
+    eff_method_req = ("LN" if method == "auto" else method) if eff_mode == "R_default" else method
 
     obs_df: pd.DataFrame | None = None
     if _is_anndata(data):
@@ -771,6 +785,7 @@ def nebula(
     algorithm: list[str] = ["filtered"] * n_genes
     loglik = np.full(n_genes, np.nan, dtype=np.float64)
     n_iter_arr = np.zeros(n_genes, dtype=np.int64)
+    laplace_orders_arr = np.zeros(n_genes, dtype=np.int64)
 
     cov_mats = (
         np.full((n_genes, p, p), np.nan, dtype=np.float64) if covariance else None
@@ -798,6 +813,15 @@ def nebula(
         const_y_fact = float(np.sum(gammaln(y_nz + 1.0))) if y_nz.size > 0 else 0.0
         beta0 = initial_beta_guess(X, log_offset, y_nz, cell_idx, n_cells, intercept_col)
 
+        if eff_mode == "R_default":
+            gene_laplace_order = (
+                (2 if (float(cpc_vec[g]) * cps < 3.0) else 1)
+                if laplace_order is None
+                else int(laplace_order)
+            )
+        else:
+            gene_laplace_order = 2 if laplace_order is None else int(laplace_order)
+
         if model == "PMM":
             beta_hat, s2_hat, phi_hat, ll, conv, n_it = fit_ln_gene(
                 X,
@@ -819,7 +843,12 @@ def nebula(
             )
             algo_g = "PMM"
         elif model == "NBLMM":
-            if method == "LN":
+            use_nblmm_ln = (
+                (eff_method_req == "LN" and cps >= 30.0)
+                if eff_mode == "R_default"
+                else (method == "LN")
+            )
+            if use_nblmm_ln:
                 beta_hat, s2_ln, phi_hat, ll, conv, n_it = fit_ln_gene(
                     X,
                     log_offset,
@@ -888,9 +917,14 @@ def nebula(
                     phi_init=float(np.clip(phi_ws, min_overdispersion, max_overdispersion)),
                 )
                 algo_g = "NBLMM"
+                laplace_orders_arr[g] = 1
         else:
             # NBGMM
-            use_hl_direct = method == "HL" or (method == "auto" and cps < cutoff_cell)
+            if eff_mode == "R_default":
+                use_hl_direct = eff_method_req == "HL" or cps < 30.0
+            else:
+                use_hl_direct = method == "HL" or (method == "auto" and cps < cutoff_cell)
+
             if use_hl_direct:
                 beta_ws, s2_ws, phi_ws, _, _, _ = fit_ln_gene(
                     X,
@@ -927,11 +961,12 @@ def nebula(
                     max_iter,
                     tol,
                     gaussian_prior=False,
-                    laplace_order=laplace_order,
+                    laplace_order=gene_laplace_order,
                     sigma2_init=float(np.clip(s2_ws, min_overdispersion, max_overdispersion)),
                     phi_init=float(np.clip(phi_ws, min_overdispersion, max_overdispersion)),
                 )
                 algo_g = "HL"
+                laplace_orders_arr[g] = gene_laplace_order
             else:
                 beta_hat, s2_hat, phi_hat, ll, conv, n_it = fit_ln_gene(
                     X,
@@ -952,33 +987,94 @@ def nebula(
                     pmm_only=False,
                 )
                 algo_g = "LN"
-                if method == "auto" and (
-                    (cutoff_cell > 0.0 and cps / max(phi_hat, 1e-12) < cutoff_cell)
-                    or conv == -40
-                ):
-                    beta_hat, s2_hat, phi_hat, ll, conv, n_it2 = fit_hl_gene(
-                        X,
-                        log_offset,
-                        subj,
-                        m,
-                        y_nz,
-                        cell_idx,
-                        subj_nz,
-                        Y_subj,
-                        Y_nz,
-                        const_y_fact,
-                        beta_hat,
-                        min_overdispersion,
-                        max_overdispersion,
-                        max_iter,
-                        tol,
-                        gaussian_prior=False,
-                        laplace_order=laplace_order,
-                        sigma2_init=float(np.clip(s2_hat, min_overdispersion, max_overdispersion)),
-                        phi_init=float(np.clip(phi_hat, min_overdispersion, max_overdispersion)),
-                    )
-                    n_it += n_it2
-                    algo_g = "HL"
+                kappa_obs = cps / max(phi_hat, 1e-12)
+                if eff_mode == "R_default":
+                    if (cutoff_cell > 0.0 and kappa_obs < cutoff_cell) or conv == -40:
+                        beta_hat, s2_hat, phi_hat, ll, conv, n_it2 = fit_hl_gene(
+                            X,
+                            log_offset,
+                            subj,
+                            m,
+                            y_nz,
+                            cell_idx,
+                            subj_nz,
+                            Y_subj,
+                            Y_nz,
+                            const_y_fact,
+                            beta_hat,
+                            min_overdispersion,
+                            max_overdispersion,
+                            max_iter,
+                            tol,
+                            gaussian_prior=False,
+                            laplace_order=gene_laplace_order,
+                            sigma2_init=float(np.clip(s2_hat, min_overdispersion, max_overdispersion)),
+                            phi_init=float(np.clip(phi_hat, min_overdispersion, max_overdispersion)),
+                        )
+                        n_it += n_it2
+                        algo_g = "HL"
+                        laplace_orders_arr[g] = gene_laplace_order
+                    elif (
+                        cutoff_cell <= kappa_obs < kappa
+                        and s2_hat < (8.0 / kappa_obs)
+                    ):
+                        s2_1d, ll_1d, conv_1d, n_it_1d = fit_hl_sigma2_1d(
+                            X,
+                            log_offset,
+                            subj,
+                            m,
+                            y_nz,
+                            cell_idx,
+                            subj_nz,
+                            Y_subj,
+                            Y_nz,
+                            const_y_fact,
+                            beta_hat,
+                            phi_hat,
+                            min_overdispersion,
+                            max_overdispersion,
+                            max_iter,
+                            tol,
+                            gaussian_prior=False,
+                            laplace_order=gene_laplace_order,
+                            sigma2_init=float(np.clip(s2_hat, min_overdispersion, max_overdispersion)),
+                            kappa_obs=kappa_obs,
+                        )
+                        s2_hat = s2_1d
+                        ll = ll_1d
+                        conv = conv_1d
+                        n_it += n_it_1d
+                        algo_g = "NBGMM (LN+HL)"
+                        laplace_orders_arr[g] = gene_laplace_order
+                else:
+                    if method == "auto" and (
+                        (cutoff_cell > 0.0 and kappa_obs < cutoff_cell)
+                        or conv == -40
+                    ):
+                        beta_hat, s2_hat, phi_hat, ll, conv, n_it2 = fit_hl_gene(
+                            X,
+                            log_offset,
+                            subj,
+                            m,
+                            y_nz,
+                            cell_idx,
+                            subj_nz,
+                            Y_subj,
+                            Y_nz,
+                            const_y_fact,
+                            beta_hat,
+                            min_overdispersion,
+                            max_overdispersion,
+                            max_iter,
+                            tol,
+                            gaussian_prior=False,
+                            laplace_order=gene_laplace_order,
+                            sigma2_init=float(np.clip(s2_hat, min_overdispersion, max_overdispersion)),
+                            phi_init=float(np.clip(phi_hat, min_overdispersion, max_overdispersion)),
+                        )
+                        n_it += n_it2
+                        algo_g = "HL"
+                        laplace_orders_arr[g] = gene_laplace_order
 
         cov_g, se_g, omega_g = compute_schur_covariance(
             beta_hat,
@@ -1038,11 +1134,12 @@ def nebula(
         cpc=cpc_vec,
         nonzero_cells=nonzero_cells,
         model=model,
-        method_requested=method,
+        method_requested=eff_method_req,
         n_cells=n_cells,
         n_subjects=m,
         mean_cells_per_subject=cps,
         subject_names=subject_names,
         covariance_matrices=cov_mats,
         random_effects=re_mat,
+        laplace_orders=laplace_orders_arr,
     )

@@ -17,12 +17,15 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.stats import rankdata
 
 from ._io import (
+    SettingsMode,
     coerce_design_matrix,
     coerce_expression_matrix,
     orthonormal_basis,
     validate_nested_models,
+    validate_settings,
 )
 from .num_sv import NumSVResult, num_sv_arrays
 from .stats import edge_lfdr, f_pvalue_arrays
@@ -107,16 +110,31 @@ def _select_vfilter(
     Y: np.ndarray,
     feature_names: list[str],
     vfilter: int | None,
+    *,
+    settings: SettingsMode = "default",
 ) -> tuple[np.ndarray, list[str]]:
-    """Optionally subset `Y` and `feature_names` to the top `vfilter` most variable features."""
+    """Optionally subset `Y` and `feature_names` to the top variable features."""
+    eff_mode = validate_settings(settings)
     if vfilter is None:
         return Y, feature_names
-    if vfilter < 2:
-        raise ValueError(f"vfilter must be >= 2, got {vfilter}.")
     m = Y.shape[0]
-    k_keep = min(int(vfilter), m)
     row_var = np.var(Y, axis=1, ddof=1)
-    top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_keep])
+    if eff_mode == "R_default":
+        if vfilter < 3:
+            raise ValueError(
+                f"vfilter must be >= 3 when settings='R_default' (retains vfilter - 1 features), got {vfilter}."
+            )
+        # Bioconductor sva.R / svaseq.R: ind = which(rank(-tmpv) < vfilter)
+        ranks = rankdata(-row_var, method="average")
+        top_idx = np.flatnonzero(ranks < float(vfilter))
+        if top_idx.size < min(2, m):
+            k_fb = min(max(int(vfilter) - 1, 2), m)
+            top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_fb])
+    else:
+        if vfilter < 2:
+            raise ValueError(f"vfilter must be >= 2, got {vfilter}.")
+        k_keep = min(int(vfilter), m)
+        top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_keep])
     return Y[top_idx], [feature_names[i] for i in top_idx]
 
 
@@ -259,8 +277,10 @@ def _irwsva_arrays(
     vfilter: int | None = None,
     seed: int | np.random.Generator | None = None,
     orthogonalize: bool = False,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Internal Iteratively Reweighted SVA implementation on validated arrays."""
+    eff_mode = validate_settings(settings)
     if not np.all(np.isfinite(Y)):
         raise ValueError(
             "Input matrix contains NaN or Inf values; filter or impute incomplete features before SVA."
@@ -273,14 +293,16 @@ def _irwsva_arrays(
         X1, X0, n_samples, require_strict_nesting=True, min_resid_df=2
     )
 
-    Y_eval, feat_eval = _select_vfilter(Y, feature_names, vfilter)
+    Y_eval, feat_eval = _select_vfilter(Y, feature_names, vfilter, settings=eff_mode)
     m_eval = Y_eval.shape[0]
     if m_eval < 2:
         raise ValueError("At least 2 features are required for SVA.")
 
     num_sv_res: NumSVResult | None = None
     if n_sv is None:
-        num_sv_res = num_sv_arrays(Y_eval, X1_v, method=num_sv_method, seed=seed)
+        num_sv_res = num_sv_arrays(
+            Y_eval, X1_v, method=num_sv_method, seed=seed, settings=eff_mode
+        )
         k_req = num_sv_res.n_sv
     else:
         if n_sv < 0:
@@ -333,11 +355,11 @@ def _irwsva_arrays(
         X0_aug = np.hstack([X0_v, S_curr])
 
         f_gam = f_pvalue_arrays(Y_eval, X1_aug, X1_v, feat_eval)
-        lfdr_gam = edge_lfdr(f_gam.p_value)
+        lfdr_gam = edge_lfdr(f_gam.p_value, settings=eff_mode)
         pprob_gam = np.where(np.isfinite(lfdr_gam), 1.0 - lfdr_gam, 0.0)
 
         f_b = f_pvalue_arrays(Y_eval, X1_aug, X0_aug, feat_eval)
-        lfdr_b = edge_lfdr(f_b.p_value)
+        lfdr_b = edge_lfdr(f_b.p_value, settings=eff_mode)
         pprob_b = np.where(np.isfinite(lfdr_b), 1.0 - lfdr_b, 0.0)
 
         w = pprob_gam * (1.0 - pprob_b)
@@ -392,8 +414,10 @@ def _twostepsva_arrays(
     vfilter: int | None = None,
     seed: int | np.random.Generator | None = None,
     lfdr_threshold: float = 0.10,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Internal Two-Step SVA implementation on validated arrays."""
+    eff_mode = validate_settings(settings)
     if not np.all(np.isfinite(Y)):
         raise ValueError(
             "Input matrix contains NaN or Inf values; filter or impute incomplete features before SVA."
@@ -406,14 +430,16 @@ def _twostepsva_arrays(
         X1, X0, n_samples, require_strict_nesting=False, min_resid_df=2
     )
 
-    Y_eval, feat_eval = _select_vfilter(Y, feature_names, vfilter)
+    Y_eval, feat_eval = _select_vfilter(Y, feature_names, vfilter, settings=eff_mode)
     m_eval = Y_eval.shape[0]
     if m_eval < 2:
         raise ValueError("At least 2 features are required for SVA.")
 
     num_sv_res: NumSVResult | None = None
     if n_sv is None:
-        num_sv_res = num_sv_arrays(Y_eval, X1_v, method=num_sv_method, seed=seed)
+        num_sv_res = num_sv_arrays(
+            Y_eval, X1_v, method=num_sv_method, seed=seed, settings=eff_mode
+        )
         k_req = num_sv_res.n_sv
     else:
         if n_sv < 0:
@@ -456,7 +482,7 @@ def _twostepsva_arrays(
 
     S0 = V0[:, :K]
     f_gam = f_pvalue_arrays(Y_eval, np.hstack([X1_v, S0]), X1_v, feat_eval)
-    lfdr = edge_lfdr(f_gam.p_value)
+    lfdr = edge_lfdr(f_gam.p_value, settings=eff_mode)
     pprob_gam = np.where(np.isfinite(lfdr), 1.0 - lfdr, 0.0)
 
     mask = np.isfinite(lfdr) & (lfdr <= lfdr_threshold)
@@ -503,8 +529,10 @@ def _supervised_sva_arrays(
     n_sv: int | None = None,
     num_sv_method: str = "be",
     seed: int | np.random.Generator | None = None,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Internal supervised SVA using known negative-control feature weights."""
+    eff_mode = validate_settings(settings)
     if not np.all(np.isfinite(Y)):
         raise ValueError(
             "Input matrix contains NaN or Inf values; filter or impute incomplete features before SVA."
@@ -524,7 +552,7 @@ def _supervised_sva_arrays(
 
     num_sv_res: NumSVResult | None = None
     if n_sv is None:
-        num_sv_res = num_sv_arrays(Y, X1_v, method=num_sv_method, seed=seed)
+        num_sv_res = num_sv_arrays(Y, X1_v, method=num_sv_method, seed=seed, settings=eff_mode)
         k_req = num_sv_res.n_sv
     else:
         if n_sv < 0:
@@ -592,8 +620,10 @@ def irwsva(
     orthogonalize: bool = False,
     features_as_rows: bool = True,
     layer: str | None = None,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Estimate surrogate variables via Iteratively Reweighted SVA (Leek & Storey 2007)."""
+    eff_mode = validate_settings(settings)
     Y, feature_names, sample_names, adata_ref = coerce_expression_matrix(
         dat, features_as_rows=features_as_rows, layer=layer
     )
@@ -616,6 +646,7 @@ def irwsva(
         vfilter=vfilter,
         seed=seed,
         orthogonalize=orthogonalize,
+        settings=eff_mode,
     )
 
 
@@ -631,8 +662,10 @@ def twostepsva(
     lfdr_threshold: float = 0.10,
     features_as_rows: bool = True,
     layer: str | None = None,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Estimate surrogate variables via Two-Step SVA (Leek & Storey 2007)."""
+    eff_mode = validate_settings(settings)
     Y, feature_names, sample_names, adata_ref = coerce_expression_matrix(
         dat, features_as_rows=features_as_rows, layer=layer
     )
@@ -654,6 +687,7 @@ def twostepsva(
         vfilter=vfilter,
         seed=seed,
         lfdr_threshold=lfdr_threshold,
+        settings=eff_mode,
     )
 
 
@@ -671,8 +705,10 @@ def sva(
     *,
     features_as_rows: bool = True,
     layer: str | None = None,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Unified entry point for Surrogate Variable Analysis (`"irw"`, `"two-step"`, `"supervised"`)."""
+    eff_mode = validate_settings(settings)
     if controls is not None or method == "supervised":
         if controls is None:
             raise ValueError("controls must be provided when method='supervised'.")
@@ -698,6 +734,7 @@ def sva(
             n_sv=n_sv,
             num_sv_method=num_sv_method,
             seed=seed,
+            settings=eff_mode,
         )
 
     if method == "irw":
@@ -712,6 +749,7 @@ def sva(
             seed=seed,
             features_as_rows=features_as_rows,
             layer=layer,
+            settings=eff_mode,
         )
     if method == "two-step":
         return twostepsva(
@@ -724,6 +762,7 @@ def sva(
             seed=seed,
             features_as_rows=features_as_rows,
             layer=layer,
+            settings=eff_mode,
         )
     raise ValueError(
         f"Unsupported sva method {method!r}; expected 'irw', 'two-step', or 'supervised'."
@@ -746,12 +785,16 @@ def svaseq(
     *,
     features_as_rows: bool = True,
     layer: str | None = None,
+    settings: SettingsMode = "default",
 ) -> SVAResult:
     """Moderated log-count Surrogate Variable Analysis for RNA-seq counts (Leek 2014).
 
     Applies `log(counts + constant)` (optionally after median library-size scaling),
     removes strictly zero-variance rows across samples, and runs `sva`.
+    When `settings="R_default"`, matches `svaseq.R`: applies `rank(-var) < vfilter`
+    (retaining `vfilter - 1` features) on count rows prior to `log(counts + constant)`.
     """
+    eff_mode = validate_settings(settings)
     C, feature_names, sample_names, adata_ref = coerce_expression_matrix(
         dat, features_as_rows=features_as_rows, layer=layer
     )
@@ -789,9 +832,7 @@ def svaseq(
             "Fewer than 2 variable features remain after filtering zero-variance count rows."
         )
 
-    Y_kept = Y_mod[keep]
     kept_features = [feature_names[i] for i in np.flatnonzero(keep)]
-
     if controls is not None or method == "supervised":
         if controls is None:
             raise ValueError("controls must be provided when method='supervised'.")
@@ -803,7 +844,7 @@ def svaseq(
                 f"controls must be 1D of length {C.shape[0]}, got shape {ctrl.shape}."
             )
         return _supervised_sva_arrays(
-            Y_kept,
+            Y_mod[keep],
             X1,
             X0,
             ctrl[keep],
@@ -812,7 +853,19 @@ def svaseq(
             n_sv=n_sv,
             num_sv_method=num_sv_method,
             seed=seed,
+            settings=eff_mode,
         )
+
+    vfilter_downstream = vfilter
+    if eff_mode == "R_default" and vfilter is not None:
+        # Bioconductor svaseq.R filters on raw/normalized counts prior to log(dat + constant)
+        C_sub, kept_features = _select_vfilter(
+            C_norm[keep], kept_features, vfilter, settings="R_default"
+        )
+        Y_kept = np.log(C_sub + float(constant))
+        vfilter_downstream = None
+    else:
+        Y_kept = Y_mod[keep]
 
     if method == "irw":
         return _irwsva_arrays(
@@ -824,8 +877,9 @@ def svaseq(
             n_sv=n_sv,
             B=B,
             num_sv_method=num_sv_method,
-            vfilter=vfilter,
+            vfilter=vfilter_downstream,
             seed=seed,
+            settings=eff_mode,
         )
     if method == "two-step":
         return _twostepsva_arrays(
@@ -836,8 +890,9 @@ def svaseq(
             sample_names,
             n_sv=n_sv,
             num_sv_method=num_sv_method,
-            vfilter=vfilter,
+            vfilter=vfilter_downstream,
             seed=seed,
+            settings=eff_mode,
         )
     raise ValueError(
         f"Unsupported sva method {method!r}; expected 'irw', 'two-step', or 'supervised'."

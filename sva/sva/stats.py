@@ -15,15 +15,18 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import make_smoothing_spline
 from scipy.stats import f as f_dist
 from scipy.stats import false_discovery_control, gaussian_kde, norm
 
 from ._io import (
+    SettingsMode,
     coerce_design_matrix,
     coerce_expression_matrix,
     is_nested_subspace,
     orthonormal_basis,
     validate_nested_models,
+    validate_settings,
 )
 
 
@@ -250,13 +253,20 @@ def f_pvalue(
     return f_pvalue_arrays(Y, X1, X0, feature_names)
 
 
-def estimate_pi0(p_values: np.ndarray) -> float:
+def estimate_pi0(
+    p_values: np.ndarray,
+    *,
+    settings: SettingsMode = "default",
+) -> float:
     """Estimate the proportion of true null hypotheses `pi0` (Storey & Tibshirani 2003)."""
+    eff_mode = validate_settings(settings)
     p = np.asarray(p_values, dtype=np.float64)
     p = p[np.isfinite(p)]
     G = p.size
     if G == 0:
         return 1.0
+    if eff_mode == "R_default":
+        return float(np.clip(np.mean(p >= 0.8) / 0.2, 0.0, 1.0))
     if G < 20:
         return float(np.clip(2.0 * np.mean(p), 0.0, 1.0))
 
@@ -282,29 +292,57 @@ def edge_lfdr(
     monotone: bool = True,
     adj: float = 1.5,
     eps: float = 1e-8,
+    settings: SettingsMode = "default",
 ) -> np.ndarray:
-    """Compute empirical-Bayes local false discovery rates via probit-space Gaussian KDE.
+    """Compute empirical-Bayes local false discovery rates via probit-space KDE.
 
-    Mirrors Bioconductor `sva:::edge.lfdr` using Storey's `pi0` estimator and
-    Gaussian KDE on `z_g = Phi^{-1}(p_g)`.
+    When `settings="default"`, uses Storey's cubic-polynomial `pi0` estimator over
+    `lambda in [0.05..0.90]` and direct probit-space Gaussian KDE evaluation.
+    When `settings="R_default"`, matches Bioconductor `sva:::edge.lfdr` (`helper.R`):
+    estimates `pi0 = min(1.0, mean(p >= 0.8) / 0.2)` (fixed `lambda = 0.8`) and
+    smooths the probit log-density ratio `log(pi0 * phi(z) / g(z))` via GCV cubic
+    smoothing spline interpolation over the KDE grid.
     """
+    eff_mode = validate_settings(settings)
     p_arr = np.asarray(p_values, dtype=np.float64)
     out = np.full(p_arr.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(p_arr)
     if not np.any(valid):
         return out
 
-    p = np.clip(p_arr[valid], eps, 1.0 - eps)
-    G = p.size
-    pi0 = estimate_pi0(p)
+    p_valid = p_arr[valid]
+    if eff_mode == "R_default":
+        pi0 = float(min(1.0, max(0.0, float(np.mean(p_valid >= 0.8)) / 0.2)))
+    else:
+        pi0 = estimate_pi0(np.clip(p_valid, eps, 1.0 - eps), settings="default")
 
     if pi0 <= 0.0:
         out[valid] = 0.0
         return out
 
+    p = np.clip(p_valid, eps, 1.0 - eps)
+    G = p.size
     z = norm.ppf(p)
-    if G < 3 or float(np.std(z)) < 1e-10:
+    std_z = float(np.std(z, ddof=1)) if G > 1 else 0.0
+    if G < 3 or std_z < 1e-10:
         lfdr = np.full(G, pi0, dtype=np.float64)
+    elif eff_mode == "R_default":
+        try:
+            q75, q25 = np.percentile(z, [75.0, 25.0])
+            iqr_z = float(q75 - q25)
+            lo = min(std_z, iqr_z / 1.34) if iqr_z > 0.0 else std_z
+            bw = max(0.9 * lo * (G ** (-0.2)) * adj, 1e-6 * max(std_z, 1.0))
+            bw_factor = max(bw / std_z, 1e-6)
+            kde = gaussian_kde(z, bw_method=bw_factor)
+            x_grid = np.linspace(float(np.min(z)) - 3.0 * bw, float(np.max(z)) + 3.0 * bw, 512)
+            g_grid = np.maximum(kde.evaluate(x_grid), 1e-300)
+            f0_grid = np.maximum(pi0 * norm.pdf(x_grid), 1e-300)
+            log_ratio_grid = np.log(f0_grid) - np.log(g_grid)
+            spline = make_smoothing_spline(x_grid, log_ratio_grid)
+            log_ratio_eval = np.clip(spline(z), -700.0, 700.0)
+            lfdr = np.exp(log_ratio_eval)
+        except (np.linalg.LinAlgError, ValueError):
+            lfdr = np.full(G, pi0, dtype=np.float64)
     else:
         try:
             kde = gaussian_kde(z, bw_method=lambda k: max(float(k.scotts_factor()) * adj, 1e-6))

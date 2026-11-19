@@ -16,8 +16,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
+from scipy.stats import rankdata
 
-from ._io import coerce_design_matrix, coerce_expression_matrix, orthonormal_basis
+from ._io import (
+    SettingsMode,
+    coerce_design_matrix,
+    coerce_expression_matrix,
+    orthonormal_basis,
+    validate_settings,
+)
 
 
 @dataclass(frozen=True)
@@ -145,8 +152,10 @@ def num_sv_arrays(
     B: int = 20,
     sig_level: float = 0.10,
     seed: int | np.random.Generator | None = None,
+    settings: SettingsMode = "default",
 ) -> NumSVResult:
     """Internal `num_sv` implementation operating on validated `(m, n)` and `(n, p)` arrays."""
+    eff_mode = validate_settings(settings)
     if method not in {"be", "leek"}:
         raise ValueError(f"Unsupported num_sv method {method!r}; expected 'be' or 'leek'.")
     if not np.all(np.isfinite(Y)):
@@ -170,11 +179,23 @@ def num_sv_arrays(
 
     Y_use = Y
     if vfilter is not None:
-        if vfilter < 2:
-            raise ValueError(f"vfilter must be >= 2, got {vfilter}.")
-        k_keep = min(int(vfilter), m)
         row_var = np.var(Y_use, axis=1, ddof=1)
-        top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_keep])
+        if eff_mode == "R_default":
+            if vfilter < 3:
+                raise ValueError(
+                    f"vfilter must be >= 3 when settings='R_default' (retains vfilter - 1 features), got {vfilter}."
+                )
+            # Bioconductor num.sv.R: ind = which(rank(-tmpv) < vfilter) -> retains vfilter - 1 features
+            ranks = rankdata(-row_var, method="average")
+            top_idx = np.flatnonzero(ranks < float(vfilter))
+            if top_idx.size < min(2, m):
+                k_fb = min(max(int(vfilter) - 1, 2), m)
+                top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_fb])
+        else:
+            if vfilter < 2:
+                raise ValueError(f"vfilter must be >= 2, got {vfilter}.")
+            k_keep = min(int(vfilter), m)
+            top_idx = np.sort(np.argsort(-row_var, kind="mergesort")[:k_keep])
         Y_use = Y_use[top_idx]
 
     R = Y_use - (Y_use @ Q1) @ Q1.T
@@ -296,6 +317,7 @@ def num_sv(
     *,
     features_as_rows: bool = True,
     layer: str | None = None,
+    settings: SettingsMode = "default",
 ) -> NumSVResult:
     """Estimate the number of latent surrogate variables orthogonal to `mod`.
 
@@ -309,7 +331,9 @@ def num_sv(
         `"be"` (Buja–Eyuboglu permutation parallel analysis) or `"leek"`
         (Leek 2011 asymptotic conditional SVD / RMT rank estimator).
     vfilter:
-        Optional number of highest-variance features to retain prior to SVD.
+        Optional number of highest-variance features to retain prior to SVD
+        (retains `vfilter` under `settings="default"`, or `vfilter - 1` via
+        `rank(-var) < vfilter` under `settings="R_default"` per `num.sv.R`).
     B:
         Number of permutations for `method="be"`.
     sig_level:
@@ -320,7 +344,10 @@ def num_sv(
         Orientation flag for `ndarray`/`DataFrame`/`sparse` inputs (ignored for `AnnData`).
     layer:
         Optional `AnnData.layers[layer]` name when `dat` is an `AnnData` object.
+    settings:
+        `"default"` or `"R_default"` (exact Bioconductor `sva` parity).
     """
+    eff_mode = validate_settings(settings)
     Y, _, _, adata_ref = coerce_expression_matrix(
         dat, features_as_rows=features_as_rows, layer=layer
     )
@@ -333,4 +360,5 @@ def num_sv(
         B=B,
         sig_level=sig_level,
         seed=seed,
+        settings=eff_mode,
     )

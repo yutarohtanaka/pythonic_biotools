@@ -9,11 +9,20 @@ to `decoupler.run_ulm`), `log2_dot`, and `top_k_zscore` projections.
 
 from __future__ import annotations
 
+from typing import Literal
 import warnings
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 def _compute_gene_zscores(X_log: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -109,6 +118,8 @@ def project_gep_programs(
     center_across_samples: bool = False,
     zscore_genes: bool | None = None,
     return_pvalues: bool = False,
+    *,
+    settings: SettingsMode = "default",
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Project continuous gene-program weights (`genes x programs`) onto an expression matrix (`genes x samples`).
 
@@ -132,9 +143,17 @@ def project_gep_programs(
         Backward-compatible alias for `center_across_samples` if explicitly supplied.
     return_pvalues : bool, default False
         When `True`, returns `(scores_df, pvalues_df)`.
+    settings : {'default', 'R_default'}, default 'default'
+        When `'R_default'`, matches `saezlab/decoupleR::run_ulm` exactly: uses `expr_genes_by_samples`
+        directly on its input scale (no auto `log2(X + 1)`), pads all features in `expr_genes_by_samples`
+        absent from `program_weights_genes_by_programs` with `0.0` weights (requiring `minsize >= 5`
+        shared targets rather than `>= 10` subsetting), and forces `center_across_samples = False`.
     """
+    _validate_settings(settings)
     if zscore_genes is not None:
         center_across_samples = bool(zscore_genes)
+    if settings == "R_default":
+        center_across_samples = False
 
     expr = expr_genes_by_samples.copy().astype(np.float64)
     weights = program_weights_genes_by_programs.copy().astype(np.float64)
@@ -145,15 +164,24 @@ def project_gep_programs(
     weights = weights.groupby(level=0).mean()
 
     shared_genes = [g for g in weights.index if g in expr.index]
-    if len(shared_genes) < 10:
-        raise ValueError(f"Fewer than 10 shared genes ({len(shared_genes)}) between expression and program weights.")
-
-    X_raw = expr.loc[shared_genes].to_numpy(dtype=np.float64)
-    if is_log_transformed:
-        X_log = X_raw
+    if settings == "R_default":
+        if len(shared_genes) < 5:
+            raise ValueError(
+                f"Fewer than 5 shared genes ({len(shared_genes)}) between expression and program weights."
+            )
+        X_log = expr.to_numpy(dtype=np.float64)
+        W = weights.reindex(expr.index, fill_value=0.0).to_numpy(dtype=np.float64)
     else:
-        X_log = np.where(np.isfinite(X_raw), np.log2(np.maximum(X_raw, 0.0) + 1.0), np.nan)
-    W = weights.loc[shared_genes].to_numpy(dtype=np.float64)  # (G, P)
+        if len(shared_genes) < 10:
+            raise ValueError(
+                f"Fewer than 10 shared genes ({len(shared_genes)}) between expression and program weights."
+            )
+        X_raw = expr.loc[shared_genes].to_numpy(dtype=np.float64)
+        if is_log_transformed:
+            X_log = X_raw
+        else:
+            X_log = np.where(np.isfinite(X_raw), np.log2(np.maximum(X_raw, 0.0) + 1.0), np.nan)
+        W = weights.loc[shared_genes].to_numpy(dtype=np.float64)  # (G, P)
     samples = list(expr.columns)
     programs = list(weights.columns)
 

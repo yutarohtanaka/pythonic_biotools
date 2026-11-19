@@ -13,11 +13,19 @@ Implements Pythonic equivalents of:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -235,7 +243,7 @@ def _fine_gray_loglik_and_derivatives(
         w_k[times >= tk] = 1.0
         comp_mask = is_competing & (times < tk)
         if np.any(comp_mask):
-            w_k[comp_mask] = np.clip(gk / g_minus_subj[comp_mask], 0.0, 1.0)
+            w_k[comp_mask] = np.clip(gk / np.maximum(g_minus_subj[comp_mask], 1e-300), 0.0, 1.0)
 
         theta_k = w_k * exp_eta
         s0 = max(float(np.sum(theta_k)), 1e-12)
@@ -270,6 +278,7 @@ def _fine_gray_sandwich_covariance(
     dc_uniq: np.ndarray,
     yc_uniq: np.ndarray,
     censoring_correction: bool = True,
+    strict_comp_tie: bool = False,
 ) -> np.ndarray:
     r"""Compute Fine-Gray (1999, Eqs. 8-10) robust sandwich covariance $I(\hat{\beta})^{-1} \Omega I(\hat{\beta})^{-1}$.
 
@@ -298,7 +307,7 @@ def _fine_gray_sandwich_covariance(
         w_k[times >= tk] = 1.0
         comp_mask = is_competing & (times < tk)
         if np.any(comp_mask):
-            w_k[comp_mask] = np.clip(gk / g_minus_subj[comp_mask], 0.0, 1.0)
+            w_k[comp_mask] = np.clip(gk / np.maximum(g_minus_subj[comp_mask], 1e-300), 0.0, 1.0)
 
         theta_k = w_k * exp_eta
         s0 = max(float(np.sum(theta_k)), 1e-12)
@@ -323,7 +332,8 @@ def _fine_gray_sandwich_covariance(
             later_k = np.flatnonzero(uniq_target_times > u_c)
             if later_k.size == 0:
                 continue
-            comp_le_u = is_competing & (times <= u_c)
+            # `crr.f:347`: strict `times < u_c` in settings='R_default'
+            comp_le_u = is_competing & ((times < u_c) if strict_comp_tie else (times <= u_c))
             if not np.any(comp_le_u):
                 continue
 
@@ -420,6 +430,8 @@ def fit_cox_ph_efron(
     max_iter: int = 60,
     max_step_halving: int = 15,
     tol: float = 1e-7,
+    *,
+    settings: SettingsMode = "default",
 ) -> HazardModelResult:
     """Fit an Efron-tie Cause-Specific Cox Proportional Hazards model (`survival::coxph`).
 
@@ -433,6 +445,7 @@ def fit_cox_ph_efron(
         `0` = right-censored, `target_event` = event of interest, other non-zero ints = competing events
         (treated as censored at their event time in cause-specific Cox PH).
     """
+    _validate_settings(settings)
     x, names = _extract_design(X, coef_names)
     t = np.asarray(times, dtype=np.float64).ravel()
     ev = np.asarray(event_types, dtype=int).ravel()
@@ -461,8 +474,9 @@ def fit_cox_ph_efron(
     z_stat = beta / se
     p_val = 2.0 * stats.norm.sf(np.abs(z_stat))
     hr = np.exp(np.clip(beta, -50.0, 50.0))
-    ci_low = np.exp(np.clip(beta - 1.959964 * se, -50.0, 50.0))
-    ci_high = np.exp(np.clip(beta + 1.959964 * se, -50.0, 50.0))
+    z_crit = float(stats.norm.isf(0.025)) if settings == "R_default" else 1.959964
+    ci_low = np.exp(np.clip(beta - z_crit * se, -50.0, 50.0))
+    ci_high = np.exp(np.clip(beta + z_crit * se, -50.0, 50.0))
 
     return HazardModelResult(
         model_type="CoxPH_Efron",
@@ -487,12 +501,14 @@ def fit_fine_gray_ipcw(
     event_types: Sequence[int],
     target_event: int = 1,
     coef_names: Sequence[str] | None = None,
-    eps_g: float = 0.05,
+    eps_g: float | None = None,
     ridge_lambda: float = 0.0,
     censoring_correction: bool = True,
     max_iter: int = 60,
     max_step_halving: int = 15,
     tol: float = 1e-7,
+    *,
+    settings: SettingsMode = "default",
 ) -> HazardModelResult:
     r"""Fit an IPCW Fine-Gray subdistribution hazard model (`cmprsk::crr`; Fine & Gray, JASA 1999).
 
@@ -502,13 +518,16 @@ def fit_fine_gray_ipcw(
     survival $\hat{G}(t-)$. Standard errors use the Fine-Gray robust Huber-White score sandwich
     estimator incorporating censoring-martingale estimation uncertainty (Eqs. 8-10).
     """
+    _validate_settings(settings)
+    eps_g_eff = (0.0 if settings == "R_default" else 0.05) if eps_g is None else float(eps_g)
+
     x, names = _extract_design(X, coef_names)
     t = np.asarray(times, dtype=np.float64).ravel().copy()
     ev = np.asarray(event_types, dtype=int).ravel()
     if x.shape[0] != t.size or t.size != ev.size:
         raise ValueError("X, times, and event_types must share the same sample count.")
 
-    uniq_t, g_left_uniq, _, dc_uniq, yc_uniq = _km_censoring_curves(t, ev, eps_g=eps_g)
+    uniq_t, g_left_uniq, _, dc_uniq, yc_uniq = _km_censoring_curves(t, ev, eps_g=eps_g_eff)
     g_minus_subj = g_left_uniq[np.searchsorted(uniq_t, t)]
 
     is_target = (ev == target_event).astype(int)
@@ -560,14 +579,16 @@ def fit_fine_gray_ipcw(
             dc_uniq=dc_uniq,
             yc_uniq=yc_uniq,
             censoring_correction=censoring_correction,
+            strict_comp_tie=(settings == "R_default"),
         )
 
     se = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     z_stat = beta / se
     p_val = 2.0 * stats.norm.sf(np.abs(z_stat))
     shr = np.exp(np.clip(beta, -50.0, 50.0))
-    ci_low = np.exp(np.clip(beta - 1.959964 * se, -50.0, 50.0))
-    ci_high = np.exp(np.clip(beta + 1.959964 * se, -50.0, 50.0))
+    z_crit = float(stats.norm.isf(0.025)) if settings == "R_default" else 1.959964
+    ci_low = np.exp(np.clip(beta - z_crit * se, -50.0, 50.0))
+    ci_high = np.exp(np.clip(beta + z_crit * se, -50.0, 50.0))
 
     return HazardModelResult(
         model_type="FineGray_IPCW",
@@ -592,12 +613,15 @@ def fit_wls_hc3(
     weights: Sequence[float] | None = None,
     add_intercept: bool = False,
     coef_names: Sequence[str] | None = None,
+    *,
+    settings: SettingsMode = "default",
 ) -> RobustWLSResult:
     """Fit Weighted Least Squares with White-Huber HC3 leverage-corrected covariance (`vcovHC(..., 'HC3')`).
 
     Ideal for heteroskedastic regression, deconvolved cell-type eQTLs (pass `weights = cell_fraction**2`),
     and small-sample regression with influential observations.
     """
+    _validate_settings(settings)
     x, names = _extract_design(X, coef_names)
     if add_intercept:
         x = np.column_stack([np.ones(x.shape[0], dtype=np.float64), x])
