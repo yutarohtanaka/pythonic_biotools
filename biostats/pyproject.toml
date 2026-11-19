@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pythonic-biostats"
+version = "0.1.0"
+description = "Pythonic implementations of R biostatistics & survival methods (limma eBayes, logistf Firth logistic, coxph Efron, cmprsk Fine-Gray IPCW, HC3 WLS, and genome-wide pooled-null permutation FDR)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Yutaro Tanaka"}]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pythonic_biostats*"]
