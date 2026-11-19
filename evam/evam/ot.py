@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-from .base import EvamResult, check_binary, structural_order
+from .base import EvamResult, SettingsMode, check_binary, structural_order, validate_settings
 
 
 def _parents(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -68,7 +68,13 @@ def _error_weights(
     return est
 
 
-def fit_ot(X: pd.DataFrame, estimate_errors: bool = True) -> EvamResult:
+def fit_ot(
+    X: pd.DataFrame,
+    estimate_errors: bool = True,
+    *,
+    settings: SettingsMode = "default",
+) -> EvamResult:
+    validate_settings(settings)
     X = check_binary(X)
     events = list(X.columns)
     keep = [c for c in events if X[c].nunique() > 1]  # formatData drops constant events
@@ -81,7 +87,7 @@ def fit_ot(X: pd.DataFrame, estimate_errors: bool = True) -> EvamResult:
             edges,
             order,
             model=dict(parent={}, eps=dict(epos=0.0, eneg=0.0), marginal_pred={}, dropped_constant=list(events)),
-            meta=dict(order_route="structural", error_fit="none"),
+            meta=dict(order_route="structural", error_fit="none", settings=settings),
         )
     A = np.column_stack([np.ones(len(X), int)] + [X[c].to_numpy() for c in keep]).astype(float)
     names = ["Root"] + keep
@@ -127,5 +133,5 @@ def fit_ot(X: pd.DataFrame, estimate_errors: bool = True) -> EvamResult:
             marginal_pred=dict(zip(names, pred_clean)),
             dropped_constant=[c for c in events if c not in keep],
         ),
-        meta=dict(order_route="structural", error_fit=err_fit),
+        meta=dict(order_route="structural", error_fit=err_fit, settings=settings),
     )

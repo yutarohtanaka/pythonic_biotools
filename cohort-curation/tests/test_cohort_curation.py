@@ -262,3 +262,68 @@ def test_download_gistic_peak_files_tumor_type_and_safe_tar(tmp_path, monkeypatc
     with tarfile.open(fileobj=io.BytesIO(evil_buf.getvalue()), mode="r:gz") as tar:
         with pytest.raises(ValueError, match="Unsafe path traversal"):
             _safe_extract_tar_member(tar, "../escape.txt", tmp_path)
+
+
+def test_r_default_settings(tmp_path):
+    from cohort_curation import EXCEL_MANGLED_GENE_MAP
+
+    # 1. Verify expanded EXCEL_MANGLED_GENE_MAP entries
+    assert EXCEL_MANGLED_GENE_MAP["2-APR"] == "PMAIP1"
+    assert EXCEL_MANGLED_GENE_MAP["OCT4"] == "POU5F1"
+    assert EXCEL_MANGLED_GENE_MAP["MARC1"] == "MTARC1"
+    assert EXCEL_MANGLED_GENE_MAP["MARC2"] == "MTARC2"
+    assert repair_excel_mangled_genes(["2-Apr", "Oct4", "MARC1", "MARC2"]) == [
+        "PMAIP1",
+        "POU5F1",
+        "MTARC1",
+        "MTARC2",
+    ]
+
+    hgnc_df = pd.DataFrame(
+        [
+            {
+                "symbol": "KMT2D",
+                "status": "Approved",
+                "prev_symbol": "MLL2",
+                "alias_symbol": "ALR",
+                "entrez_id": "8085",
+            },
+            {
+                "symbol": "TP53",
+                "status": "Approved",
+                "prev_symbol": np.nan,
+                "alias_symbol": "P53",
+                "entrez_id": "7157",
+            },
+        ]
+    )
+
+    p_entrez = tmp_path / "data_gene_panel_ENTREZ1.txt"
+    p_entrez.write_text("stable_id: ENTREZ1\nentrez_gene_list:\t7157\t8085.0\n")
+    p_legacy = tmp_path / "data_gene_panel_LEGACY1.txt"
+    p_legacy.write_text("stable_id: LEGACY1\ngene_list: MLL2 MARC1 2-Apr OCT4\n")
+
+    # 2. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        harmonize_hgnc_symbols(pd.Series(["MLL2"]), hgnc_df, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        build_genie_panel_matrix(tmp_path, settings="invalid")  # type: ignore[arg-type]
+
+    # 3. harmonize_hgnc_symbols: default keeps unmapped symbols, R_default sets unmapped to NaN (HGNChelper)
+    s_in = pd.Series(["MLL2", "2-Apr", "OCT4", "UNKNOWN_LOCUS"])
+    h_def = harmonize_hgnc_symbols(s_in, hgnc_df, settings="default")
+    h_r = harmonize_hgnc_symbols(s_in, hgnc_df, settings="R_default")
+    assert list(h_def) == ["KMT2D", "PMAIP1", "POU5F1", "UNKNOWN_LOCUS"]
+    assert list(h_r.iloc[:3]) == ["KMT2D", "PMAIP1", "POU5F1"]
+    assert pd.isna(h_r.iloc[3])
+
+    # 4. build_genie_panel_matrix: Entrez-ID gene lists + R_default gnomeR symbol canonicalization
+    cov_raw_entrez = build_genie_panel_matrix([p_entrez], settings="default")
+    assert list(cov_raw_entrez.columns) == ["7157", "8085"]
+
+    cov_mapped = build_genie_panel_matrix(tmp_path, entrez_to_symbol=hgnc_df, settings="R_default")
+    assert set(cov_mapped.columns) == {"TP53", "KMT2D", "MTARC1", "PMAIP1", "POU5F1"}
+    assert cov_mapped.loc["ENTREZ1", "TP53"] == 1 and cov_mapped.loc["ENTREZ1", "KMT2D"] == 1
+    assert cov_mapped.loc["LEGACY1", "MTARC1"] == 1 and cov_mapped.loc["LEGACY1", "PMAIP1"] == 1
+    assert cov_mapped.loc["LEGACY1", "POU5F1"] == 1 and cov_mapped.loc["LEGACY1", "KMT2D"] == 1
+

@@ -265,3 +265,91 @@ def test_input_validation_errors():
     with pytest.raises(ValueError, match="at least 2"):
         bg = fit_discover_background(np.array([[1.0, 0.0], [0.0, 1.0]]))
         groupwise_discover_test(bg, genes=["G0"])
+
+    bg_ok = fit_discover_background(np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]))
+    with pytest.raises(ValueError, match="settings"):
+        pairwise_discover_test(bg_ok, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        groupwise_discover_test(bg_ok, genes=["G0", "G1"], settings="bad")  # type: ignore[arg-type]
+
+
+def test_r_default_inclusive_p_and_exact_dbh_fdr():
+    """
+    Verify NKI-CCB/DISCOVER (fdr.f90, grouptest.py) parity under settings='R_default':
+    1. Forces mid_p=False (inclusive tails P(X <= x) / P(X >= x)).
+    2. Computes exact DBH discrete Benjamini-Hochberg FDR:
+       pi0 * sum_r F_r(p_obs) / rank with pi0 = min(1.0, sum(p) / sum(E_0[P])).
+    """
+    rng = np.random.default_rng(2025)
+    n_tumors = 80
+    bg_genes = rng.binomial(1, 0.2, size=(12, n_tumors)).astype(float)
+    mex1 = np.zeros(n_tumors)
+    mex2 = np.zeros(n_tumors)
+    mex1[:25] = 1.0
+    mex2[25:50] = 1.0
+    mat = np.vstack([mex1, mex2, bg_genes])
+    names = ["MEX_A", "MEX_B"] + [f"G_{i}" for i in range(12)]
+    bg = fit_discover_background(pd.DataFrame(mat, index=names))
+
+    # Pairwise exclusivity: mid_p=True in default -> p(0) = 0.5 * Pr(X=0);
+    # settings='R_default' forces mid_p=False even if mid_p=True is left at default!
+    sub = bg.subset(genes=["MEX_A", "MEX_B", "G_0", "G_1", "G_2", "G_3"])
+    res_def = pairwise_discover_test(sub, alternative="exclusivity", settings="default")
+    res_r = pairwise_discover_test(sub, alternative="exclusivity", settings="R_default")
+
+    assert res_def.mid_p is True
+    assert res_r.mid_p is False
+    # For k_obs == 0 on (MEX_A, MEX_B), inclusive p_value is exactly 2x mid-p p_value!
+    np.testing.assert_allclose(res_r.p_value[0], 2.0 * res_def.p_value[0], rtol=1e-12)
+
+    # Verify exact DBH q_value against brute-force reference formula from fdr.f90
+    df_r = res_r.to_dataframe()
+    m = len(df_r)
+    name_to_idx = {g: i for i, g in enumerate(sub.gene_names)}
+    supports_ref = []
+    e0_ref = []
+    for _, row in df_r.iterrows():
+        i = name_to_idx[row["gene1"]]
+        j = name_to_idx[row["gene2"]]
+        pk = sub.bg_probs[i] * sub.bg_probs[j]
+        pmf = poisson_binomial_pmf(pk, method="auto")
+        cdf = np.clip(np.cumsum(pmf), 0.0, 1.0)
+        supports_ref.append(cdf)
+        e0_ref.append(float(np.dot(pmf, cdf)))
+        np.testing.assert_allclose(row["p_value"], cdf[int(row["obs_co_mutations"])], rtol=1e-12)
+
+    p_obs = df_r["p_value"].to_numpy(dtype=np.float64)
+    pi0_ref = min(1.0, float(np.sum(p_obs)) / float(np.sum(e0_ref)))
+    order = np.argsort(p_obs, kind="mergesort")
+    p_sorted = p_obs[order]
+    raw_q_ref = np.zeros(m, dtype=np.float64)
+    for k in range(m):
+        tau = p_sorted[k]
+        sum_f = sum(
+            float(np.max(s[s <= tau * (1.0 + 1e-14)])) if np.any(s <= tau * (1.0 + 1e-14)) else 0.0
+            for s in supports_ref
+        )
+        raw_q_ref[k] = pi0_ref * sum_f / float(k + 1)
+    q_sorted_ref = np.clip(np.minimum.accumulate(raw_q_ref[::-1])[::-1], 0.0, 1.0)
+    q_ref = np.empty(m, dtype=np.float64)
+    q_ref[order] = q_sorted_ref
+    np.testing.assert_allclose(res_r.q_value, q_ref, rtol=1e-12, atol=1e-14)
+
+    # Also verify groupwise_discover_test under settings='R_default' (both exclusivity & coverage)
+    gsets = {
+        "S1": ["MEX_A", "MEX_B", "G_0"],
+        "S2": ["G_1", "G_2", "G_3"],
+        "S3": ["G_4", "G_5", "G_6"],
+    }
+    gw_def = groupwise_discover_test(bg, gene_sets=gsets, method="coverage", settings="default")
+    gw_r = groupwise_discover_test(bg, gene_sets=gsets, method="coverage", settings="R_default")
+    assert gw_def.mid_p is True
+    assert gw_r.mid_p is False
+    assert np.all(gw_r.p_value >= gw_def.p_value - 1e-15)
+    assert gw_r.q_value[0] < 0.05
+
+    # 2-gene groupwise impurity == pairwise exclusivity holds in R_default too!
+    pw_2_r = pairwise_discover_test(bg, g1=["MEX_A"], g2=["MEX_B"], settings="R_default")
+    gw_2_r = groupwise_discover_test(bg, genes=["MEX_A", "MEX_B"], method="impurity", settings="R_default")
+    np.testing.assert_allclose(gw_2_r.p_value, pw_2_r.p_value, rtol=1e-12)
+    np.testing.assert_allclose(gw_2_r.q_value, pw_2_r.q_value, rtol=1e-12)

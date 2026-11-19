@@ -23,6 +23,16 @@ from .intervals import compute_territory_and_counts
 _MAX_LOG_THETA = 12.5  # theta ~ 2.68e5 -> alpha ~ 3.7e-6 (Poisson regime)
 _MIN_LOG_THETA = -14.0  # theta ~ 8.3e-7
 
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
+
 
 @dataclass(frozen=True)
 class FishHookResult:
@@ -53,25 +63,30 @@ class FishHookResult:
     qq_slope: float
     converged: bool
     n_iter: int
+    p_neg: np.ndarray | None = None
+    fdr_neg: np.ndarray | None = None
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Return region-level enrichment statistics as a DataFrame."""
-        return pd.DataFrame(
-            {
-                "region_id": self.region_ids,
-                "chrom": self.chrom,
-                "start": self.start,
-                "end": self.end,
-                "eligible_bp": self.eligible_bp,
-                "obs_counts": self.obs_counts,
-                "exp_counts": self.exp_counts,
-                "obs_density": self.obs_density,
-                "exp_density": self.exp_density,
-                "fold_enrichment": self.fold_enrichment,
-                "p_value": self.p_value,
-                "q_value": self.q_value,
-            }
-        )
+        """Return region-level enrichment (and optional depletion) statistics as a DataFrame."""
+        data: dict[str, object] = {
+            "region_id": self.region_ids,
+            "chrom": self.chrom,
+            "start": self.start,
+            "end": self.end,
+            "eligible_bp": self.eligible_bp,
+            "obs_counts": self.obs_counts,
+            "exp_counts": self.exp_counts,
+            "obs_density": self.obs_density,
+            "exp_density": self.exp_density,
+            "fold_enrichment": self.fold_enrichment,
+            "p_value": self.p_value,
+            "q_value": self.q_value,
+        }
+        if self.p_neg is not None:
+            data["p_neg"] = self.p_neg
+        if self.fdr_neg is not None:
+            data["fdr_neg"] = self.fdr_neg
+        return pd.DataFrame(data)
 
     def coefficients_dataframe(self) -> pd.DataFrame:
         """Return fitted covariate regression coefficients and Wald tests."""
@@ -115,7 +130,10 @@ class FishHookModel:
         restrict_mutations_to_eligible: bool = True,
         max_iter: int = 100,
         tol: float = 1e-8,
+        seed: int = 42,
+        settings: SettingsMode = "default",
     ) -> None:
+        _validate_settings(settings)
         self.regions = regions
         self.mutations = mutations
         self.eligible_intervals = eligible_intervals
@@ -126,6 +144,8 @@ class FishHookModel:
         self.restrict_mutations_to_eligible = restrict_mutations_to_eligible
         self.max_iter = max_iter
         self.tol = tol
+        self.seed = seed
+        self.settings: SettingsMode = settings
 
     def fit(self) -> FishHookResult:
         return fit_fishhook(
@@ -139,6 +159,8 @@ class FishHookModel:
             restrict_mutations_to_eligible=self.restrict_mutations_to_eligible,
             max_iter=self.max_iter,
             tol=self.tol,
+            seed=self.seed,
+            settings=self.settings,
         )
 
 
@@ -368,11 +390,16 @@ def _profile_mle_theta(
     return float(np.exp(log_t)), best_ll
 
 
-def _compute_inflation_diagnostics(p_active: np.ndarray) -> tuple[float, float]:
+def _compute_inflation_diagnostics(
+    p_active: np.ndarray,
+    *,
+    settings: SettingsMode = "default",
+) -> tuple[float, float]:
     """
     Compute QQ slope (-log10 observed vs uniform expected) and genomic inflation
-    factor lambda_GC (Devlin & Roeder 1999, falling back to QQ slope when >50% of
-    genomic tiles have 0 mutations and exact discrete p = 1.0).
+    factor lambda_GC.
+    In `settings='R_default'`, fits all-point zero-intercept OLS
+    `lm(-log10(p_obs) ~ -log10(p_exp) - 1)` matching `mskilab/fishHook` `fishhook.R`.
     """
     m = p_active.size
     if m == 0:
@@ -381,6 +408,13 @@ def _compute_inflation_diagnostics(p_active: np.ndarray) -> tuple[float, float]:
     p_clamped = np.clip(p_active, 1e-300, 1.0)
     p_sorted = np.sort(p_clamped)
     exp_p = (np.arange(1, m + 1, dtype=np.float64) - 0.5) / m
+
+    if settings == "R_default":
+        x_q = -np.log10(exp_p)
+        y_q = -np.log10(p_sorted)
+        denom = float(np.dot(x_q, x_q))
+        lam = float(np.dot(x_q, y_q) / denom) if denom > 0.0 else 1.0
+        return lam, lam
 
     # QQ slope across informative interior quantiles (excluding top 1% driver tail
     # and the discrete p == 1.0 zero-mutation plateau)
@@ -418,21 +452,29 @@ def fit_fishhook(
     restrict_mutations_to_eligible: bool = True,
     max_iter: int = 100,
     tol: float = 1e-8,
+    seed: int = 42,
+    settings: SettingsMode = "default",
 ) -> FishHookResult:
     """
     Fit a fishHook Gamma-Poisson (NB2) somatic mutation background model with
-    callable territory offset log(L_i) and evaluate exact right-tail enrichment.
+    callable territory offset log(L_i) and evaluate right-tail enrichment.
     """
+    _validate_settings(settings)
     if max_iter < 1:
         raise ValueError("max_iter must be >= 1.")
     if tol <= 0:
         raise ValueError("tol must be > 0.")
 
+    muts_df = mutations if isinstance(mutations, pd.DataFrame) else pd.DataFrame(mutations)
+    eff_cap = max_muts_per_sample_per_tile
+    if settings == "R_default" and eff_cap is None and "sample_id" in muts_df.columns:
+        eff_cap = 1
+
     r_chrom, r_start, r_end, r_ids, eligible_bp, obs_counts = compute_territory_and_counts(
         regions=regions,
-        mutations=mutations,
+        mutations=muts_df,
         eligible_intervals=eligible_intervals,
-        max_muts_per_sample_per_tile=max_muts_per_sample_per_tile,
+        max_muts_per_sample_per_tile=eff_cap,
         pos_coord_system=pos_coord_system,
         restrict_mutations_to_eligible=restrict_mutations_to_eligible,
     )
@@ -482,8 +524,22 @@ def fit_fishhook(
         obs_dens = np.where(active_mask, 0.0, np.nan)
         exp_dens = np.where(active_mask, 0.0, np.nan)
         fe = np.where(active_mask, 1.0, np.nan)
-        p_vals = np.where(active_mask, 1.0, np.nan)
-        q_vals = np.where(active_mask, 1.0, np.nan)
+        p_neg_zero: np.ndarray | None = None
+        fdr_neg_zero: np.ndarray | None = None
+        if settings == "R_default":
+            rng = np.random.default_rng(seed)
+            u_act = rng.uniform(0.0, 1.0, size=n_act)
+            p_vals = np.full(n_total, np.nan, dtype=np.float64)
+            p_vals[active_mask] = u_act
+            q_vals = _bh_fdr_nan_aware(p_vals, active_mask)
+            p_neg_zero = np.full(n_total, np.nan, dtype=np.float64)
+            p_neg_zero[active_mask] = 1.0 - u_act
+            fdr_neg_zero = _bh_fdr_nan_aware(p_neg_zero, active_mask)
+            lam_zero, qq_zero = _compute_inflation_diagnostics(u_act, settings="R_default")
+        else:
+            p_vals = np.where(active_mask, 1.0, np.nan)
+            q_vals = np.where(active_mask, 1.0, np.nan)
+            lam_zero, qq_zero = 1.0, 1.0
         return FishHookResult(
             region_ids=r_ids,
             chrom=r_chrom,
@@ -506,10 +562,12 @@ def fit_fishhook(
             theta=float(np.inf),
             is_poisson_fallback=True,
             loglik=0.0,
-            lambda_gc=1.0,
-            qq_slope=1.0,
+            lambda_gc=lam_zero,
+            qq_slope=qq_zero,
             converged=True,
             n_iter=1,
+            p_neg=p_neg_zero,
+            fdr_neg=fdr_neg_zero,
         )
 
     gammaln_y1 = special.gammaln(y_act + 1.0)
@@ -626,19 +684,65 @@ def fit_fishhook(
     fold_enrichment[active_mask] = y_act / np.maximum(mu_hat, 1e-300)
 
     y_int_act = obs_counts[active_mask]
-    p_act = np.ones(n_act, dtype=np.float64)
-    pos_y = y_int_act >= 1
-    if np.any(pos_y):
-        if is_poisson:
-            p_act[pos_y] = stats.poisson.sf(y_int_act[pos_y] - 1, mu=mu_hat[pos_y])
-        else:
-            p_nb = theta_hat / (theta_hat + mu_hat[pos_y])
-            p_act[pos_y] = stats.nbinom.sf(y_int_act[pos_y] - 1, n=theta_hat, p=p_nb)
-    p_act = np.clip(p_act, 0.0, 1.0)
-    p_values[active_mask] = p_act
+    p_neg_values: np.ndarray | None = None
+    fdr_neg_values: np.ndarray | None = None
 
-    q_values = _bh_fdr_nan_aware(p_values, active_mask)
-    lambda_gc, qq_slope = _compute_inflation_diagnostics(p_act)
+    if settings == "R_default":
+        rng = np.random.default_rng(seed)
+        u_act = rng.uniform(0.0, 1.0, size=n_act)
+
+        if is_poisson:
+            p_gt = stats.poisson.sf(y_int_act, mu=mu_hat)
+            p_ge = np.where(
+                y_int_act >= 1,
+                stats.poisson.sf(np.maximum(y_int_act - 1, 0), mu=mu_hat),
+                1.0,
+            )
+            cdf_lt = np.where(
+                y_int_act >= 1,
+                stats.poisson.cdf(np.maximum(y_int_act - 1, 0), mu=mu_hat),
+                0.0,
+            )
+            cdf_le = stats.poisson.cdf(y_int_act, mu=mu_hat)
+        else:
+            p_nb_all = theta_hat / (theta_hat + mu_hat)
+            p_gt = stats.nbinom.sf(y_int_act, n=theta_hat, p=p_nb_all)
+            p_ge = np.where(
+                y_int_act >= 1,
+                stats.nbinom.sf(np.maximum(y_int_act - 1, 0), n=theta_hat, p=p_nb_all),
+                1.0,
+            )
+            cdf_lt = np.where(
+                y_int_act >= 1,
+                stats.nbinom.cdf(np.maximum(y_int_act - 1, 0), n=theta_hat, p=p_nb_all),
+                0.0,
+            )
+            cdf_le = stats.nbinom.cdf(y_int_act, n=theta_hat, p=p_nb_all)
+
+        p_act = np.clip((1.0 - u_act) * p_gt + u_act * p_ge, 0.0, 1.0)
+        p_neg_act = np.clip(u_act * cdf_lt + (1.0 - u_act) * cdf_le, 0.0, 1.0)
+
+        p_values[active_mask] = p_act
+        q_values = _bh_fdr_nan_aware(p_values, active_mask)
+
+        p_neg_values = np.full(n_total, np.nan, dtype=np.float64)
+        p_neg_values[active_mask] = p_neg_act
+        fdr_neg_values = _bh_fdr_nan_aware(p_neg_values, active_mask)
+        lambda_gc, qq_slope = _compute_inflation_diagnostics(p_act, settings="R_default")
+    else:
+        p_act = np.ones(n_act, dtype=np.float64)
+        pos_y = y_int_act >= 1
+        if np.any(pos_y):
+            if is_poisson:
+                p_act[pos_y] = stats.poisson.sf(y_int_act[pos_y] - 1, mu=mu_hat[pos_y])
+            else:
+                p_nb = theta_hat / (theta_hat + mu_hat[pos_y])
+                p_act[pos_y] = stats.nbinom.sf(y_int_act[pos_y] - 1, n=theta_hat, p=p_nb)
+        p_act = np.clip(p_act, 0.0, 1.0)
+        p_values[active_mask] = p_act
+
+        q_values = _bh_fdr_nan_aware(p_values, active_mask)
+        lambda_gc, qq_slope = _compute_inflation_diagnostics(p_act, settings="default")
 
     return FishHookResult(
         region_ids=r_ids,
@@ -666,4 +770,6 @@ def fit_fishhook(
         qq_slope=qq_slope,
         converged=converged,
         n_iter=n_outer,
+        p_neg=p_neg_values,
+        fdr_neg=fdr_neg_values,
     )

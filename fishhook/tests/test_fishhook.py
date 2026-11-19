@@ -310,3 +310,105 @@ def test_coefficients_dataframe_and_exposure_scaling_invariance():
     assert np.isclose(res.exp_counts[1] / res.exp_counts[0], 4.0, rtol=1e-10)
     assert np.isclose(res.exp_density[1], res.exp_density[0], rtol=1e-10)
 
+
+def test_fishhook_settings_validation():
+    regions = pd.DataFrame({"chrom": ["chr1", "chr1"], "start": [0, 1000], "end": [1000, 2000]})
+    muts = pd.DataFrame({"chrom": ["chr1"], "pos": [500]})
+    with pytest.raises(ValueError, match="settings"):
+        FishHookModel(regions, muts, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        fit_fishhook(regions, muts, settings="bad")  # type: ignore[arg-type]
+
+
+def test_r_default_idcap_randomized_p_ols_qq_and_depletion():
+    """
+    Verify mskilab/fishHook (fishhook.R) parity under settings='R_default':
+    1. Defaults max_muts_per_sample_per_tile=1 when sample_id column is present (and works without sample_id).
+    2. Computes uniform randomized p-values strictly in [P(Y > y), P(Y >= y)] seeded deterministically.
+    3. Fits all-point zero-intercept OLS lm(-log10(p_obs) ~ -log10(p_exp) - 1) for QQ lambda.
+    4. Includes p_neg and fdr_neg depletion columns in .to_dataframe().
+    """
+    rng = np.random.default_rng(3030)
+    n_tiles = 200
+    regions = pd.DataFrame(
+        {
+            "chrom": ["chr1"] * n_tiles,
+            "start": np.arange(n_tiles) * 10_000,
+            "end": (np.arange(n_tiles) + 1) * 10_000,
+            "region_id": [f"T_{i}" for i in range(n_tiles)],
+        }
+    )
+    # Moderate baseline ~12 muts/tile across distinct samples, EXCEPT:
+    # - T_0 has 35 kataegis mutations all in ONE sample 'KAT_1' (capped to 1 in R_default -> depleted!)
+    # - T_1 has 0 mutations -> strongly depleted in p_neg / fdr_neg!
+    # - T_2 has 40 mutations across 40 distinct samples -> strongly enriched!
+    bg_counts = rng.poisson(12.0, size=n_tiles)
+    bg_counts[0] = 0
+    bg_counts[1] = 0
+    bg_counts[2] = 0
+    bg_muts = _simulate_mutations_from_counts(regions, bg_counts, seed=3031)
+    kat_muts = pd.DataFrame(
+        {
+            "chrom": ["chr1"] * 35,
+            "pos": rng.integers(50, 9_950, size=35),
+            "sample_id": ["KAT_1"] * 35,
+        }
+    )
+    drv_muts = pd.DataFrame(
+        {
+            "chrom": ["chr1"] * 40,
+            "pos": rng.integers(20_050, 29_950, size=40),
+            "sample_id": [f"DRV_{k}" for k in range(40)],
+        }
+    )
+    all_muts = pd.concat([bg_muts, kat_muts, drv_muts], ignore_index=True)
+
+    res_def = FishHookModel(regions, all_muts, settings="default").fit()
+    res_r1 = FishHookModel(regions, all_muts, seed=99, settings="R_default").fit()
+    res_r2 = fit_fishhook(regions, all_muts, seed=99, settings="R_default")
+
+    # Deterministic seeding
+    np.testing.assert_allclose(res_r1.p_value, res_r2.p_value, rtol=1e-15)
+
+    # 1. Default idcap=1 when sample_id is present: T_0 count is 35 in default vs 1 in R_default!
+    assert res_def.obs_counts[0] == 35
+    assert res_r1.obs_counts[0] == 1
+    assert res_r1.obs_counts[2] == 40
+
+    # 2. Uniform randomized p-values lie inside [P(Y > y), P(Y >= y)], so y=0 tiles have p < 1.0!
+    assert res_def.p_value[1] == 1.0
+    assert 0.0 < res_r1.p_value[1] < 1.0
+    for idx in range(n_tiles):
+        y_i = int(res_r1.obs_counts[idx])
+        mu_i = float(res_r1.exp_counts[idx])
+        if res_r1.is_poisson_fallback:
+            p_gt = stats.poisson.sf(y_i, mu=mu_i)
+            p_ge = stats.poisson.sf(y_i - 1, mu=mu_i) if y_i >= 1 else 1.0
+        else:
+            p_nb = res_r1.theta / (res_r1.theta + mu_i)
+            p_gt = stats.nbinom.sf(y_i, n=res_r1.theta, p=p_nb)
+            p_ge = stats.nbinom.sf(y_i - 1, n=res_r1.theta, p=p_nb) if y_i >= 1 else 1.0
+        assert p_gt - 1e-15 <= res_r1.p_value[idx] <= p_ge + 1e-15
+
+    # 3. All-point zero-intercept OLS lm(-log10(p_obs) ~ -log10(p_exp) - 1)
+    p_s = np.sort(np.clip(res_r1.p_value, 1e-300, 1.0))
+    exp_p = (np.arange(1, n_tiles + 1, dtype=np.float64) - 0.5) / n_tiles
+    x_q = -np.log10(exp_p)
+    y_q = -np.log10(p_s)
+    expected_lam = float(np.dot(x_q, y_q) / np.dot(x_q, x_q))
+    np.testing.assert_allclose(res_r1.qq_slope, expected_lam, rtol=1e-12)
+    np.testing.assert_allclose(res_r1.lambda_gc, expected_lam, rtol=1e-12)
+
+    # 4. Depletion columns p_neg and fdr_neg in .to_dataframe()
+    df_def = res_def.to_dataframe()
+    df_r = res_r1.to_dataframe().set_index("region_id")
+    assert "p_neg" not in df_def.columns and "fdr_neg" not in df_def.columns
+    assert "p_neg" in df_r.columns and "fdr_neg" in df_r.columns
+    assert df_r.loc["T_1", "fdr_neg"] < 0.05  # 0 mutations vs ~12 expected -> significant depletion!
+    assert df_r.loc["T_2", "q_value"] < 1e-3  # 40 mutations -> significant enrichment!
+
+    # Without sample_id column, settings='R_default' still runs cleanly without error
+    no_sid = all_muts.drop(columns=["sample_id"])
+    res_no_sid = fit_fishhook(regions, no_sid, settings="R_default")
+    assert res_no_sid.obs_counts[0] == 35
+

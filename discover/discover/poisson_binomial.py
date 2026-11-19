@@ -273,3 +273,60 @@ def discover_fdr(
     q = np.empty(m, dtype=np.float64)
     q[order] = q_sorted
     return q
+
+
+def dbh_fdr(
+    p_values: np.ndarray | list[float],
+    supports: list[np.ndarray],
+    pmfs_aligned: list[np.ndarray],
+) -> np.ndarray:
+    """
+    Exact discrete Benjamini-Hochberg (DBH) FDR matching NKI-CCB/DISCOVER `fdr.f90`:
+        pi0 = min(1.0, sum_r p_r / sum_r E_0[P_r])
+        q_(k) = min_{j >= k} min(1.0, pi0 * (sum_r F_r(p_(j))) / j)
+    where `F_r(tau) = max({0} U {s in supports[r] : s <= tau})` is the null CDF of
+    test r's discrete inclusive Poisson-Binomial p-value.
+    """
+    p = np.asarray(p_values, dtype=np.float64).ravel()
+    m = p.size
+    if m == 0:
+        return np.array([], dtype=np.float64)
+    if len(supports) != m or len(pmfs_aligned) != m:
+        raise ValueError("supports and pmfs_aligned must have length equal to len(p_values).")
+    if np.any(np.isnan(p)) or np.any((p < 0.0) | (p > 1.0)):
+        raise ValueError("p_values must lie in [0, 1] without NaN.")
+
+    e0_p = np.empty(m, dtype=np.float64)
+    for r in range(m):
+        e0_p[r] = float(np.dot(pmfs_aligned[r], supports[r]))
+
+    denom = float(np.sum(e0_p))
+    pi0 = min(1.0, float(np.sum(p)) / denom) if denom > 0.0 else 1.0
+
+    order = np.argsort(p, kind="mergesort")
+    p_sorted = p[order]
+    p_max_tol = float(p_sorted[-1]) * (1.0 + 1e-14)
+
+    diff = np.zeros(m + 1, dtype=np.float64)
+    for s_r in supports:
+        if s_r.size == 0:
+            continue
+        deltas = np.empty_like(s_r)
+        deltas[0] = s_r[0]
+        if s_r.size > 1:
+            deltas[1:] = np.diff(s_r)
+        mask = (deltas > 0.0) & (s_r <= p_max_tol)
+        if np.any(mask):
+            s_sub = s_r[mask] * (1.0 - 1e-14)
+            k_idx = np.searchsorted(p_sorted, s_sub, side="left")
+            np.add.at(diff, k_idx, deltas[mask])
+
+    sum_f = np.maximum(np.cumsum(diff[:m]), p_sorted)
+    ranks = np.arange(1, m + 1, dtype=np.float64)
+    q_sorted = (pi0 * sum_f) / ranks
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+
+    q = np.empty(m, dtype=np.float64)
+    q[order] = q_sorted
+    return q

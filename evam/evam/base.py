@@ -14,8 +14,17 @@ It is derived by one of four routes, recorded in `meta["order_route"]`:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 import numpy as np
 import pandas as pd
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 @dataclass

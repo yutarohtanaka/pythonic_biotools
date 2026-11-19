@@ -9,6 +9,7 @@ from evam import (
     ctmc_order_mc,
     fit_frequency,
     fit_frequency_fisher,
+    fit_mhn,
     fit_oncobn,
     fit_ot,
     order_from_theta,
@@ -112,3 +113,107 @@ def test_dbn_cbn_noise_non_overfitting_fisher_and_ctmc_mc():
     mc_O = ctmc_order_mc(lambda st: np.exp(np.diag(theta) + off @ st.astype(float)), 3, n_paths=6000, seed=11)
     mask = ~np.eye(3, dtype=bool)
     np.testing.assert_allclose(mc_O[mask], exact_O[mask], atol=0.03)
+
+
+def test_r_default_settings(monkeypatch):
+    import sys
+    import types
+
+    rng = np.random.default_rng(77)
+    n_samp = 150
+    a = rng.binomial(1, 0.70, size=n_samp)
+    b = np.where(a == 1, rng.binomial(1, 0.75, size=n_samp), rng.binomial(1, 0.04, size=n_samp))
+    c = np.where((a == 1) & (b == 1), rng.binomial(1, 0.70, size=n_samp), rng.binomial(1, 0.03, size=n_samp))
+    X = pd.DataFrame({"A": a, "B": b, "C": c})
+
+    # 1. Invalid settings raises ValueError across fit_ot, fit_oncobn, fit_mhn
+    for fn in (
+        lambda: fit_ot(X, settings="unknown"),  # type: ignore[arg-type]
+        lambda: fit_oncobn(X, settings="unknown"),  # type: ignore[arg-type]
+        lambda: fit_mhn(X, settings="unknown"),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="settings"):
+            fn()
+
+    # 2. fit_ot R_default
+    ot_def = fit_ot(X, settings="default")
+    ot_r = fit_ot(X, settings="R_default")
+    pd.testing.assert_frame_equal(ot_r.order, ot_def.order)
+
+    # 3. fit_oncobn R_default: defaults to model="CBN", penalty="none", +N loglik offset, no theta > eps rejection
+    obn_def = fit_oncobn(X)
+    obn_r = fit_oncobn(X, settings="R_default")
+    assert obn_def.method == "OncoBN_DBN" and obn_def.model["penalty"] == "bic"
+    assert obn_r.method == "OncoBN_CBN" and obn_r.model["penalty"] == "none"
+
+    obn_unpen_def = fit_oncobn(X, model="CBN", penalty="none", settings="default")
+    assert obn_r.model["loglik"] == pytest.approx(obn_unpen_def.model["loglik"] + len(X), rel=1e-12)
+
+    # Mutually exclusive pair where theta == 0 < epsilon=0.45:
+    # default rejects parent edge (theta <= epsilon), whereas R_default (OncoBN::fitCPN) permits it when ll improves
+    m1 = np.r_[np.ones(60, dtype=int), np.zeros(40, dtype=int)]
+    m2 = np.r_[np.zeros(60, dtype=int), np.ones(18, dtype=int), np.zeros(22, dtype=int)]
+    X_me = pd.DataFrame({"M1": m1, "M2": m2})
+    me_def = fit_oncobn(X_me, model="CBN", penalty="none", epsilon=0.45, settings="default")
+    me_r = fit_oncobn(X_me, epsilon=0.45, settings="R_default")
+    assert me_def.model["parents"]["M2"] == ["Root"]
+    assert me_r.model["parents"]["M2"] == ["M1"]
+
+    # 4. fit_mhn R_default (both built-in exact solver and mocked LearnMHN optimizer)
+    mhn_def = fit_mhn(X, maxit=200, settings="default")
+    mhn_r = fit_mhn(X, maxit=200, settings="R_default")
+    assert mhn_def.method == "cMHN"
+    assert mhn_r.method == "oMHN"
+    theta_r = mhn_r.model["log_theta"].to_numpy()
+    np.testing.assert_allclose(theta_r, np.round(theta_r, 2), atol=1e-12)
+
+    # Verify small non-zero off-diagonal edge (0.03) is retained in R_default but filtered (>0.05) in default
+    class _MockRes:
+        def __init__(self, lt):
+            self.log_theta = lt
+            self.meta = {"score": -1.23}
+
+        def get_equivalent_classical_mhn(self):
+            n_ev = self.log_theta.shape[1]
+            eff = self.log_theta[:n_ev, :n_ev] - self.log_theta[n_ev][None, :] * (1.0 - np.eye(n_ev))
+            return _MockRes(eff)
+
+    class _MockOpt:
+        is_o = False
+
+        def load_data_matrix(self, mat):
+            self._n = mat.shape[1]
+
+        def train(self, lam=0.01, maxit=5000, round_result=False):
+            raw = np.array(
+                [
+                    [-0.412, 0.034, 0.0],
+                    [1.256, -1.104, 0.0],
+                    [0.0, 0.889, -1.523],
+                ]
+            )
+            if self.is_o:
+                raw = np.vstack([raw, np.array([0.004, 0.0, 0.0])])
+            if round_result:
+                raw = np.round(raw, 2)
+            return _MockRes(raw)
+
+    class _MockCMHN(_MockOpt):
+        is_o = False
+
+    class _MockOMHN(_MockOpt):
+        is_o = True
+
+    fake_pkg = types.ModuleType("mhn")
+    fake_opt_mod = types.ModuleType("mhn.optimizers")
+    fake_opt_mod.cMHNOptimizer = _MockCMHN  # type: ignore[attr-defined]
+    fake_opt_mod.oMHNOptimizer = _MockOMHN  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mhn", fake_pkg)
+    monkeypatch.setitem(sys.modules, "mhn.optimizers", fake_opt_mod)
+
+    fit_mock_def = fit_mhn(X, settings="default")
+    fit_mock_r = fit_mhn(X, settings="R_default")
+    assert fit_mock_def.method == "cMHN" and len(fit_mock_def.edges) == 2
+    assert fit_mock_r.method == "oMHN" and len(fit_mock_r.edges) == 3  # retains 0.03 edge!
+    assert 0.03 in set(np.round(fit_mock_r.edges["weight"].to_numpy(), 2))
+

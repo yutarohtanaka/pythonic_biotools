@@ -965,3 +965,131 @@ def test_sparse_zero_count_trinucleotide_contexts() -> None:
     assert np.all(np.isfinite(res_prof.global_mle))
     assert np.all(np.isfinite(res_prof.global_cilow))
 
+
+def test_settings_r_default_glm_nb_trajectory_sel_cv_columns_and_theta_fallback() -> None:
+    """
+    Verify `settings="R_default"` vs `settings="default"` in `dndscv`:
+    1. Strict `ValueError` on invalid `settings`.
+    2. Alternating IRLS + Newton `theta` updates (`MASS::glm.nb`, `maxit=25`) recover
+       NB dispersion `theta` and covariate slopes accurately.
+    3. Exact upstream `sel_cv` DataFrame column ordering both with active indels (19 cols)
+       and SNV-only cohorts (14 cols).
+    4. Strict `theta` convergence fallback rules fall back cleanly to Poisson when
+       outer `glm.nb` iteration fails to converge (`max_iter=1`) or `theta -> inf`.
+    """
+    from dndscv.model import fit_nb_covariate_model
+
+    rng = np.random.default_rng(2026)
+    ref = simulate_refcds(n_genes=220, cds_length=600, n_exons=3, n_covariates=2, seed=2026)
+    r_true = rng.uniform(0.02, 0.04, size=192)
+    beta_true = np.array([0.0, 0.65, -0.50])
+    w_gene = np.ones((len(ref), 4), dtype=np.float64)
+    w_gene[0, 1] = 16.0  # missense driver
+    w_ind = np.ones(len(ref), dtype=np.float64)
+    w_ind[1] = 20.0  # indel driver
+
+    muts_with_ind = _simulate_maf_from_refcds(
+        ref,
+        rng,
+        r_true,
+        beta=beta_true,
+        theta=4.5,
+        w_gene=w_gene,
+        ind_rate_scale=0.003,
+        w_ind_gene=w_ind,
+        n_samples=2500,
+    )
+
+    # 1. Invalid settings raises ValueError
+    with pytest.raises(ValueError, match="settings"):
+        run_dndscv(muts_with_ind, ref, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        DnDScvModel(muts_with_ind, ref, settings="bad_mode")  # type: ignore[arg-type]
+
+    # 2 & 3. Exact sel_cv column ordering when indels are active + MASS::glm.nb parity
+    res_def = run_dndscv(muts_with_ind, ref, settings="default")
+    res_r = run_dndscv(muts_with_ind, ref, settings="R_default")
+    assert res_r.settings == "R_default"
+    assert res_r.converged
+    assert not res_r.is_poisson_syn
+    np.testing.assert_allclose(res_r.theta_syn, res_def.theta_syn, rtol=1e-4)
+    np.testing.assert_allclose(res_r.beta_syn, res_def.beta_syn, atol=1e-4)
+
+    expected_indel_cols = [
+        "gene_name",
+        "n_syn",
+        "n_mis",
+        "n_non",
+        "n_spl",
+        "wmis_cv",
+        "wnon_cv",
+        "wspl_cv",
+        "wind_cv",
+        "pmis_cv",
+        "ptrunc_cv",
+        "pallsubs_cv",
+        "pind_cv",
+        "qmis_cv",
+        "qtrunc_cv",
+        "qallsubs_cv",
+        "qind_cv",
+        "pglobal_cv",
+        "qglobal_cv",
+    ]
+    df_r = res_r.to_dataframe()
+    assert list(df_r.columns) == expected_indel_cols
+    assert list(res_r.sel_cv.columns) == expected_indel_cols
+    assert "cds_length" in res_def.to_dataframe().columns
+    sig_r = res_r.significant(alpha=0.05)
+    assert {ref.gene_names[0], ref.gene_names[1]}.issubset(set(sig_r["gene_name"]))
+
+    # SNV-only cohort (0 indels): exact 14-column upstream sel_cv schema
+    muts_snv_only = muts_with_ind.loc[muts_with_ind["mut"] != "-"].copy()
+    res_r_snv = DnDScvModel(muts_snv_only, ref, settings="R_default").fit()
+    expected_snv_cols = [
+        "gene_name",
+        "n_syn",
+        "n_mis",
+        "n_non",
+        "n_spl",
+        "wmis_cv",
+        "wnon_cv",
+        "wspl_cv",
+        "pmis_cv",
+        "ptrunc_cv",
+        "pallsubs_cv",
+        "qmis_cv",
+        "qtrunc_cv",
+        "qallsubs_cv",
+    ]
+    assert list(res_r_snv.to_dataframe().columns) == expected_snv_cols
+
+    # 4. Strict theta convergence fallback: non-convergent glm.nb (max_iter=1 on strongly
+    #    overdispersed counts) falls back strictly to Poisson under R_default, whereas default
+    #    retains the intermediate finite theta iterate
+    nb_nonconv_r = fit_nb_covariate_model(
+        res_r.n_syn.astype(float),
+        res_r.exp_syn,
+        ref.covariates,
+        np.ones(len(ref), dtype=bool),
+        use_nb=True,
+        max_iter=1,
+        tol=1e-14,
+        settings="R_default",
+    )
+    nb_nonconv_def = fit_nb_covariate_model(
+        res_r.n_syn.astype(float),
+        res_r.exp_syn,
+        ref.covariates,
+        np.ones(len(ref), dtype=bool),
+        use_nb=True,
+        max_iter=1,
+        tol=1e-14,
+        settings="default",
+    )
+    assert nb_nonconv_r.is_poisson is True
+    assert np.isinf(nb_nonconv_r.theta)
+    assert nb_nonconv_def.is_poisson is False
+    assert np.isfinite(nb_nonconv_def.theta)
+
+

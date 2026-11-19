@@ -42,6 +42,21 @@ print(res.global_dnds_dataframe())
 print(res.significant(alpha=0.05))
 ```
 
+## Exact `im3sanger/dndscv` Parity (`settings="R_default"`)
+
+`dndscv(...)` (and `DnDScvModel`) accepts `settings: Literal["default", "R_default"] = "default"` (strictly validated; raises `ValueError` on unknown values):
+
+| Component | `settings="default"` (Pythonic default) | `settings="R_default"` (`im3sanger/dndscv` `dndscv.R` parity) |
+| :--- | :--- | :--- |
+| **NB covariate optimizer** | Damped IRLS + bounded Brent/Newton `log(theta)` profile MLE (`max_iter=100`) | `MASS::glm.nb` (`maxit=25`) alternating IRLS + `MASS::theta.ml` moment-initialized Newton `theta` updates |
+| **`theta` fallback policy** | Falls back to Poisson when `theta` hits boundary or `ll_nb <= ll_pois` | Strict `dndscv.R` `tryCatch` convergence fallback: any non-convergent outer `glm.nb` or diverging `theta.ml` (`theta >= 1e4` or `theta < 1e-3`) reverts cleanly to Poisson GLM |
+| **`to_dataframe()` / `sel_cv` schema** | Rich 42-column Pythonic table (`cds_length`, `exp_*`, `mu_*`, `w_*_cv`, `w_*_p`, etc.) | Exact upstream `sel_cv` column ordering (`gene_name, n_syn, n_mis, n_non, n_spl, wmis_cv, wnon_cv, wspl_cv, wind_cv, pmis_cv, ptrunc_cv, pallsubs_cv, pind_cv, qmis_cv, qtrunc_cv, qallsubs_cv, qind_cv, pglobal_cv, qglobal_cv` when indels active; 14-column SNV table otherwise) |
+
+```python
+res_r = dndscv(mutations_df, refcds, settings="R_default")
+print(res_r.to_dataframe(sort_by_pvalue=True).head())
+```
+
 ## License
 
 MIT (clean-room implementation derived from the published mathematical formulations in Martincorena et al., *Cell* 2017).

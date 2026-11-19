@@ -3,10 +3,10 @@ Model re-implemented from the paper and checked against the OncoBN R package's l
 of the EvAM-Tools `do_OncoBN` interface (Diaz-Uriarte & Herrera-Nieto, AGPL-3.0).
 
 Each event i has a parent set Pa(i) (|Pa| <= k, acyclic; empty means 'hangs from WT'). If the parent condition holds
-(OR for DBN, AND for CBN; always true for WT) then x_i ~ Bernoulli(theta_i), otherwise x_i ~ Bernoulli(epsilon),
-subject to the progression positivity constraint theta_i > epsilon (Nicol et al., 2021).
-Score = penalized log-likelihood (default BIC penalty `-0.5 * log(N) * |Pa(i)|`); structure search is exact DP
-over subsets (search='dp', n <= ~14) or exhaustive parent sets under decreasing frequency (search='freq_order').
+(OR for DBN, AND for CBN; always true for WT) then x_i ~ Bernoulli(theta_i), otherwise x_i ~ Bernoulli(epsilon).
+- `settings='default'`: `model='DBN'`, `penalty='bic'`, enforces progression positivity `theta_i > epsilon`.
+- `settings='R_default'`: Matches `phillipnicol/OncoBN::fitCPN` defaults (`model='CBN'`, `penalty='none'`
+  unpenalized conditional log-likelihood without `theta > epsilon` rejection, adding `+ N` offset to `loglik`).
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import itertools
 import numpy as np
 import pandas as pd
 
-from .base import EvamResult, check_binary, structural_order
+from .base import EvamResult, SettingsMode, check_binary, structural_order, validate_settings
 
 
 def _local(x_i: np.ndarray, cond: np.ndarray, eps: float) -> tuple[float, float]:
@@ -37,16 +37,22 @@ def _local(x_i: np.ndarray, cond: np.ndarray, eps: float) -> tuple[float, float]
 
 def fit_oncobn(
     X: pd.DataFrame,
-    model: str = "DBN",
+    model: str | None = None,
     k: int = 3,
     epsilon: float | None = None,
     search: str | None = None,
-    penalty: str = "bic",
+    penalty: str | None = None,
+    *,
+    settings: SettingsMode = "default",
 ) -> EvamResult:
-    if model not in ("DBN", "CBN"):
+    validate_settings(settings)
+    model_eff = ("CBN" if settings == "R_default" else "DBN") if model is None else model
+    penalty_eff = ("none" if settings == "R_default" else "bic") if penalty is None else penalty
+
+    if model_eff not in ("DBN", "CBN"):
         raise ValueError("model must be DBN or CBN")
-    if penalty not in ("bic", "aic", "none"):
-        raise ValueError(f"penalty must be 'bic', 'aic', or 'none', got {penalty!r}")
+    if penalty_eff not in ("bic", "aic", "none"):
+        raise ValueError(f"penalty must be 'bic', 'aic', or 'none', got {penalty_eff!r}")
 
     X = check_binary(X)
     events = list(X.columns)
@@ -55,15 +61,16 @@ def fit_oncobn(
     eps = float(epsilon if epsilon is not None else max(A.mean(0).min() / 2, 1e-6))
     eps = float(np.clip(eps, 1e-6, 1.0 - 1e-6))
     search = search or ("dp" if n <= 14 else "freq_order")
-    agg = (lambda cols: A[:, cols].any(1)) if model == "DBN" else (lambda cols: A[:, cols].all(1))
+    agg = (lambda cols: A[:, cols].any(1)) if model_eff == "DBN" else (lambda cols: A[:, cols].all(1))
 
-    if penalty == "bic":
+    if penalty_eff == "bic":
         edge_pen = 0.5 * float(np.log(max(N, 1)))
-    elif penalty == "aic":
+    elif penalty_eff == "aic":
         edge_pen = 1.0
     else:
         edge_pen = 0.0
 
+    enforce_theta_gt_eps = settings != "R_default"
     raw_cache: dict[tuple[int, tuple[int, ...]], tuple[float, float]] = {}
 
     def local_raw(i: int, P: tuple[int, ...]) -> tuple[float, float]:
@@ -76,7 +83,7 @@ def fit_oncobn(
     def local_scored(i: int, P: tuple[int, ...]) -> float:
         ll, theta = local_raw(i, P)
         if len(P) > 0:
-            if not (theta > eps):
+            if enforce_theta_gt_eps and not (theta > eps):
                 return float("-inf")
             ll -= edge_pen * len(P)
         return ll
@@ -148,14 +155,16 @@ def fit_oncobn(
             rows.append((events[j], events[i], th_i))
         if not P:
             rows.append(("Root", events[i], th_i))
+
+    ll_offset = float(N) if settings == "R_default" else 0.0
     edges = pd.DataFrame(rows, columns=["From", "To", "weight"])
     order = structural_order(
         events,
         {e: ([] if p == ["Root"] else p) for e, p in pdict.items()},
-        "or" if model == "DBN" else "and",
+        "or" if model_eff == "DBN" else "and",
     )
     return EvamResult(
-        f"OncoBN_{model}",
+        f"OncoBN_{model_eff}",
         events,
         edges,
         order,
@@ -163,10 +172,10 @@ def fit_oncobn(
             parents=pdict,
             theta=thetas,
             epsilon=eps,
-            loglik=float(raw_loglik),
-            score=float(total_score),
-            penalty=penalty,
+            loglik=float(raw_loglik + ll_offset),
+            score=float(total_score + ll_offset),
+            penalty=penalty_eff,
             k=k,
         ),
-        meta=dict(order_route="structural", search=search, penalty=penalty),
+        meta=dict(order_route="structural", search=search, penalty=penalty_eff, settings=settings),
     )

@@ -13,6 +13,7 @@ from .core import (
 )
 from .poisson_binomial import (
     bh_fdr,
+    dbh_fdr,
     discover_fdr,
     poisson_binomial_pmf,
     poisson_binomial_pval,
@@ -28,6 +29,7 @@ __all__ = [
     "poisson_binomial_pmf",
     "poisson_binomial_pval",
     "discover_fdr",
+    "dbh_fdr",
     "bh_fdr",
 ]
 

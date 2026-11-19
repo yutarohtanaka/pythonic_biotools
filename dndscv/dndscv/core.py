@@ -15,11 +15,13 @@ from scipy import stats
 from .annotate import AnnotationResult, annotate_mutations
 from .model import (
     NBCovariateFit,
+    SettingsMode,
     bh_fdr_nan_aware,
     compute_gene_tests_cv,
     compute_global_dnds,
     compute_indel_tests,
     fit_nb_covariate_model,
+    validate_settings,
 )
 from .refcds import TRINUC_CONTEXTS, RefCDS, _prepare_covariates_df
 
@@ -93,9 +95,78 @@ class DnDScvResult:
     excluded_samples: list[str]
     annot_muts: pd.DataFrame
     converged: bool
+    settings: SettingsMode = "default"
+
+    def _build_r_sel_cv(self, sort_by_pvalue: bool = False) -> pd.DataFrame:
+        """Construct exact upstream `im3sanger/dndscv` `sel_cv` DataFrame."""
+        has_indels = int(np.sum(self.n_ind)) > 0
+        if has_indels:
+            df = pd.DataFrame(
+                {
+                    "gene_name": self.gene_names,
+                    "n_syn": self.n_syn,
+                    "n_mis": self.n_mis,
+                    "n_non": self.n_non,
+                    "n_spl": self.n_spl,
+                    "wmis_cv": self.w_mis_cv,
+                    "wnon_cv": self.w_non_cv,
+                    "wspl_cv": self.w_spl_cv,
+                    "wind_cv": self.w_ind_cv,
+                    "pmis_cv": self.p_mis_cv,
+                    "ptrunc_cv": self.p_tru_cv,
+                    "pallsubs_cv": self.p_all_cv,
+                    "pind_cv": self.p_ind_cv,
+                    "qmis_cv": self.q_mis_cv,
+                    "qtrunc_cv": self.q_tru_cv,
+                    "qallsubs_cv": self.q_all_cv,
+                    "qind_cv": self.q_ind_cv,
+                    "pglobal_cv": self.p_global_cv,
+                    "qglobal_cv": self.q_global_cv,
+                }
+            )
+            if sort_by_pvalue:
+                df = df.sort_values(
+                    ["pglobal_cv", "pallsubs_cv", "pmis_cv", "ptrunc_cv", "gene_name"],
+                    kind="mergesort",
+                    na_position="last",
+                ).reset_index(drop=True)
+            return df
+
+        df = pd.DataFrame(
+            {
+                "gene_name": self.gene_names,
+                "n_syn": self.n_syn,
+                "n_mis": self.n_mis,
+                "n_non": self.n_non,
+                "n_spl": self.n_spl,
+                "wmis_cv": self.w_mis_cv,
+                "wnon_cv": self.w_non_cv,
+                "wspl_cv": self.w_spl_cv,
+                "pmis_cv": self.p_mis_cv,
+                "ptrunc_cv": self.p_tru_cv,
+                "pallsubs_cv": self.p_all_cv,
+                "qmis_cv": self.q_mis_cv,
+                "qtrunc_cv": self.q_tru_cv,
+                "qallsubs_cv": self.q_all_cv,
+            }
+        )
+        if sort_by_pvalue:
+            df = df.sort_values(
+                ["pallsubs_cv", "pmis_cv", "ptrunc_cv", "gene_name"],
+                kind="mergesort",
+                na_position="last",
+            ).reset_index(drop=True)
+        return df
+
+    @property
+    def sel_cv(self) -> pd.DataFrame:
+        """Upstream `im3sanger/dndscv` `sel_cv` table sorted by p-value."""
+        return self._build_r_sel_cv(sort_by_pvalue=True)
 
     def to_dataframe(self, sort_by_pvalue: bool = False) -> pd.DataFrame:
         """Return gene-level selection ratios, p-values, and BH-adjusted q-values."""
+        if self.settings == "R_default":
+            return self._build_r_sel_cv(sort_by_pvalue=sort_by_pvalue)
         df = pd.DataFrame(
             {
                 "gene_name": self.gene_names,
@@ -166,10 +237,27 @@ class DnDScvResult:
     def significant(self, alpha: float = 0.05, by: str = "q_global_cv") -> pd.DataFrame:
         """Return genes passing FDR threshold `alpha` sorted deterministically by p-value."""
         df = self.to_dataframe(sort_by_pvalue=False)
-        if by not in df.columns:
+        col = by
+        if self.settings == "R_default" and col not in df.columns:
+            alias_map = {
+                "q_global_cv": "qglobal_cv" if "qglobal_cv" in df.columns else "qallsubs_cv",
+                "q_all_cv": "qallsubs_cv",
+                "q_mis_cv": "qmis_cv",
+                "q_tru_cv": "qtrunc_cv",
+                "q_ind_cv": "qind_cv",
+            }
+            col = alias_map.get(col, col)
+        if col not in df.columns:
             raise ValueError(f"Column {by!r} not found in result DataFrame.")
-        sub = df.loc[df[by].notna() & (df[by] <= alpha)].copy()
-        sort_col = "p_global_cv" if by == "q_global_cv" else by
+        sub = df.loc[df[col].notna() & (df[col] <= alpha)].copy()
+        if col == "q_global_cv":
+            sort_col = "p_global_cv"
+        elif col == "qglobal_cv":
+            sort_col = "pglobal_cv"
+        elif col == "qallsubs_cv":
+            sort_col = "pallsubs_cv"
+        else:
+            sort_col = col
         return sub.sort_values(
             [sort_col, "gene_name"], kind="mergesort", na_position="last"
         ).reset_index(drop=True)
@@ -241,9 +329,11 @@ class DnDScvModel:
         rate_model: Literal["192r_3w", "192r_syn"] = "192r_3w",
         use_nb: bool = True,
         coord_system: Literal["one_based", "zero_based"] = "one_based",
-        max_iter: int = 100,
+        max_iter: int | None = None,
         tol: float = 1e-8,
+        settings: SettingsMode = "default",
     ) -> None:
+        validate_settings(settings)
         self.mutations = mutations
         self.refcds = refcds
         self.covariates = covariates
@@ -258,6 +348,7 @@ class DnDScvModel:
         self.coord_system = coord_system
         self.max_iter = max_iter
         self.tol = tol
+        self.settings = settings
 
     def fit(self) -> DnDScvResult:
         return dndscv(
@@ -275,6 +366,7 @@ class DnDScvModel:
             coord_system=self.coord_system,
             max_iter=self.max_iter,
             tol=self.tol,
+            settings=self.settings,
         )
 
 
@@ -292,45 +384,18 @@ def dndscv(
     rate_model: Literal["192r_3w", "192r_syn"] = "192r_3w",
     use_nb: bool = True,
     coord_system: Literal["one_based", "zero_based"] = "one_based",
-    max_iter: int = 100,
+    max_iter: int | None = None,
     tol: float = 1e-8,
+    settings: SettingsMode = "default",
 ) -> DnDScvResult:
     """
     Fit the dNdScv maximum-likelihood somatic selection model (Martincorena et al., Cell 2017).
-
-    Parameters
-    ----------
-    mutations : pd.DataFrame
-        Somatic mutations in 5-column (`sampleID`, `chr`, `pos`, `ref`, `mut`) or
-        TCGA MAF (`Tumor_Sample_Barcode`, `Chromosome`, `Start_Position`,
-        `Reference_Allele`, `Tumor_Seq_Allele2`) format.
-    refcds : RefCDS
-        Coding gene reference built via `build_refcds`, `build_refcds_from_gtf`,
-        `build_synthetic_refcds`, or `simulate_refcds`.
-    covariates : pd.DataFrame | np.ndarray | None
-        Optional gene-level covariates overriding `refcds.covariates`.
-    gene_list : Sequence[str] | None
-        Optional subset of genes (e.g., targeted sequencing panel) to analyze.
-    max_muts_per_gene_per_sample : int | None
-        Per-gene-per-sample mutation cap (default 3).
-    max_coding_muts_per_sample : int | None
-        Hypermutator sample exclusion threshold (default 3000).
-    known_cancergenes : Sequence[str] | None
-        Optional driver gene names excluded from background rate and NB fitting.
-    ci_level : float
-        Confidence interval level for global dN/dS ratios (default 0.95).
-    ci_method : {"wald", "profile"}
-        Global CI method: Schur-complement Wald or exact profile likelihood.
-    rate_model : {"192r_3w", "192r_syn"}
-        192-trinucleotide rate model (`192r_3w` joint MLE or `192r_syn`).
-    use_nb : bool
-        If True (default), fit NB2 covariate regression with Poisson fallback.
-    coord_system : {"one_based", "zero_based"}
-        Coordinate convention of `mutations` (default `"one_based"`).
     """
+    eff_mode = validate_settings(settings)
+    eff_max_iter = (25 if eff_mode == "R_default" else 100) if max_iter is None else int(max_iter)
     if not isinstance(refcds, RefCDS) or len(refcds) == 0:
         raise ValueError("refcds must be a non-empty RefCDS instance.")
-    if max_iter < 1:
+    if eff_max_iter < 1:
         raise ValueError("max_iter must be >= 1.")
     if tol <= 0.0:
         raise ValueError("tol must be > 0.")
@@ -462,6 +527,7 @@ def dndscv(
             excluded_samples=annot.excluded_samples,
             annot_muts=annot.annot_muts,
             converged=True,
+            settings=eff_mode,
         )
 
     if total_coding_snvs > 0:
@@ -489,8 +555,9 @@ def dndscv(
             cov_df,
             bg_mask,
             use_nb=use_nb,
-            max_iter=max_iter,
+            max_iter=eff_max_iter,
             tol=tol,
+            settings=eff_mode,
         )
 
         # Gene-level SNV LRTs (CV + pure Poisson)
@@ -551,8 +618,9 @@ def dndscv(
         cov_df,
         bg_mask,
         use_nb=use_nb,
-        max_iter=max_iter,
+        max_iter=eff_max_iter,
         tol=tol,
+        settings=eff_mode,
     )
 
     # Length-proportional baseline expected indels before covariates
@@ -656,6 +724,7 @@ def dndscv(
         excluded_samples=annot.excluded_samples,
         annot_muts=annot.annot_muts,
         converged=converged,
+        settings=eff_mode,
     )
 
 

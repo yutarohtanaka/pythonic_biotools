@@ -20,6 +20,19 @@ from scipy import optimize, special, stats
 
 _MAX_LOG_THETA = 12.5
 _MIN_LOG_THETA = -14.0
+_R_THETA_POISSON_CEIL = 1e4
+_R_THETA_MIN_FLOOR = 1e-3
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    """Strictly validate `settings` parameter (`'default'` or `'R_default'`)."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Unsupported settings={settings!r}; expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -564,6 +577,78 @@ def _profile_mle_theta(
     return float(np.exp(log_t)), best_ll
 
 
+def _theta_ml_newton(
+    y: np.ndarray,
+    mu: np.ndarray,
+    gammaln_y1: np.ndarray,
+    *,
+    theta_init: float | None = None,
+    limit: int = 25,
+    eps: float = 1e-6,
+) -> tuple[float, float, bool]:
+    """
+    `MASS::theta.ml` Newton / Fisher-scoring estimator for NB2 size parameter `theta`
+    at fixed `mu`, initialized from moment estimate `n / sum((y / mu - 1)^2)`.
+
+    Returns `(theta_hat, loglik, converged)`.
+    """
+    mu_safe = np.maximum(mu, 1e-300)
+    if theta_init is None:
+        denom_mom = float(np.sum((y / mu_safe - 1.0) ** 2))
+        if not np.isfinite(denom_mom) or denom_mom <= 1e-15:
+            return float(np.inf), _poisson_loglik_vec(y, mu_safe, gammaln_y1), False
+        t = float(np.clip(float(y.size) / denom_mom, _R_THETA_MIN_FLOOR, _R_THETA_POISSON_CEIL))
+    else:
+        t = float(theta_init)
+
+    if not np.isfinite(t) or t <= 0.0:
+        return float(np.inf), _poisson_loglik_vec(y, mu_safe, gammaln_y1), False
+
+    y_pos = y > 0
+    converged = False
+    for _ in range(max(1, limit)):
+        if t >= _R_THETA_POISSON_CEIL:
+            return float(np.inf), _poisson_loglik_vec(y, mu_safe, gammaln_y1), False
+        if t < _R_THETA_MIN_FLOOR:
+            return t, _nb2_loglik_vec(y, mu_safe, max(t, 1e-8), gammaln_y1), False
+
+        psi_diff = np.where(y_pos, special.digamma(y + t) - special.digamma(t), 0.0)
+        score = float(np.sum(psi_diff - np.log1p(mu_safe / t) + (mu_safe - y) / (t + mu_safe)))
+        tri_diff = np.where(
+            y_pos,
+            special.polygamma(1, y + t) - special.polygamma(1, t),
+            0.0,
+        )
+        info = float(
+            np.sum(-tri_diff - 1.0 / t + 2.0 / (t + mu_safe) - (y + t) / ((t + mu_safe) ** 2))
+        )
+
+        if not np.isfinite(score) or not np.isfinite(info):
+            return float(np.inf), _poisson_loglik_vec(y, mu_safe, gammaln_y1), False
+
+        if info <= 1e-14:
+            if score >= 0.0:
+                del_t = 0.5 * t
+            else:
+                del_t = -0.5 * t
+        else:
+            del_t = score / info
+            while t + del_t <= 0.1 * t:
+                del_t *= 0.5
+            del_t = min(del_t, 5.0 * t)
+
+        t_next = t + del_t
+        if abs(del_t) <= eps * (1.0 + t) and abs(score) <= 1e-4 * max(1.0, np.sqrt(float(y.size))):
+            t = t_next
+            converged = True
+            break
+        t = t_next
+
+    if t >= _R_THETA_POISSON_CEIL or t < _R_THETA_MIN_FLOOR:
+        return float(np.inf), _poisson_loglik_vec(y, mu_safe, gammaln_y1), False
+    return float(t), _nb2_loglik_vec(y, mu_safe, t, gammaln_y1), converged
+
+
 def fit_nb_covariate_model(
     y_all: np.ndarray,
     exposure_all: np.ndarray,
@@ -573,11 +658,13 @@ def fit_nb_covariate_model(
     use_nb: bool = True,
     max_iter: int = 100,
     tol: float = 1e-8,
+    settings: SettingsMode = "default",
 ) -> NBCovariateFit:
     """
     Fit Gamma-Poisson (NB2) regression on active background genes with log(exposure)
     offset and optional covariates, falling back cleanly to Poisson when alpha -> 0+.
     """
+    eff_mode = validate_settings(settings)
     y_vec = np.asarray(y_all, dtype=np.float64)
     exp_vec = np.asarray(exposure_all, dtype=np.float64)
     n_total = y_vec.size
@@ -658,8 +745,9 @@ def fit_nb_covariate_model(
     gamma0[0] = float(np.log(np.sum(y_act) / np.sum(e_act)))
 
     # 1. Fit exact Poisson GLM (alpha = 0)
+    irls_pois_max = 25 if eff_mode == "R_default" else 60
     gamma_pois, mu_pois, ll_pois, conv_pois = _fit_irls_given_alpha(
-        z_design, offset_act, y_act, 0.0, gamma0, gammaln_y1, max_inner=60, tol=tol
+        z_design, offset_act, y_act, 0.0, gamma0, gammaln_y1, max_inner=irls_pois_max, tol=tol
     )
 
     if not use_nb:
@@ -670,6 +758,105 @@ def fit_nb_covariate_model(
         is_poisson = True
         final_ll = ll_pois
         converged = conv_pois
+    elif eff_mode == "R_default":
+        # MASS::glm.nb (maxit=25) alternating IRLS + MASS::theta.ml Newton updates
+        # with dndscv.R strict theta convergence fallback to Poisson GLM
+        alpha_score_zero = 0.5 * float(np.sum((y_act - mu_pois) ** 2 - y_act))
+        theta_init, ll_nb_init, th_init_conv = _theta_ml_newton(
+            y_act, mu_pois, gammaln_y1, limit=max_iter
+        )
+
+        if (
+            alpha_score_zero <= 0.0
+            or not th_init_conv
+            or not np.isfinite(theta_init)
+            or theta_init >= _R_THETA_POISSON_CEIL
+            or theta_init < _R_THETA_MIN_FLOOR
+            or ll_nb_init <= ll_pois + 1e-7
+        ):
+            gamma_hat = gamma_pois
+            mu_hat = mu_pois
+            alpha_hat = 0.0
+            theta_hat = float(np.inf)
+            is_poisson = True
+            final_ll = ll_pois
+            converged = conv_pois
+        else:
+            gamma_curr = gamma_pois.copy()
+            theta_curr = theta_init
+            dev_prev = -2.0 * ll_nb_init
+            nb_converged = False
+
+            for _ in range(max_iter):
+                alpha_curr = 1.0 / theta_curr
+                gamma_next, mu_next, _, conv_b = _fit_irls_given_alpha(
+                    z_design,
+                    offset_act,
+                    y_act,
+                    alpha_curr,
+                    gamma_curr,
+                    gammaln_y1,
+                    max_inner=25,
+                    tol=min(tol, 1e-8),
+                )
+                theta_next, ll_next, th_ok = _theta_ml_newton(
+                    y_act,
+                    mu_next,
+                    gammaln_y1,
+                    theta_init=theta_curr,
+                    limit=max_iter,
+                )
+                if (
+                    not th_ok
+                    or not np.isfinite(theta_next)
+                    or theta_next >= _R_THETA_POISSON_CEIL
+                    or theta_next < _R_THETA_MIN_FLOOR
+                ):
+                    nb_converged = False
+                    break
+
+                dev_curr = -2.0 * ll_next
+                rel_dev = abs(dev_prev - dev_curr) / (0.1 + abs(dev_curr))
+                rel_th = abs(theta_next - theta_curr) / (0.1 + abs(theta_curr))
+                gamma_curr = gamma_next
+                theta_curr = theta_next
+                dev_prev = dev_curr
+
+                if conv_b and rel_dev <= max(tol, 1e-8) and rel_th <= max(tol, 1e-6):
+                    nb_converged = True
+                    break
+
+            eta_cand = np.clip(offset_act + z_design @ gamma_curr, -45.0, 45.0)
+            mu_cand = np.exp(eta_cand)
+            ll_cand = (
+                _nb2_loglik_vec(y_act, mu_cand, theta_curr, gammaln_y1)
+                if np.isfinite(theta_curr) and theta_curr > 0.0
+                else -np.inf
+            )
+
+            # Strict theta convergence fallback (dndscv.R tryCatch fallback to Poisson GLM)
+            if (
+                not nb_converged
+                or not np.isfinite(theta_curr)
+                or theta_curr >= _R_THETA_POISSON_CEIL
+                or theta_curr < _R_THETA_MIN_FLOOR
+                or ll_pois >= ll_cand - 1e-7
+            ):
+                gamma_hat = gamma_pois
+                mu_hat = mu_pois
+                alpha_hat = 0.0
+                theta_hat = float(np.inf)
+                is_poisson = True
+                final_ll = ll_pois
+                converged = conv_pois
+            else:
+                gamma_hat = gamma_curr
+                mu_hat = mu_cand
+                theta_hat = theta_curr
+                alpha_hat = 1.0 / theta_hat
+                is_poisson = False
+                final_ll = ll_cand
+                converged = True
     else:
         alpha_score_zero = 0.5 * float(np.sum((y_act - mu_pois) ** 2 - y_act))
         theta_init, ll_nb_init = _profile_mle_theta(y_act, mu_pois, gammaln_y1)
@@ -927,11 +1114,13 @@ def compute_indel_tests(
     use_nb: bool = True,
     max_iter: int = 100,
     tol: float = 1e-8,
+    settings: SettingsMode = "default",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, NBCovariateFit | None]:
     """
     Fit NB2/Poisson covariate model for indels and compute gene-level indel LRTs.
     Returns `(w_ind_cv, p_ind_cv, q_ind_cv, mu_ind, nb_fit)`.
     """
+    eff_mode = validate_settings(settings)
     n_ind_f = np.asarray(n_ind, dtype=np.float64)
     lens_f = np.asarray(cds_lengths, dtype=np.float64)
     G = n_ind_f.size
@@ -956,6 +1145,7 @@ def compute_indel_tests(
         use_nb=use_nb,
         max_iter=max_iter,
         tol=tol,
+        settings=eff_mode,
     )
     mu_ind = nb_fit.mu_all
     w_ind = np.full(G, np.nan, dtype=np.float64)

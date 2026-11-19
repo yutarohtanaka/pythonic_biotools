@@ -8,14 +8,28 @@ from __future__ import annotations
 import gzip
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Iterable, Literal
 
 import numpy as np
 import pandas as pd
 
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
+
+
 EXCEL_MANGLED_GENE_MAP: dict[str, str] = {
     "1-DEC": "DELEC1",
     "15-SEP": "SELENOF",
+    "2-APR": "PMAIP1",
+    "4-OCT": "POU5F1",
+    "OCT4": "POU5F1",
+    "MARC1": "MTARC1",
+    "MARC2": "MTARC2",
     **{f"{i}-MAR": f"MARCHF{i}" for i in range(1, 12)},
     **{f"MARCH{i}": f"MARCHF{i}" for i in range(1, 12)},
     **{f"{i}-SEP": f"SEPTIN{i}" for i in range(1, 15)},
@@ -72,18 +86,25 @@ def harmonize_hgnc_symbols(
     symbols: pd.Series,
     hgnc_table: str | Path | pd.DataFrame,
     entrez_ids: pd.Series | None = None,
+    *,
+    unmapped_as_na: bool | None = None,
+    settings: SettingsMode = "default",
 ) -> pd.Series:
     """Deterministically map platform/legacy gene symbols to current HGNC approved symbols.
 
     Precedence:
       1. Entrez Gene ID -> Approved HGNC symbol (handles str, int, float, and `///`-delimited IDs)
       2. Preserve missing (`NaN` / `None`) symbols without stringifying to `'nan'`
-      3. Repair Excel date-mangled symbols (`1-Mar` -> `MARCHF1`, etc.)
+      3. Repair Excel date-mangled symbols (`1-Mar` -> `MARCHF1`, `2-APR` -> `PMAIP1`, `OCT4` -> `POU5F1`, etc.)
       4. Already an Approved HGNC symbol (exact or case-insensitive fallback)
       5. Unambiguous `prev_symbol` (1-to-1 mapping, exact or uppercase fallback)
       6. Unambiguous `alias_symbol` that does not collide with an approved symbol (exact or uppercase fallback)
-      7. Original symbol unchanged
+      7. Unmapped fallback: original symbol unchanged in `settings='default'`, or `NaN` in `settings='R_default'`
+         (matching Bioconductor `HGNChelper::checkGeneSymbols(..., unmapped.as.na=TRUE)`).
     """
+    _validate_settings(settings)
+    unmapped_na = (settings == "R_default") if unmapped_as_na is None else bool(unmapped_as_na)
+
     if isinstance(hgnc_table, pd.DataFrame):
         h = hgnc_table.copy()
     else:
@@ -94,7 +115,7 @@ def harmonize_hgnc_symbols(
             usecols=["symbol", "status", "prev_symbol", "alias_symbol", "entrez_id"],
         )
     h = h.loc[h["status"] == "Approved"].copy()
-    approved = set(h["symbol"].dropna().astype(str))
+    approved = set(h["symbol"].dropna().astype(str)) | set(EXCEL_MANGLED_GENE_MAP.values())
     approved_upper: dict[str, str] = {}
     for sym_a in approved:
         approved_upper.setdefault(sym_a.upper(), sym_a)
@@ -161,7 +182,7 @@ def harmonize_hgnc_symbols(
         elif sym_up in alias_map_upper:
             out[idx] = alias_map_upper[sym_up]
         else:
-            out[idx] = sym
+            out[idx] = np.nan if unmapped_na else sym
     return pd.Series(out, index=symbols.index, name=symbols.name)
 
 

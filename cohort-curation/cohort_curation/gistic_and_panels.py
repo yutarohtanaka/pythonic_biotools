@@ -5,15 +5,25 @@ plus AACR Project GENIE targeted-sequencing gene-panel coverage masking.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import csv
 import io
 from pathlib import Path
+import re
 import tarfile
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 import requests
+
+from .hgnc_and_cellosaurus import (
+    SettingsMode,
+    _normalize_entrez_id,
+    _validate_settings,
+    harmonize_hgnc_symbols,
+    repair_excel_mangled_genes,
+)
 
 FIREHOSE_ROOT = "https://gdac.broadinstitute.org/runs/analyses__latest/data"
 
@@ -114,12 +124,68 @@ def cross_check_gistic_panel(
     return pd.DataFrame(rows)
 
 
-def build_genie_panel_matrix(panel_dir_or_files: str | Path | Iterable[str | Path]) -> pd.DataFrame:
+def _build_entrez_lookup(
+    entrez_to_symbol: Mapping[int | str, str] | pd.Series | pd.DataFrame | str | Path | None,
+) -> tuple[dict[str, str], pd.DataFrame | None]:
+    if entrez_to_symbol is None:
+        return {}, None
+
+    if isinstance(entrez_to_symbol, (str, Path)):
+        df = pd.read_csv(entrez_to_symbol, sep="\t", dtype=str)
+    elif isinstance(entrez_to_symbol, pd.DataFrame):
+        df = entrez_to_symbol.copy()
+    else:
+        items = entrez_to_symbol.items()
+        lookup: dict[str, str] = {}
+        for k, v in items:
+            ek = _normalize_entrez_id(k)
+            if ek is not None and v is not None and pd.notna(v):
+                lookup[ek] = str(v).strip()
+        return lookup, None
+
+    hgnc_df = df if {"symbol", "status"}.issubset(df.columns) else None
+    if "status" in df.columns:
+        df = df.loc[df["status"] == "Approved"]
+
+    e_col = "entrez_id" if "entrez_id" in df.columns else ("Entrez_Gene_Id" if "Entrez_Gene_Id" in df.columns else None)
+    s_col = "symbol" if "symbol" in df.columns else ("Hugo_Symbol" if "Hugo_Symbol" in df.columns else None)
+    lookup = {}
+    if e_col is not None and s_col is not None:
+        for _, row in df.dropna(subset=[e_col, s_col]).iterrows():
+            ek = _normalize_entrez_id(row[e_col])
+            if ek is not None:
+                lookup[ek] = str(row[s_col]).strip()
+    return lookup, hgnc_df
+
+
+def _normalize_panel_gene_token(raw_tok: str, entrez_lookup: dict[str, str]) -> str:
+    tok = raw_tok.strip()
+    if tok.upper().startswith("ENTREZ:"):
+        tok = tok.split(":", 1)[1].strip()
+    # Normalize integer/float Entrez IDs (`7157`, `7157.0`)
+    if re.fullmatch(r"\d+(?:\.0+)?", tok):
+        norm_id = str(int(float(tok)))
+        return entrez_lookup.get(norm_id, norm_id)
+    return entrez_lookup.get(tok, tok)
+
+
+def build_genie_panel_matrix(
+    panel_dir_or_files: str | Path | Iterable[str | Path],
+    entrez_to_symbol: Mapping[int | str, str] | pd.Series | pd.DataFrame | str | Path | None = None,
+    *,
+    settings: SettingsMode = "default",
+) -> pd.DataFrame:
     """Parse AACR Project GENIE / cBioPortal `data_gene_panel_*.txt` files into a binary `panels x genes` DataFrame.
 
-    Prevents targeted-sequencing cohorts (GENIE, MSK-IMPACT v3/v5/v6/v7, DFCI-ONCOPANEL) from
-    conflating 'gene not sequenced on panel' with 'wild-type (0)'.
+    Supports both HUGO symbol (`gene_list:`) and Entrez Gene ID (`entrez_gene_list:` or numeric `gene_list:`)
+    panel definitions. When `entrez_to_symbol` (a dict, Series, or HGNC DataFrame/TSV) is supplied, Entrez IDs
+    are translated to canonical HUGO symbols. When `settings='R_default'`, legacy/Excel-mangled panel symbols
+    (`1-Mar` -> `MARCHF1`, `2-APR` -> `PMAIP1`, `OCT4` -> `POU5F1`, `MARC1` -> `MTARC1`) are canonicalized
+    automatically following `MSKCC-Epi-Bio/gnomeR`.
     """
+    _validate_settings(settings)
+    entrez_lookup, hgnc_df = _build_entrez_lookup(entrez_to_symbol)
+
     if isinstance(panel_dir_or_files, (str, Path)):
         p = Path(panel_dir_or_files)
         files = sorted(p.glob("data_gene_panel_*.txt")) if p.is_dir() else [p]
@@ -135,9 +201,23 @@ def build_genie_panel_matrix(panel_dir_or_files: str | Path | Iterable[str | Pat
         for ln in lines:
             if ln.startswith("stable_id:"):
                 stable_id = ln.split(":", 1)[1].strip()
-            elif ln.startswith("gene_list:"):
+            elif ln.startswith("gene_list:") or ln.startswith("entrez_gene_list:"):
                 raw = ln.split(":", 1)[1].strip()
-                genes = [g.strip() for g in raw.split("\t") if g.strip()]
+                tokens = [g.strip() for g in re.split(r"[\t,\s]+", raw) if g.strip()]
+                genes.extend(_normalize_panel_gene_token(tok, entrez_lookup) for tok in tokens)
+
+        if settings == "R_default" and genes:
+            genes = repair_excel_mangled_genes(genes)
+            if hgnc_df is not None:
+                genes = list(
+                    harmonize_hgnc_symbols(
+                        pd.Series(genes, dtype=object),
+                        hgnc_df,
+                        unmapped_as_na=False,
+                        settings="R_default",
+                    )
+                )
+
         panel_to_genes[stable_id] = set(genes)
         all_genes.update(genes)
 

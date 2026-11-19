@@ -21,10 +21,21 @@ from scipy import optimize, special
 from .poisson_binomial import (
     _tail_from_pmf,
     bh_fdr,
+    dbh_fdr,
     discover_fdr,
     poisson_binomial_pmf,
     poisson_binomial_pval,
 )
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -522,6 +533,7 @@ def pairwise_discover_test(
     fdr_method: Literal["discover_fdr", "bh"] = "discover_fdr",
     min_mutations: int = 1,
     strata: Sequence[str | int] | np.ndarray | pd.Series | None = None,
+    settings: SettingsMode = "default",
 ) -> PairwiseDiscoverResult:
     """
     Pairwise DISCOVER independence test for mutual exclusivity or co-occurrence.
@@ -537,14 +549,21 @@ def pairwise_discover_test(
         "exclusivity" / "less" tests lower tail (fewer co-mutations than expected);
         "co-occurrence" / "greater" tests upper tail (more co-mutations than expected).
     mid_p : bool, default=True
-        Apply Lancaster (1961) mid-p correction (default in Canisius et al., 2016).
+        Apply Lancaster (1961) mid-p correction (default in Canisius et al., 2016;
+        forced to `False` when `settings="R_default"`).
     fdr_method : {"discover_fdr", "bh"}, default="discover_fdr"
         Multiple-testing correction method.
     min_mutations : int, default=1
         Minimum observed alterations required for each gene in a tested pair.
     strata : optional 1D sequence
         Tumor stratum labels (used only if `data` is not already a `DiscoverMatrix`).
+    settings : {"default", "R_default"}, default="default"
+        `"default"` uses Lancaster mid-p and minimum-p adaptive discrete FDR;
+        `"R_default"` forces `mid_p=False` and computes exact `DBH` discrete
+        Benjamini-Hochberg FDR matching `NKI-CCB/DISCOVER` (`fdr.f90`).
     """
+    _validate_settings(settings)
+    eff_mid_p = False if settings == "R_default" else bool(mid_p)
     alt_map = {
         "exclusivity": "less",
         "less": "less",
@@ -616,7 +635,7 @@ def pairwise_discover_test(
             p_min=empty_f,
             q_value=empty_f,
             alternative=canonical_alt,
-            mid_p=mid_p,
+            mid_p=eff_mid_p,
             fdr_method=fdr_method,
         )
 
@@ -641,6 +660,9 @@ def pairwise_discover_test(
 
     p_vals = np.ones(n_pairs, dtype=np.float64)
     p_mins = np.ones(n_pairs, dtype=np.float64)
+    dbh_supports: list[np.ndarray] = []
+    dbh_pmfs: list[np.ndarray] = []
+    use_dbh = settings == "R_default" and fdr_method == "discover_fdr"
 
     fully_obs = bg.fully_observed
     bg_p = bg.bg_probs
@@ -652,6 +674,9 @@ def pairwise_discover_test(
         if int(n_valid[idx]) == 0:
             p_vals[idx] = 1.0
             p_mins[idx] = 1.0
+            if use_dbh:
+                dbh_supports.append(np.array([1.0], dtype=np.float64))
+                dbh_pmfs.append(np.array([1.0], dtype=np.float64))
             continue
 
         if fully_obs:
@@ -661,37 +686,57 @@ def pairwise_discover_test(
             pk = bg_p[i, valid] * bg_p[j, valid]
 
         k_obs = int(obs_co[idx])
-        if tail == "less":
+        if use_dbh:
+            pmf = poisson_binomial_pmf(pk, method="auto")
+            pv_check = _tail_from_pmf(k_obs, pmf, tail, mid_p=False)
+            if pk.size > 64 and pv_check < 1e-12:
+                pmf = poisson_binomial_pmf(pk, method="dp")
+            if tail == "less":
+                s_vec = np.clip(np.cumsum(pmf), 0.0, 1.0)
+                p_vals[idx] = float(s_vec[k_obs])
+                p_mins[idx] = float(s_vec[0])
+                dbh_supports.append(s_vec)
+                dbh_pmfs.append(pmf)
+            else:
+                k_max = int(min(n_mut1[idx], n_mut2[idx]))
+                pmf_rev = pmf[::-1]
+                s_vec = np.clip(np.cumsum(pmf_rev), 0.0, 1.0)
+                p_vals[idx] = float(s_vec[pmf.size - 1 - k_obs])
+                p_mins[idx] = float(s_vec[pmf.size - 1 - k_max])
+                dbh_supports.append(s_vec)
+                dbh_pmfs.append(pmf_rev)
+        elif tail == "less":
             # Exact Pr(X = 0) in O(N) without FFT when k_obs == 0
             if np.any(pk >= 1.0):
                 pr_zero = 0.0
             else:
                 pr_zero = float(np.exp(np.sum(np.log1p(-pk))))
-            p_min_val = (0.5 * pr_zero) if mid_p else pr_zero
+            p_min_val = (0.5 * pr_zero) if eff_mid_p else pr_zero
             p_mins[idx] = np.clip(p_min_val, 0.0, 1.0)
             if k_obs == 0:
                 p_vals[idx] = p_mins[idx]
             else:
                 p_vals[idx] = poisson_binomial_pval(
-                    k_obs, pk, alternative="less", mid_p=mid_p
+                    k_obs, pk, alternative="less", mid_p=eff_mid_p
                 )
         else:
             k_max = int(min(n_mut1[idx], n_mut2[idx]))
             pmf = poisson_binomial_pmf(pk, method="auto")
-            pv = _tail_from_pmf(k_obs, pmf, "greater", mid_p=mid_p)
-            pm = _tail_from_pmf(k_max, pmf, "greater", mid_p=mid_p)
+            pv = _tail_from_pmf(k_obs, pmf, "greater", mid_p=eff_mid_p)
+            pm = _tail_from_pmf(k_max, pmf, "greater", mid_p=eff_mid_p)
             if pk.size > 64 and (pv < 1e-12 or pm < 1e-12):
                 pmf_dp = poisson_binomial_pmf(pk, method="dp")
-                pv = _tail_from_pmf(k_obs, pmf_dp, "greater", mid_p=mid_p)
-                pm = _tail_from_pmf(k_max, pmf_dp, "greater", mid_p=mid_p)
+                pv = _tail_from_pmf(k_obs, pmf_dp, "greater", mid_p=eff_mid_p)
+                pm = _tail_from_pmf(k_max, pmf_dp, "greater", mid_p=eff_mid_p)
             p_vals[idx] = float(np.clip(pv, 0.0, 1.0))
             p_mins[idx] = float(np.clip(pm, 0.0, 1.0))
 
-    q_vals = (
-        discover_fdr(p_vals, p_mins)
-        if fdr_method == "discover_fdr"
-        else bh_fdr(p_vals)
-    )
+    if use_dbh:
+        q_vals = dbh_fdr(p_vals, dbh_supports, dbh_pmfs)
+    elif fdr_method == "discover_fdr":
+        q_vals = discover_fdr(p_vals, p_mins)
+    else:
+        q_vals = bh_fdr(p_vals)
 
     return PairwiseDiscoverResult(
         gene1=[bg.gene_names[i] for i in p_arr],
@@ -705,7 +750,7 @@ def pairwise_discover_test(
         p_min=p_mins,
         q_value=q_vals,
         alternative=canonical_alt,
-        mid_p=mid_p,
+        mid_p=eff_mid_p,
         fdr_method=fdr_method,
     )
 
@@ -781,6 +826,7 @@ def groupwise_discover_test(
     mid_p: bool = True,
     fdr_method: Literal["discover_fdr", "bh"] = "discover_fdr",
     strata: Sequence[str | int] | np.ndarray | pd.Series | None = None,
+    settings: SettingsMode = "default",
 ) -> GroupwiseDiscoverResult:
     """
     Groupwise DISCOVER pathway test (Canisius, Martens & Wessels, 2016).
@@ -793,6 +839,8 @@ def groupwise_discover_test(
     - `"exclusivity"`: Tumors with ==1 altered gene in S (`p_k = sum_i P_{i,k} prod_{j!=i}(1 - P_{j,k})`).
       Higher than expected under mutual exclusivity; lower under co-occurrence.
     """
+    _validate_settings(settings)
+    eff_mid_p = False if settings == "R_default" else bool(mid_p)
     if method not in ("impurity", "coverage", "exclusivity"):
         raise ValueError(
             f"Invalid method '{method}'. Expected 'impurity', 'coverage', or 'exclusivity'."
@@ -854,6 +902,9 @@ def groupwise_discover_test(
     exp_arr = np.zeros(n_groups, dtype=np.float64)
     p_vals = np.ones(n_groups, dtype=np.float64)
     p_mins = np.ones(n_groups, dtype=np.float64)
+    dbh_supports: list[np.ndarray] = []
+    dbh_pmfs: list[np.ndarray] = []
+    use_dbh = settings == "R_default" and fdr_method == "discover_fdr"
 
     for g_i, g_label in enumerate(g_names_list):
         r_idx = np.asarray(groups_dict[g_label], dtype=np.int64)
@@ -870,43 +921,65 @@ def groupwise_discover_test(
         if pk.size == 0:
             p_vals[g_i] = 1.0
             p_mins[g_i] = 1.0
+            if use_dbh:
+                dbh_supports.append(np.array([1.0], dtype=np.float64))
+                dbh_pmfs.append(np.array([1.0], dtype=np.float64))
             continue
 
-        if tail == "less":
+        total_alts = int(
+            np.rint(np.sum(np.where(bg.mask[r_idx], bg.events[r_idx], 0.0)))
+        )
+        if method in ("coverage", "exclusivity"):
+            k_ext = min(pk.size, total_alts)
+        else:
+            k_ext = min(pk.size, total_alts // 2)
+
+        if use_dbh:
+            pmf = poisson_binomial_pmf(pk, method="auto")
+            pv_check = _tail_from_pmf(obs_val, pmf, tail, mid_p=False)
+            if pk.size > 64 and pv_check < 1e-12:
+                pmf = poisson_binomial_pmf(pk, method="dp")
+            if tail == "less":
+                s_vec = np.clip(np.cumsum(pmf), 0.0, 1.0)
+                pv = float(s_vec[obs_val])
+                pm = float(s_vec[0])
+                dbh_supports.append(s_vec)
+                dbh_pmfs.append(pmf)
+            else:
+                pmf_rev = pmf[::-1]
+                s_vec = np.clip(np.cumsum(pmf_rev), 0.0, 1.0)
+                pv = float(s_vec[pmf.size - 1 - obs_val])
+                pm = float(s_vec[pmf.size - 1 - k_ext])
+                dbh_supports.append(s_vec)
+                dbh_pmfs.append(pmf_rev)
+        elif tail == "less":
             if np.any(pk >= 1.0):
                 pr_zero = 0.0
             else:
                 pr_zero = float(np.exp(np.sum(np.log1p(-pk))))
-            pm = (0.5 * pr_zero) if mid_p else pr_zero
+            pm = (0.5 * pr_zero) if eff_mid_p else pr_zero
             if obs_val == 0:
                 pv = pm
             else:
-                pv = poisson_binomial_pval(obs_val, pk, alternative="less", mid_p=mid_p)
+                pv = poisson_binomial_pval(obs_val, pk, alternative="less", mid_p=eff_mid_p)
         else:
-            total_alts = int(
-                np.rint(np.sum(np.where(bg.mask[r_idx], bg.events[r_idx], 0.0)))
-            )
-            if method in ("coverage", "exclusivity"):
-                k_ext = min(pk.size, total_alts)
-            else:
-                k_ext = min(pk.size, total_alts // 2)
-
             pmf = poisson_binomial_pmf(pk, method="auto")
-            pv = _tail_from_pmf(obs_val, pmf, tail, mid_p=mid_p)
-            pm = _tail_from_pmf(k_ext, pmf, tail, mid_p=mid_p)
+            pv = _tail_from_pmf(obs_val, pmf, tail, mid_p=eff_mid_p)
+            pm = _tail_from_pmf(k_ext, pmf, tail, mid_p=eff_mid_p)
             if pk.size > 64 and (pv < 1e-12 or pm < 1e-12):
                 pmf_dp = poisson_binomial_pmf(pk, method="dp")
-                pv = _tail_from_pmf(obs_val, pmf_dp, tail, mid_p=mid_p)
-                pm = _tail_from_pmf(k_ext, pmf_dp, tail, mid_p=mid_p)
+                pv = _tail_from_pmf(obs_val, pmf_dp, tail, mid_p=eff_mid_p)
+                pm = _tail_from_pmf(k_ext, pmf_dp, tail, mid_p=eff_mid_p)
 
         p_vals[g_i] = float(np.clip(pv, 0.0, 1.0))
         p_mins[g_i] = float(np.clip(pm, 0.0, 1.0))
 
-    q_vals = (
-        discover_fdr(p_vals, p_mins)
-        if fdr_method == "discover_fdr"
-        else bh_fdr(p_vals)
-    )
+    if use_dbh:
+        q_vals = dbh_fdr(p_vals, dbh_supports, dbh_pmfs)
+    elif fdr_method == "discover_fdr":
+        q_vals = discover_fdr(p_vals, p_mins)
+    else:
+        q_vals = bh_fdr(p_vals)
 
     return GroupwiseDiscoverResult(
         group_names=g_names_list,
@@ -920,6 +993,6 @@ def groupwise_discover_test(
         p_value=p_vals,
         p_min=p_mins,
         q_value=q_vals,
-        mid_p=mid_p,
+        mid_p=eff_mid_p,
         fdr_method=fdr_method,
     )
