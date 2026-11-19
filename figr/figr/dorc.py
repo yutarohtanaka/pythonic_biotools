@@ -12,7 +12,7 @@ from scipy import sparse
 from sklearn.neighbors import NearestNeighbors
 
 from .corr import GenePeakCorrResult, _normalize_cells_matrix
-from .io import extract_matrix
+from .io import SettingsMode, extract_matrix, validate_settings
 
 
 @dataclass(frozen=True)
@@ -116,14 +116,17 @@ class DORCScoresResult:
 def call_dorcs(
     corr_result: GenePeakCorrResult | pd.DataFrame,
     *,
-    dorc_k: int = 5,
+    dorc_k: int | None = None,
     p_cut: float | None = 0.05,
     fdr_cut: float | None = None,
     min_r: float | None = None,
+    settings: SettingsMode = "default",
 ) -> DORCCallResult:
     """Call Domains of Regulatory Chromatin (DORCs) from cis peak-gene correlation results."""
-    if dorc_k < 1:
-        raise ValueError(f"`dorc_k` must be >= 1, got {dorc_k}.")
+    validate_settings(settings)
+    eff_dorc_k = (7 if settings == "R_default" else 5) if dorc_k is None else int(dorc_k)
+    if eff_dorc_k < 1:
+        raise ValueError(f"`dorc_k` must be >= 1, got {eff_dorc_k}.")
 
     df = corr_result.to_dataframe() if isinstance(corr_result, GenePeakCorrResult) else corr_result.copy()
     if not isinstance(df, pd.DataFrame):
@@ -162,7 +165,7 @@ def call_dorcs(
             rank=np.empty(0, dtype=np.int64),
             is_dorc=np.empty(0, dtype=bool),
             dorc_genes=[],
-            dorc_k=dorc_k,
+            dorc_k=eff_dorc_k,
             filtered_links=filtered.reset_index(drop=True),
         )
 
@@ -196,7 +199,7 @@ def call_dorcs(
     n_genes = len(grouped)
     rank = np.arange(1, n_genes + 1, dtype=np.int64)
     n_peaks_arr = grouped["n_peaks"].to_numpy(dtype=np.int64)
-    is_dorc = n_peaks_arr >= dorc_k
+    is_dorc = n_peaks_arr >= eff_dorc_k
     gene_arr = grouped["gene"].astype(str).to_numpy(dtype=object)
     dorc_genes = [str(g) for g in gene_arr[is_dorc]]
 
@@ -209,7 +212,7 @@ def call_dorcs(
         rank=rank,
         is_dorc=is_dorc,
         dorc_genes=dorc_genes,
-        dorc_k=dorc_k,
+        dorc_k=eff_dorc_k,
         filtered_links=filtered,
     )
 

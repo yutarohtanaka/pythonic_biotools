@@ -330,6 +330,18 @@ def align_cells(
     return mat_a, mat_b, shared_names
 
 
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    """Validate `settings` parity mode ('default' or 'R_default')."""
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid `settings` {settings!r}; expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
+
+
 def bh_fdr(p_values: np.ndarray) -> np.ndarray:
     """Compute `NaN`-aware Benjamini–Hochberg adjusted p-values (excluding non-finite entries from `m`)."""
     pvals = np.asarray(p_values, dtype=np.float64)

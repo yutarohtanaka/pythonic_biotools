@@ -982,3 +982,157 @@ def test_build_knn_graph_two_by_two_disambiguation():
     np.testing.assert_allclose(W_off_adj, np.array([[0.0, 1.0], [1.0, 0.0]]), atol=1e-12)
 
 
+def test_figr_settings_validation():
+    rng = np.random.default_rng(1717)
+    cells = [f"c_{i}" for i in range(10)]
+    peaks = ["chr1:100-200", "chr1:300-400", "chr1:500-600"]
+    rna = pd.DataFrame(rng.normal(size=(10, 2)), index=cells, columns=["G1", "G2"])
+    atac = pd.DataFrame(rng.poisson(2.0, size=(10, 3)).astype(float), index=cells, columns=peaks)
+    tss = pd.DataFrame({"gene_name": ["G1"], "chrom": ["chr1"], "strand": ["+"], "tss": [150]})
+    links = pd.DataFrame({"gene": ["G1"], "peak": [peaks[0]], "p_value": [0.01]})
+    motifs = pd.DataFrame(np.ones((3, 2)), index=peaks, columns=["G1", "G2"])
+    scores = pd.DataFrame(rng.normal(size=(10, 1)), index=cells, columns=["G1"])
+
+    with pytest.raises(ValueError, match="settings"):
+        run_gene_peak_corr(rna, atac, tss, peak_gc=[0.5, 0.5, 0.5], n_bg=2, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        call_dorcs(links, settings="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        run_figr_grn(scores, rna, links, motifs, settings="bad")  # type: ignore[arg-type]
+
+
+def test_figr_r_default_parity_across_corr_dorc_and_grn():
+    """
+    Verify buenrostrolab/FigR parity under settings='R_default':
+    1. run_gene_peak_corr: keep_multi_mapping_peaks=False (keeps max r_obs gene per peak)
+       and p_cut=None (retains all tested cis pairs).
+    2. call_dorcs: default threshold dorc_k=7 (vs 5 in settings='default').
+    3. run_figr_grn: score_mode='kartha_union', corr_p_method='z_across_tfs',
+       two-sided motif enrichment p = 2 * norm.sf(abs(z)) with log10P=0 when z < 0,
+       and dorc_k_pool=30 pooling across correlated DORCs when >= 2 DORCs exist.
+    """
+    rng = np.random.default_rng(1818)
+    n_cells = 100
+    n_peaks = 40
+    cells = [f"c_{i}" for i in range(n_cells)]
+    peaks = [f"chr1:{10_000 + p * 500}-{10_400 + p * 500}" for p in range(n_peaks)]
+
+    # Place G_STRONG and G_WEAK with overlapping cis windows around peaks 0..7
+    tss_df = pd.DataFrame(
+        {
+            "gene_name": ["G_STRONG", "G_WEAK"],
+            "chrom": ["chr1", "chr1"],
+            "strand": ["+", "+"],
+            "tss": [11_000, 11_500],
+        }
+    )
+    latent = rng.normal(size=n_cells)
+    rna_cols = {
+        "G_STRONG": 3.0 + 2.0 * latent + rng.normal(0.0, 0.1, n_cells),
+        "G_WEAK": rng.normal(0.0, 1.0, n_cells),
+        "TF_ACT": 3.0 + 2.0 * latent + rng.normal(0.0, 0.1, n_cells),
+        "TF_DEP": 3.0 + 2.0 * latent + rng.normal(0.0, 0.1, n_cells),
+    }
+    null_tfs = [f"TF_NULL_{k}" for k in range(12)]
+    for nt in null_tfs:
+        rna_cols[nt] = rng.normal(size=n_cells)
+    rna_df = pd.DataFrame(rna_cols, index=cells)
+    atac_mat = rng.poisson(2.0, size=(n_cells, n_peaks)).astype(float)
+    for k in range(6):
+        atac_mat[:, k] = rng.poisson(np.exp(1.0 + 1.0 * latent)).astype(float)
+    atac_df = pd.DataFrame(atac_mat, index=cells, columns=peaks)
+    gc = rng.uniform(0.4, 0.6, size=n_peaks)
+
+    corr_def = run_gene_peak_corr(
+        rna_df[["G_STRONG", "G_WEAK"]],
+        atac_df,
+        tss=tss_df,
+        peak_gc=gc,
+        window_pad=5_000,
+        n_bg=20,
+        seed=1818,
+        settings="default",
+    )
+    corr_r = run_gene_peak_corr(
+        rna_df[["G_STRONG", "G_WEAK"]],
+        atac_df,
+        tss=tss_df,
+        peak_gc=gc,
+        window_pad=5_000,
+        n_bg=20,
+        seed=1818,
+        settings="R_default",
+    )
+
+    df_c_def = corr_def.to_dataframe()
+    df_c_r = corr_r.to_dataframe()
+    # default keeps multi-mapping peaks (each cis peak tested against both G_STRONG and G_WEAK)
+    assert df_c_def["peak"].duplicated().any()
+    # R_default keeps only the max-r_obs gene per peak (unique peaks!) while keeping non-sig peaks too (p_cut=None)
+    assert not df_c_r["peak"].duplicated().any()
+    assert np.any(df_c_r["p_value"] > 0.05)
+    for pk, grp in df_c_def.groupby("peak"):
+        best_gene = grp.sort_values("r_obs", ascending=False).iloc[0]["gene"]
+        chosen_gene = df_c_r.loc[df_c_r["peak"] == pk, "gene"].iloc[0]
+        assert chosen_gene == best_gene
+
+    # 2. call_dorcs: 6 significant peaks passes dorc_k=5 in default, fails dorc_k=7 in R_default!
+    syn_links = pd.DataFrame(
+        {
+            "gene": ["D_SIX"] * 6 + ["D_SEVEN"] * 7,
+            "peak": peaks[:6] + peaks[6:13],
+            "p_value": [1e-4] * 13,
+            "r_obs": [0.6] * 13,
+            "z_score": [4.0] * 13,
+        }
+    )
+    dorc_def = call_dorcs(syn_links, settings="default")
+    dorc_r = call_dorcs(syn_links, settings="R_default")
+    assert dorc_def.dorc_k == 5 and set(dorc_def.dorc_genes) == {"D_SEVEN", "D_SIX"}
+    assert dorc_r.dorc_k == 7 and set(dorc_r.dorc_genes) == {"D_SEVEN"}
+
+    # 3. run_figr_grn in R_default:
+    # Two correlated DORCs (D_SIX: 6 peaks, D_SEVEN: 7 disjoint peaks -> pooled = 13 peaks via dorc_k_pool=30)
+    dorc_scores = pd.DataFrame(
+        {
+            "D_SIX": 2.0 * latent + rng.normal(0.0, 0.1, n_cells),
+            "D_SEVEN": 2.0 * latent + rng.normal(0.0, 0.1, n_cells),
+        },
+        index=cells,
+    )
+    all_tfs = ["TF_ACT", "TF_DEP"] + null_tfs
+    motif_mat = (rng.uniform(size=(n_peaks, len(all_tfs))) < 0.15).astype(float)
+    motif_mat[:, 0] = 0.0
+    motif_mat[:12, 0] = 1.0   # TF_ACT enriched in pooled DORC peaks (z > 0)
+    motif_mat[:, 1] = 0.0
+    motif_mat[15:, 1] = 1.0   # TF_DEP depleted in pooled DORC peaks (0 hits in 0..12, all hits in bg -> z < 0)
+    motifs_df = pd.DataFrame(motif_mat, index=peaks, columns=all_tfs)
+
+    grn_r = run_figr_grn(
+        dorc_scores,
+        rna_df[all_tfs],
+        dorc_links=syn_links,
+        peak_motifs=motifs_df,
+        atac=atac_df,
+        peak_gc=gc,
+        n_bg=30,
+        seed=1818,
+        settings="R_default",
+    )
+    assert grn_r.score_mode == "kartha_union"
+    df_grn_r = grn_r.to_dataframe().set_index(["tf_gene", "dorc_gene"])
+    # Pooled across both DORCs (6 + 7 = 13 peaks) because default dorc_k_pool=30 in R_default
+    assert int(df_grn_r.loc[("TF_ACT", "D_SIX"), "n_dorc_peaks"]) == 13
+    # Two-sided motif p-value = 2 * norm.sf(abs(z))
+    for _, row in df_grn_r.iterrows():
+        np.testing.assert_allclose(
+            row["p_motif"], 2.0 * stats.norm.sf(abs(row["motif_enrichment_z"])), atol=1e-12
+        )
+    # Depleted motif (z < 0) has small two-sided p_motif, YET dorc_reg_score == 0.0!
+    dep_row = df_grn_r.loc[("TF_DEP", "D_SIX")]
+    assert dep_row["motif_enrichment_z"] < -1.0
+    assert dep_row["p_motif"] < 0.3
+    assert dep_row["dorc_reg_score"] == 0.0
+    assert df_grn_r.loc[("TF_ACT", "D_SIX"), "dorc_reg_score"] > 1.0
+
+

@@ -149,3 +149,97 @@ def test_sparse_csr_parity_nan_variability_and_pwm_windows():
     assert delta < -2.5
     # Creation of a de novo motif ("AAAAACCGAAAAAAA" -> "AAAAACTGAAAAAAA") has positive symmetrical disruption
     assert compute_variant_pwm_disruption(alt_flank, ref_flank, pwm_from_prob) == pytest.approx(-delta, rel=1e-12)
+
+
+def test_r_default_settings():
+    import itertools
+    from chromvar import pwm_threshold_from_pvalue
+
+    rng = np.random.default_rng(2026)
+    counts = rng.poisson(6.0, size=(60, 12)) + 1
+    gc = rng.uniform(0.35, 0.65, size=60)
+    matches = rng.binomial(1, 0.25, size=(60, 3))
+    bg_init = get_background_peaks(counts, gc, n_iterations=10, seed=1)
+    res_init = compute_deviations(counts, matches, bg_init)
+    pfm_counts = np.array(
+        [
+            [2.0, 90.0, 4.0, 4.0],
+            [3.0, 3.0, 4.0, 90.0],
+            [2.0, 2.0, 94.0, 2.0],
+            [92.0, 2.0, 3.0, 3.0],
+            [2.0, 92.0, 3.0, 3.0],
+            [3.0, 2.0, 3.0, 92.0],
+            [2.0, 3.0, 93.0, 2.0],
+            [93.0, 2.0, 2.0, 3.0],
+        ]
+    )
+    pwm_dummy = build_log_odds_pwm(pfm_counts)
+
+    # 1. Invalid settings raises ValueError across all 5 functions
+    for fn in (
+        lambda: get_background_peaks(counts, gc, settings="invalid"),  # type: ignore[arg-type]
+        lambda: compute_deviations(counts, matches, bg_init, settings="invalid"),  # type: ignore[arg-type]
+        lambda: compute_variability(res_init.z_scores, settings="invalid"),  # type: ignore[arg-type]
+        lambda: build_log_odds_pwm(pfm_counts, settings="invalid"),  # type: ignore[arg-type]
+        lambda: scan_sequence_pwm("ACGTACGTACGT", pwm_dummy, settings="invalid"),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="settings"):
+            fn()
+
+    # 2. get_background_peaks: zero-fragment peak raises ValueError in R_default, allowed in default
+    counts_zero_peak = counts.copy()
+    counts_zero_peak[0, :] = 0
+    bg_def_z = get_background_peaks(counts_zero_peak, gc, n_iterations=10, seed=5, settings="default")
+    assert bg_def_z.shape == (60, 10)
+    with pytest.raises(ValueError, match="> 0 total fragments"):
+        get_background_peaks(counts_zero_peak, gc, n_iterations=10, seed=5, settings="R_default")
+
+    bg_r = get_background_peaks(counts, gc, n_iterations=25, seed=5, settings="R_default")
+    assert bg_r.shape == (60, 25) and bg_r.min() >= 0 and bg_r.max() < 60
+
+    # 3. compute_deviations: masks dev and z to NaN wherever expected = E_motif * sample_depth < 1.0
+    # Make Motif_Rare match only peak 0 (fraction ~ 1/60), and give sample 0 depth = 12 -> expected ~ 0.2 < 1.0!
+    counts_low = np.full((60, 8), 20, dtype=int)
+    counts_low[:, 0] = 0
+    counts_low[:12, 0] = 1  # sample 0 depth = 12
+    matches_rare = pd.DataFrame(
+        {
+            "Motif_Common": np.r_[np.ones(30), np.zeros(30)],
+            "Motif_Rare": np.r_[np.ones(1), np.zeros(59)],
+        }
+    )
+    res_def_low = compute_deviations(counts_low, matches_rare, bg_r, settings="default")
+    res_r_low = compute_deviations(counts_low, matches_rare, bg_r, settings="R_default")
+    assert np.isfinite(res_def_low.z_scores.iloc[1, 0])
+    assert np.isnan(res_r_low.deviations.iloc[1, 0]) and np.isnan(res_r_low.z_scores.iloc[1, 0])
+    assert np.all(np.isfinite(res_r_low.z_scores.loc["Motif_Common"]))
+
+    # 4. compute_variability: default n_boot = 1000 in R_default matches explicit n_boot=1000
+    var_r_auto = compute_variability(res_r_low.z_scores, seed=19, settings="R_default")
+    var_r_1000 = compute_variability(res_r_low.z_scores, n_boot=1000, seed=19, settings="default")
+    pd.testing.assert_frame_equal(var_r_auto, var_r_1000)
+
+    # 5. build_log_odds_pwm: TFBSTools raw-count pseudocount = 0.8 (count-scale shrinkage)
+    bg_u = np.array([[0.25, 0.25, 0.25, 0.25]])
+    pwm_r = build_log_odds_pwm(pfm_counts, settings="R_default")
+    expected_pwm_r = np.log2(((pfm_counts + 0.8 * bg_u) / (pfm_counts.sum(axis=1, keepdims=True) + 0.8)) / bg_u)
+    np.testing.assert_allclose(pwm_r, expected_pwm_r, rtol=1e-13, atol=1e-13)
+    # Scaling raw counts by 10x increases information content in R_default (unlike scale-invariant default)
+    pwm_r_deep = build_log_odds_pwm(pfm_counts * 10.0, settings="R_default")
+    assert pwm_r_deep.max() > pwm_r.max()
+
+    # 6. Exact DP background score-distribution threshold vs brute-force 4^8 enumeration & dedup_window_bp=0
+    all_kmers = np.array(list(itertools.product(range(4), repeat=8)))  # (65536, 8)
+    exact_scores = pwm_r[np.arange(8)[None, :], all_kmers].sum(axis=1)
+    thresh_dp = pwm_threshold_from_pvalue(pwm_r, p_cutoff=5e-5)
+    emp_tail_p = float(np.mean(exact_scores >= thresh_dp))
+    assert 0.0 < emp_tail_p <= 5e-5 + 1e-12
+
+    # Tandem direct repeat CTGACTGACTGACTGA has 3 overlapping 8-mer consensus matches at offsets 0, 4, 8:
+    # default (dedup_window_bp=8) suppresses offset 4, whereas R_default (dedup_window_bp=0) retains all 3!
+    tandem_seq = "CTGACTGACTGACTGA"
+    hits_def = scan_sequence_pwm(tandem_seq, pwm_r, min_log2_odds=thresh_dp, settings="default")
+    hits_r = scan_sequence_pwm(tandem_seq, pwm_r, settings="R_default")
+    assert [h.offset_5prime for h in hits_r] == [0, 4, 8]
+    assert len(hits_def) == 2
+

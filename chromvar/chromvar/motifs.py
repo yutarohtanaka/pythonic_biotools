@@ -9,14 +9,22 @@ from dataclasses import dataclass
 import gzip
 from pathlib import Path
 import re
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
 
+SettingsMode = Literal["default", "R_default"]
+
 _GTF_ATTR = re.compile(r'(\S+)\s+"([^"]*)"')
 _BASE_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 _COMPLEMENT_MAP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -99,14 +107,19 @@ def nearest_tss(
 
 def build_log_odds_pwm(
     pfm: np.ndarray,
-    pseudocount: float = 0.01,
+    pseudocount: float | None = None,
     bg_probs: Sequence[float] = (0.25, 0.25, 0.25, 0.25),
+    *,
+    settings: SettingsMode = "default",
 ) -> np.ndarray:
-    """Convert a `(K, 4)` Position Frequency Matrix (`A, C, G, T`) into a scale-invariant log2-odds PWM.
+    """Convert a `(K, 4)` Position Frequency Matrix (`A, C, G, T`) into a log2-odds PWM.
 
-    Normalizes each position's base counts/frequencies to probabilities summing to 1.0 before adding
-    `pseudocount`, so raw JASPAR count matrices and normalized probability matrices produce identical PWMs.
+    - `settings='default'`: Normalizes each position's base counts/frequencies to sum to 1.0 before adding
+      `pseudocount` (default `0.01`), yielding scale-invariant PWMs.
+    - `settings='R_default'`: Matches Bioconductor `TFBSTools::toPWM(..., type='log2probratio', pseudocounts=0.8)`
+      by adding `bg * pseudocount` (`default=0.8`) directly on the raw count scale `(pfm + bg * pc) / (N + pc)`.
     """
+    _validate_settings(settings)
     arr = np.asarray(pfm, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 4:
         raise ValueError(f"Expected PFM of shape (K, 4) for [A, C, G, T], got {arr.shape}.")
@@ -117,13 +130,88 @@ def build_log_odds_pwm(
         raise ValueError("Each position in PFM must have positive total frequency/count.")
 
     bg = np.asarray(bg_probs, dtype=np.float64).reshape(1, 4)
-    if np.any(bg <= 0.0):
-        raise ValueError("Background base probabilities must be strictly positive.")
+    if np.any(~np.isfinite(bg)) or np.any(bg <= 0.0):
+        raise ValueError("Background base probabilities must be finite and strictly positive.")
     bg = bg / bg.sum()
 
+    if settings == "R_default":
+        pc = 0.8 if pseudocount is None else float(pseudocount)
+        if pc < 0.0 or not np.isfinite(pc):
+            raise ValueError("pseudocount must be finite and >= 0.")
+        probs = (arr + bg * pc) / (row_sums + pc)
+        return np.log2(probs / bg)
+
+    pc = 0.01 if pseudocount is None else float(pseudocount)
+    if pc < 0.0 or not np.isfinite(pc):
+        raise ValueError("pseudocount must be finite and >= 0.")
     p_norm = arr / row_sums
-    probs = (p_norm + pseudocount) / (1.0 + 4.0 * pseudocount)
+    probs = (p_norm + pc) / (1.0 + 4.0 * pc)
     return np.log2(probs / bg)
+
+
+def pwm_threshold_from_pvalue(
+    pwm: np.ndarray,
+    p_cutoff: float = 5e-5,
+    bg_probs: Sequence[float] = (0.25, 0.25, 0.25, 0.25),
+    n_grid_bins: int = 80_000,
+) -> float:
+    """Compute exact background score-distribution threshold `T` with `P(S >= T) <= p_cutoff` via 1D DP (`MOODS`)."""
+    if not (0.0 < p_cutoff <= 1.0) or not np.isfinite(p_cutoff):
+        raise ValueError(f"p_cutoff must lie in (0, 1], got {p_cutoff!r}.")
+
+    mat = np.asarray(pwm, dtype=np.float64)
+    if mat.ndim != 2 or mat.shape[1] != 4 or not np.all(np.isfinite(mat)):
+        raise ValueError("pwm must be a finite (K, 4) array.")
+
+    bg = np.asarray(bg_probs, dtype=np.float64).ravel()
+    if bg.size != 4 or np.any(~np.isfinite(bg)) or np.any(bg <= 0.0):
+        raise ValueError("bg_probs must contain 4 strictly positive finite probabilities.")
+    bg = bg / bg.sum()
+
+    row_mins = mat.min(axis=1)
+    row_maxs = mat.max(axis=1)
+    min_score = float(row_mins.sum())
+    max_score = float(row_maxs.sum())
+    if p_cutoff >= 1.0:
+        return min_score - 1e-9
+
+    span = max_score - min_score
+    if span <= 1e-12:
+        return max_score + 1e-6
+
+    k_len = mat.shape[0]
+    scale = float(max(n_grid_bins, 4000)) / span
+    shifted = mat - row_mins[:, None]
+    offsets = np.rint(shifted * scale).astype(np.int64)
+
+    dp = np.array([1.0], dtype=np.float64)
+    cur_max = 0
+    for k_idx in range(k_len):
+        row_off = offsets[k_idx]
+        next_max = cur_max + int(row_off.max())
+        nxt = np.zeros(next_max + 1, dtype=np.float64)
+        for b_idx in range(4):
+            shift = int(row_off[b_idx])
+            nxt[shift : shift + cur_max + 1] += bg[b_idx] * dp
+        dp = nxt
+        cur_max = next_max
+
+    tail_prob = np.cumsum(dp[::-1])[::-1]
+    occ = np.flatnonzero(dp > 0.0)
+    passing_occ = occ[tail_prob[occ] <= p_cutoff + 1e-15]
+    if passing_occ.size == 0:
+        return max_score + 1e-6
+
+    idx_cut = int(passing_occ[0])
+    if idx_cut <= int(occ[0]):
+        return min_score - 1e-9
+
+    cut_pos = int(np.searchsorted(occ, idx_cut))
+    prev_occ = int(occ[cut_pos - 1])
+    thresh = min_score + 0.5 * float(idx_cut + prev_occ) / scale
+    if idx_cut == cur_max:
+        thresh = min(thresh, max_score - 1e-9)
+    return float(thresh)
 
 
 def score_kmer_strand_max(kmer: str, pwm: np.ndarray) -> tuple[float, str]:
@@ -186,27 +274,51 @@ def compute_variant_pwm_disruption(ref_kmer: str, alt_kmer: str, pwm: np.ndarray
 def scan_sequence_pwm(
     sequence: str,
     pwm: np.ndarray,
-    min_log2_odds: float = 6.0,
+    min_log2_odds: float | None = None,
     sequence_id: str = "seq",
     tss_position_in_seq: int | None = None,
-    dedup_window_bp: int = 8,
+    dedup_window_bp: int | None = None,
+    *,
+    p_cutoff: float | None = None,
+    bg_probs: Sequence[float] = (0.25, 0.25, 0.25, 0.25),
+    settings: SettingsMode = "default",
 ) -> list[PWMMotifHit]:
-    """Scan a DNA sequence with any `(K, 4)` log2-odds PWM on both strands."""
+    """Scan a DNA sequence with any `(K, 4)` log2-odds PWM on both strands.
+
+    When `settings='R_default'` (or when `p_cutoff` is explicitly provided), uses exact dynamic-programming
+    background score-distribution p-value thresholding (`p_cutoff = 5e-5`, MOODS/`motifmatchr` convention)
+    and disables NMS window deduplication (`dedup_window_bp = 0`) unless explicitly overridden.
+    """
+    _validate_settings(settings)
+    if p_cutoff is not None:
+        thresh = pwm_threshold_from_pvalue(pwm, p_cutoff=p_cutoff, bg_probs=bg_probs)
+    elif min_log2_odds is not None:
+        thresh = float(min_log2_odds)
+    elif settings == "R_default":
+        thresh = pwm_threshold_from_pvalue(pwm, p_cutoff=5e-5, bg_probs=bg_probs)
+    else:
+        thresh = 6.0
+
+    win_bp = (0 if settings == "R_default" else 8) if dedup_window_bp is None else int(dedup_window_bp)
+
     seq = sequence.upper()
     k = pwm.shape[0]
     raw_hits: list[PWMMotifHit] = []
     for i in range(max(0, len(seq) - k + 1)):
         win = seq[i : i + k]
         sc, strand = score_kmer_strand_max(win, pwm)
-        if sc >= min_log2_odds:
+        if sc >= thresh:
             rel = (i - tss_position_in_seq) if tss_position_in_seq is not None else None
             raw_hits.append(PWMMotifHit(sequence_id, i, rel, win, strand, sc))
 
-    # Non-maximum suppression within `dedup_window_bp`
+    if win_bp <= 1:
+        return raw_hits
+
+    # Non-maximum suppression within `win_bp`
     raw_hits.sort(key=lambda h: -h.log2_odds_score)
     kept: list[PWMMotifHit] = []
     for h in raw_hits:
-        if all(abs(h.offset_5prime - kh.offset_5prime) >= dedup_window_bp for kh in kept):
+        if all(abs(h.offset_5prime - kh.offset_5prime) >= win_bp for kh in kept):
             kept.append(h)
     kept.sort(key=lambda h: h.offset_5prime)
     return kept

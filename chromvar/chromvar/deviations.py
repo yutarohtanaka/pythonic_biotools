@@ -14,12 +14,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 import warnings
 
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"settings must be 'default' or 'R_default', got {settings!r}.")
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -97,12 +105,15 @@ def get_background_peaks(
     w: float = 0.1,
     bs: int = 50,
     seed: int = 42,
+    *,
+    settings: SettingsMode = "default",
 ) -> np.ndarray:
     """Sample `n_iterations` GC- and accessibility-matched background peaks per peak (Schep et al., 2017).
 
     Matches peaks in Mahalanobis-whitened `(log10(peak_fragments), gc_content)` space using a 2D
     grid of `bs x bs` bins smoothed with a Gaussian kernel of bandwidth `w`.
     """
+    _validate_settings(settings)
     X, _ = _coerce_counts(counts_peaks_by_samples)
     n_peaks = X.shape[0]
     gc = np.asarray(gc_content, dtype=np.float64).ravel()
@@ -110,28 +121,48 @@ def get_background_peaks(
         raise ValueError(f"gc_content length ({len(gc)}) must match number of peaks ({n_peaks}).")
 
     peak_sums = np.asarray(X.sum(axis=1), dtype=np.float64).ravel()
-    log_frags = np.log10(np.maximum(peak_sums, 1.0))
-    feats = np.column_stack([log_frags, gc])
-    cov = np.cov(feats.T) + 1e-6 * np.eye(2)
-    L = np.linalg.cholesky(cov)
-    norm_data = np.linalg.solve(L, (feats - feats.mean(axis=0)).T).T  # (n_peaks, 2)
+    if settings == "R_default":
+        if np.any(peak_sums <= 0.0):
+            raise ValueError(
+                "All peaks must have > 0 total fragments when settings='R_default' (filter zero-fragment peaks first)."
+            )
+        log_frags = np.log10(peak_sums)
+        feats = np.column_stack([log_frags, gc])
+        cov = np.cov(feats.T)
+        if not np.all(np.isfinite(cov)) or np.linalg.det(cov) <= 1e-24:
+            cov = cov + 1e-6 * np.eye(2)
+        L = np.linalg.cholesky(cov)
+        norm_data = np.linalg.solve(L, feats.T).T  # (n_peaks, 2), matches forwardsolve(t(chol(cov)), t(mat))
 
-    n_bins = min(bs, max(5, n_peaks // 4))
-    edges0 = np.linspace(norm_data[:, 0].min() - 1e-6, norm_data[:, 0].max() + 1e-6, n_bins + 1)
-    edges1 = np.linspace(norm_data[:, 1].min() - 1e-6, norm_data[:, 1].max() + 1e-6, n_bins + 1)
-    centers0 = 0.5 * (edges0[:-1] + edges0[1:])
-    centers1 = 0.5 * (edges1[:-1] + edges1[1:])
+        n_bins = max(int(bs), 2)
+        centers0 = np.linspace(float(norm_data[:, 0].min()), float(norm_data[:, 0].max()), n_bins)
+        centers1 = np.linspace(float(norm_data[:, 1].min()), float(norm_data[:, 1].max()), n_bins)
+        bin0 = np.argmin(np.abs(norm_data[:, 0:1] - centers0[None, :]), axis=1)
+        bin1 = np.argmin(np.abs(norm_data[:, 1:2] - centers1[None, :]), axis=1)
+        flat_bin = bin0 * n_bins + bin1
+    else:
+        log_frags = np.log10(np.maximum(peak_sums, 1.0))
+        feats = np.column_stack([log_frags, gc])
+        cov = np.cov(feats.T) + 1e-6 * np.eye(2)
+        L = np.linalg.cholesky(cov)
+        norm_data = np.linalg.solve(L, (feats - feats.mean(axis=0)).T).T  # (n_peaks, 2)
 
-    bin0 = np.clip(np.digitize(norm_data[:, 0], edges0) - 1, 0, n_bins - 1)
-    bin1 = np.clip(np.digitize(norm_data[:, 1], edges1) - 1, 0, n_bins - 1)
-    flat_bin = bin0 * n_bins + bin1
+        n_bins = min(bs, max(5, n_peaks // 4))
+        edges0 = np.linspace(norm_data[:, 0].min() - 1e-6, norm_data[:, 0].max() + 1e-6, n_bins + 1)
+        edges1 = np.linspace(norm_data[:, 1].min() - 1e-6, norm_data[:, 1].max() + 1e-6, n_bins + 1)
+        centers0 = 0.5 * (edges0[:-1] + edges0[1:])
+        centers1 = 0.5 * (edges1[:-1] + edges1[1:])
+
+        bin0 = np.clip(np.digitize(norm_data[:, 0], edges0) - 1, 0, n_bins - 1)
+        bin1 = np.clip(np.digitize(norm_data[:, 1], edges1) - 1, 0, n_bins - 1)
+        flat_bin = bin0 * n_bins + bin1
 
     grid_c0, grid_c1 = np.meshgrid(centers0, centers1, indexing="ij")
     grid_pts = np.column_stack([grid_c0.ravel(), grid_c1.ravel()])  # (B^2, 2)
     bin_counts = np.bincount(flat_bin, minlength=n_bins * n_bins).astype(np.float64)
 
     dist2 = np.sum((grid_pts[:, None, :] - grid_pts[None, :, :]) ** 2, axis=2)
-    kernel = np.exp(-0.5 * dist2 / (w ** 2))  # (B^2, B^2)
+    kernel = np.exp(-0.5 * dist2 / (w**2))  # (B^2, B^2)
 
     smoothed_density = np.maximum(kernel @ bin_counts, 1e-12)
     bin_to_bin_prob = kernel * (bin_counts / smoothed_density)[None, :]
@@ -164,8 +195,11 @@ def compute_deviations(
     expectations: np.ndarray | None = None,
     sample_names: Sequence[str] | None = None,
     motif_names: Sequence[str] | None = None,
+    *,
+    settings: SettingsMode = "default",
 ) -> ChromVARResult:
     """Compute raw chromVAR deviations and bias-corrected Z-scores (`motifs x samples`)."""
+    _validate_settings(settings)
     X, samples = _coerce_counts(counts_peaks_by_samples, sample_names=sample_names)
 
     is_sparse_m = sparse.issparse(motif_matches_peaks_by_motifs)
@@ -256,6 +290,13 @@ def compute_deviations(
     bias_corrected_dev = raw_dev - bg_mean
     z_mat = bias_corrected_dev / bg_sd
 
+    if settings == "R_default":
+        # GreenleafLab/chromVAR compute_deviations.R:342-352 (`threshold = 1`)
+        low_exp = exp_m < 1.0
+        if np.any(low_exp):
+            bias_corrected_dev = np.where(low_exp, np.nan, bias_corrected_dev)
+            z_mat = np.where(low_exp, np.nan, z_mat)
+
     return ChromVARResult(
         deviations=pd.DataFrame(bias_corrected_dev, index=motifs, columns=samples),
         z_scores=pd.DataFrame(z_mat, index=motifs, columns=samples),
@@ -264,10 +305,17 @@ def compute_deviations(
 
 def compute_variability(
     z_scores: pd.DataFrame,
-    n_boot: int = 200,
+    n_boot: int | None = None,
     seed: int = 42,
+    *,
+    settings: SettingsMode = "default",
 ) -> pd.DataFrame:
     """Compute chromVAR motif variability (`SD(z)` across samples), bootstrap CIs, and chi-square p-values."""
+    _validate_settings(settings)
+    n_boot_eff = (1000 if settings == "R_default" else 200) if n_boot is None else int(n_boot)
+    if n_boot_eff < 1:
+        raise ValueError("n_boot must be >= 1.")
+
     Z = z_scores.to_numpy(dtype=np.float64)
     k_motifs, n_samples = Z.shape
     n_eff = np.sum(np.isfinite(Z), axis=1)
@@ -277,8 +325,8 @@ def compute_variability(
         variability = np.where(n_eff >= 2, np.nanstd(Z, axis=1, ddof=1), np.nan)
 
         rng = np.random.default_rng(seed)
-        boot_sd = np.empty((n_boot, k_motifs), dtype=np.float64)
-        for b in range(n_boot):
+        boot_sd = np.empty((n_boot_eff, k_motifs), dtype=np.float64)
+        for b in range(n_boot_eff):
             cols = rng.integers(0, n_samples, size=n_samples)
             Z_b = Z[:, cols]
             n_b = np.sum(np.isfinite(Z_b), axis=1)

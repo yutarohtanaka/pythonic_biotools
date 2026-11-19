@@ -14,9 +14,20 @@ import bisect
 from dataclasses import dataclass
 import gzip
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
+
+SettingsMode = Literal["default", "R_default"]
+
+
+def _validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -116,6 +127,50 @@ def _overlaps_sorted(
     return idx > 0 and merged[idx - 1][1] > start
 
 
+def _contained_in_any_tss_window(
+    start: int,
+    end: int,
+    sorted_tss: list[int] | None,
+    window_bp: int,
+) -> bool:
+    """
+    Return True iff `[start, end]` is fully contained inside at least one
+    `[tss - window_bp, tss + window_bp]` interval (matching ROSE getContainers).
+    Algebraically: `tss - W <= start` and `end <= tss + W` <=> `end - W <= tss <= start + W`.
+    """
+    if not sorted_tss or window_bp <= 0:
+        return False
+    lo = end - window_bp
+    hi = start + window_bp
+    if lo > hi:
+        return False
+    idx = bisect.bisect_left(sorted_tss, lo)
+    return idx < len(sorted_tss) and sorted_tss[idx] <= hi
+
+
+def _count_overlapping_tss50_genes(
+    start: int,
+    end: int,
+    chrom_tss_genes: tuple[list[int], list[str]] | None,
+    half_window_bp: int = 50,
+) -> int:
+    """
+    Count distinct genes whose `[tss - 50, tss + 50]` window overlaps `[start, end]`
+    (matching Young Lab ROSE_main.py L98-115 unstitching rule).
+    """
+    if chrom_tss_genes is None:
+        return 0
+    tss_positions, gene_ids = chrom_tss_genes
+    if not tss_positions:
+        return 0
+    # Overlap of [start, end] with [tss - 50, tss + 50] <=> start - 50 <= tss <= end + 50
+    lo_idx = bisect.bisect_left(tss_positions, start - half_window_bp)
+    hi_idx = bisect.bisect_right(tss_positions, end + half_window_bp)
+    if lo_idx >= hi_idx:
+        return 0
+    return len(set(gene_ids[lo_idx:hi_idx]))
+
+
 def call_rose_super_enhancers(
     peaks: str | Path | pd.DataFrame,
     blacklist: str | Path | pd.DataFrame | None = None,
@@ -128,6 +183,7 @@ def call_rose_super_enhancers(
     max_promoter_peak_width_bp: int = 2_500,
     score_col_index: int = 8,
     standard_chroms_only: bool = True,
+    settings: SettingsMode = "default",
 ) -> ROSEResult:
     """Call stitched regulatory domains and ROSE super-enhancers from MACS2 narrowPeaks or DataFrame.
 
@@ -151,7 +207,13 @@ def call_rose_super_enhancers(
         When `False` (standard ROSE), excludes ALL peaks overlapping `TSS ± tss_exclusion_bp` so broad
         promoter peaks cannot stitch enhancers across a TSS. When `True`, only excludes promoter-overlapping
         peaks narrower than or equal to `max_promoter_peak_width_bp`.
+    settings : {"default", "R_default"}, default "default"
+        `"default"` preserves Pythonic ROSE behavior; `"R_default"` matches Young Lab
+        `ROSE_main.py` and `ROSE_callSuper.R` (excludes `chrY`, `getContainers` strict TSS
+        containment, unstitching across `>2` distinct `TSS ± 50 bp` windows, and
+        `calculate_cutoff` `y - slope * x` minimization).
     """
+    _validate_settings(settings)
     if control_bigwig_path is not None and bigwig_path is None:
         raise ValueError("control_bigwig_path requires bigwig_path to be provided.")
     if bigwig_path is not None and not Path(bigwig_path).exists():
@@ -159,20 +221,56 @@ def call_rose_super_enhancers(
     if control_bigwig_path is not None and not Path(control_bigwig_path).exists():
         raise FileNotFoundError(f"control_bigwig_path does not exist: {control_bigwig_path}")
 
-    std_chroms = {f"chr{i}" for i in range(1, 23)} | {"chrX", "chrY"} | {str(i) for i in range(1, 23)} | {"X", "Y"}
+    if settings == "R_default":
+        std_chroms = (
+            {f"chr{i}" for i in range(1, 23)}
+            | {"chrX"}
+            | {str(i) for i in range(1, 23)}
+            | {"X"}
+        )
+    else:
+        std_chroms = (
+            {f"chr{i}" for i in range(1, 23)}
+            | {"chrX", "chrY"}
+            | {str(i) for i in range(1, 23)}
+            | {"X", "Y"}
+        )
     bl_dict = load_bed_intervals(blacklist)
     bl_index = _build_interval_index(bl_dict)
 
     tss_windows: dict[str, list[tuple[int, int]]] = {}
-    if tss_df is not None and {"chrom", "tss"}.issubset(tss_df.columns) and tss_exclusion_bp > 0:
-        for _, r in tss_df.iterrows():
+    sorted_tss_by_chrom: dict[str, list[int]] = {}
+    tss_gene_index: dict[str, tuple[list[int], list[str]]] = {}
+    if tss_df is not None and {"chrom", "tss"}.issubset(tss_df.columns):
+        has_gene_col = "gene_name" in tss_df.columns
+        per_chrom_pairs: dict[str, list[tuple[int, str]]] = {}
+        for row_idx, r in tss_df.iterrows():
+            chrom_s = str(r["chrom"])
             pos = int(r["tss"])
-            tss_windows.setdefault(str(r["chrom"]), []).append((pos - tss_exclusion_bp, pos + tss_exclusion_bp))
+            if tss_exclusion_bp > 0:
+                tss_windows.setdefault(chrom_s, []).append(
+                    (pos - tss_exclusion_bp, pos + tss_exclusion_bp)
+                )
+            gid = str(r["gene_name"]) if has_gene_col else f"{chrom_s}:{pos}:{row_idx}"
+            per_chrom_pairs.setdefault(chrom_s, []).append((pos, gid))
+        for chrom_s, pairs in per_chrom_pairs.items():
+            pairs.sort(key=lambda x: x[0])
+            sorted_tss_by_chrom[chrom_s] = [p[0] for p in pairs]
+            tss_gene_index[chrom_s] = (
+                [p[0] for p in pairs],
+                [p[1] for p in pairs],
+            )
     tss_index = _build_interval_index(tss_windows)
 
     def _exclude_peak(chrom: str, s: int, e: int) -> bool:
         if _overlaps_indexed(s, e, bl_index.get(chrom)):
             return True
+        if settings == "R_default":
+            if tss_exclusion_bp > 0 and _contained_in_any_tss_window(
+                s, e, sorted_tss_by_chrom.get(chrom), tss_exclusion_bp
+            ):
+                return True
+            return False
         if _overlaps_indexed(s, e, tss_index.get(chrom)):
             if not allow_broad_promoter_peaks or (e - s) <= max_promoter_peak_width_bp:
                 return True
@@ -235,15 +333,38 @@ def call_rose_super_enhancers(
     for chrom, ivs in by_chrom.items():
         ivs.sort(key=lambda x: x[0])
         cur_s, cur_e, cur_sig, n_sub = ivs[0][0], ivs[0][1], ivs[0][2], 1
+        cur_members: list[tuple[int, int, float]] = [ivs[0]]
         for s, e, sig in ivs[1:]:
             if s - cur_e <= stitch_bp:
                 cur_e = max(cur_e, e)
                 cur_sig += sig
                 n_sub += 1
+                cur_members.append((s, e, sig))
             else:
-                stitched.append([chrom, cur_s, cur_e, cur_sig, n_sub])
+                if (
+                    settings == "R_default"
+                    and n_sub > 1
+                    and _count_overlapping_tss50_genes(
+                        cur_s, cur_e, tss_gene_index.get(chrom)
+                    )
+                    > 2
+                ):
+                    for ms, me, msig in cur_members:
+                        stitched.append([chrom, ms, me, msig, 1])
+                else:
+                    stitched.append([chrom, cur_s, cur_e, cur_sig, n_sub])
                 cur_s, cur_e, cur_sig, n_sub = s, e, sig, 1
-        stitched.append([chrom, cur_s, cur_e, cur_sig, n_sub])
+                cur_members = [(s, e, sig)]
+        if (
+            settings == "R_default"
+            and n_sub > 1
+            and _count_overlapping_tss50_genes(cur_s, cur_e, tss_gene_index.get(chrom))
+            > 2
+        ):
+            for ms, me, msig in cur_members:
+                stitched.append([chrom, ms, me, msig, 1])
+        else:
+            stitched.append([chrom, cur_s, cur_e, cur_sig, n_sub])
 
     if bigwig_path is not None:
         import pyBigWig
@@ -271,8 +392,15 @@ def call_rose_super_enhancers(
     max_sig = float(sigs[-1]) if sigs[-1] > 0.0 else 1.0
     x_norm = np.arange(n_dom, dtype=np.float64) / max(1, n_dom - 1)
     y_norm = sigs / max_sig
-    # Geometric 45-degree tangent cutoff: maximize (x_norm - y_norm)
-    cutoff_idx = int(np.argmax(x_norm - y_norm))
+    if settings == "R_default":
+        # ROSE_callSuper.R calculate_cutoff: minimize y - slope * x (slope = (max - min)/N, x = 1..N)
+        y_vec = np.maximum(sigs, 0.0)
+        x_vec = np.arange(1, n_dom + 1, dtype=np.float64)
+        slope = (float(y_vec[-1]) - float(y_vec[0])) / float(max(1, n_dom))
+        cutoff_idx = int(np.argmin(y_vec - slope * x_vec))
+    else:
+        # Geometric 45-degree tangent cutoff: maximize (x_norm - y_norm)
+        cutoff_idx = int(np.argmax(x_norm - y_norm))
     cutoff_val = float(sigs[cutoff_idx])
 
     # Optional nearest-TSS gene annotation

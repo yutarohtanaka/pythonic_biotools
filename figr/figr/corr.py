@@ -12,7 +12,15 @@ import pandas as pd
 from scipy import sparse, stats
 
 from .background import get_background_peaks
-from .io import align_cells, bh_fdr, coerce_peaks, coerce_tss_table, extract_matrix
+from .io import (
+    SettingsMode,
+    align_cells,
+    bh_fdr,
+    coerce_peaks,
+    coerce_tss_table,
+    extract_matrix,
+    validate_settings,
+)
 
 
 @dataclass(frozen=True)
@@ -285,9 +293,11 @@ def run_gene_peak_corr(
     rna_layer: str | None = None,
     atac_layer: str | None = None,
     orientation: Literal["cells_by_features", "features_by_cells"] = "cells_by_features",
+    keep_multi_mapping_peaks: bool | None = None,
     p_cut: float | None = None,
     fdr_cut: float | None = None,
     seed: int = 42,
+    settings: SettingsMode = "default",
 ) -> GenePeakCorrResult:
     """Test cis peak-to-gene correlations against GC/accessibility-matched background peaks.
 
@@ -296,6 +306,12 @@ def run_gene_peak_corr(
     matched background correlations per cis pair, and computes empirical null Z-scores,
     p-values, and `NaN`-aware Benjamini–Hochberg FDR.
     """
+    validate_settings(settings)
+    eff_keep_multi = (
+        (settings != "R_default")
+        if keep_multi_mapping_peaks is None
+        else bool(keep_multi_mapping_peaks)
+    )
     if window_pad <= 0:
         raise ValueError(f"`window_pad` must be > 0, got {window_pad}.")
     if alternative not in ("greater", "two-sided", "less"):
@@ -569,6 +585,20 @@ def run_gene_peak_corr(
                 na_position="last",
             )
             .drop_duplicates(subset=["gene", "peak"], keep="first")
+            .sort_values(by="_orig", kind="mergesort")
+            .reset_index(drop=True)
+        )
+
+    if not eff_keep_multi and len(df_all) > 0 and df_all.duplicated(subset=["peak"]).any():
+        # Match buenrostrolab/FigR cisCor.R keepMultiMappingPeaks=FALSE: keep max r_obs gene per peak
+        df_all = (
+            df_all.sort_values(
+                by=["r_obs", "p_value", "_abs_dist", "_orig"],
+                ascending=[False, True, True, True],
+                kind="mergesort",
+                na_position="last",
+            )
+            .drop_duplicates(subset=["peak"], keep="first")
             .sort_values(by="_orig", kind="mergesort")
             .reset_index(drop=True)
         )

@@ -13,7 +13,7 @@ from scipy import sparse, stats
 from .background import get_background_peaks
 from .corr import GenePeakCorrResult, compute_unit_rank_matrix
 from .dorc import DORCCallResult, DORCScoresResult
-from .io import align_cells, bh_fdr, extract_matrix
+from .io import SettingsMode, align_cells, bh_fdr, extract_matrix, validate_settings
 
 
 @dataclass(frozen=True)
@@ -264,30 +264,48 @@ def run_figr_grn(
     peak_names: Sequence[str] | None = None,
     motif_names: Sequence[str] | None = None,
     motif_threshold: float = 0.0,
-    dorc_k_pool: int = 0,
+    dorc_k_pool: int | None = None,
     n_bg: int = 50,
     bg_method: Literal["chromvar_kernel", "knn_mahalanobis"] = "chromvar_kernel",
     enrichment_method: Literal["background_z", "hypergeometric"] = "background_z",
     corr_method: Literal["spearman", "pearson"] = "spearman",
-    corr_p_method: Literal["ttest", "z_across_tfs"] = "ttest",
-    score_mode: Literal["product", "kartha_union"] = "product",
+    corr_p_method: Literal["ttest", "z_across_tfs"] | None = None,
+    score_mode: Literal["product", "kartha_union"] | None = None,
     clamp_negative_enrichment: bool = True,
     min_p: float = 1e-300,
     rna_layer: str | None = None,
     orientation: Literal["cells_by_features", "features_by_cells"] = "cells_by_features",
     seed: int = 42,
+    settings: SettingsMode = "default",
 ) -> FigRGRNResult:
     """Infer TF-DORC regulatory networks by combining TF motif enrichment with TF-RNA correlation."""
+    validate_settings(settings)
+    eff_dorc_k_pool = (
+        (30 if settings == "R_default" else 0)
+        if dorc_k_pool is None
+        else int(dorc_k_pool)
+    )
+    eff_corr_p_method: Literal["ttest", "z_across_tfs"] = (
+        ("z_across_tfs" if settings == "R_default" else "ttest")
+        if corr_p_method is None
+        else corr_p_method
+    )
+    eff_score_mode: Literal["product", "kartha_union"] = (
+        ("kartha_union" if settings == "R_default" else "product")
+        if score_mode is None
+        else score_mode
+    )
+
     if enrichment_method not in ("background_z", "hypergeometric"):
         raise ValueError(f"Invalid `enrichment_method` {enrichment_method!r}.")
     if corr_method not in ("spearman", "pearson"):
         raise ValueError(f"Invalid `corr_method` {corr_method!r}.")
-    if corr_p_method not in ("ttest", "z_across_tfs"):
-        raise ValueError(f"Invalid `corr_p_method` {corr_p_method!r}.")
-    if score_mode not in ("product", "kartha_union"):
-        raise ValueError(f"Invalid `score_mode` {score_mode!r}.")
-    if dorc_k_pool < 0:
-        raise ValueError(f"`dorc_k_pool` must be >= 0, got {dorc_k_pool}.")
+    if eff_corr_p_method not in ("ttest", "z_across_tfs"):
+        raise ValueError(f"Invalid `corr_p_method` {eff_corr_p_method!r}.")
+    if eff_score_mode not in ("product", "kartha_union"):
+        raise ValueError(f"Invalid `score_mode` {eff_score_mode!r}.")
+    if eff_dorc_k_pool < 0:
+        raise ValueError(f"`dorc_k_pool` must be >= 0, got {eff_dorc_k_pool}.")
     if min_p <= 0.0 or min_p > 1.0:
         raise ValueError(f"`min_p` must be in (0, 1], got {min_p}.")
 
@@ -322,7 +340,7 @@ def run_figr_grn(
                 n_cells=len(shared_tmp),
                 enrichment_method=enrichment_method,
                 corr_method=corr_method,
-                score_mode=score_mode,
+                score_mode=eff_score_mode,
             )
     else:
         mat_dorc_raw, dorc_cells, dorc_genes, dorc_has_cells, _ = extract_matrix(
@@ -444,8 +462,8 @@ def run_figr_grn(
         raw_dorc_peaks[g] = sorted(set(raw_dorc_peaks[g]))
 
     pooled_dorc_peaks: list[np.ndarray] = []
-    if dorc_k_pool > 0 and len(dorc_genes) > 1:
-        k_eff = min(dorc_k_pool, len(dorc_genes))
+    if eff_dorc_k_pool > 0 and len(dorc_genes) > 1:
+        k_eff = min(eff_dorc_k_pool, len(dorc_genes))
         means = mat_dorc.mean(axis=0, keepdims=True)
         sds = mat_dorc.std(axis=0, keepdims=True)
         z_dorc = np.where(sds > 1e-12, (mat_dorc - means) / np.maximum(sds, 1e-12), 0.0)
@@ -527,7 +545,7 @@ def run_figr_grn(
     valid_pair_mat = valid_dorc[:, None] & valid_tf[None, :]
     corr_mat = np.where(valid_pair_mat, np.clip(corr_mat, -1.0, 1.0), np.nan)
 
-    if corr_p_method == "ttest":
+    if eff_corr_p_method == "ttest":
         t_stats = corr_mat * np.sqrt((n_cells - 2) / np.maximum(1.0 - corr_mat ** 2, 1e-15))
         p_corr_mat = np.where(valid_pair_mat, 2.0 * stats.t.sf(np.abs(t_stats), df=n_cells - 2), np.nan)
         p_corr_mat = np.clip(p_corr_mat, 0.0, 1.0)
@@ -598,13 +616,19 @@ def run_figr_grn(
                     )
                     sd_eff = float(np.sqrt(m_d * q_hat * (1.0 - q_hat)))
                     z_vec[t_pos] = (c_obs[t_pos] - mu_bg[t_pos]) / max(sd_eff, 1e-12)
-            p_m_vec = np.clip(stats.norm.sf(z_vec), 0.0, 1.0)
+            if settings == "R_default":
+                p_m_vec = np.clip(2.0 * stats.norm.sf(np.abs(z_vec)), 0.0, 1.0)
+            else:
+                p_m_vec = np.clip(stats.norm.sf(z_vec), 0.0, 1.0)
         else:
             mu_bg = m_d * total_motif_hits / n_peaks
             var_h = m_d * (total_motif_hits / n_peaks) * (1.0 - total_motif_hits / n_peaks) * (n_peaks - m_d) / max(n_peaks - 1, 1)
             sd_h = np.sqrt(np.maximum(var_h, 0.0))
             z_vec = np.where(sd_h > 1e-12, (c_obs - mu_bg) / np.maximum(sd_h, 1e-12), 0.0)
-            p_m_vec = np.clip(stats.hypergeom.sf(c_obs - 1, n_peaks, total_motif_hits, m_d), 0.0, 1.0)
+            if settings == "R_default":
+                p_m_vec = np.clip(2.0 * stats.norm.sf(np.abs(z_vec)), 0.0, 1.0)
+            else:
+                p_m_vec = np.clip(stats.hypergeom.sf(c_obs - 1, n_peaks, total_motif_hits, m_d), 0.0, 1.0)
 
         for t_pos in range(n_act_motifs):
             out_dorc.append(d_name)
@@ -629,7 +653,10 @@ def run_figr_grn(
     p_m_clip = np.clip(p_motif_arr, min_p, 1.0)
     p_c_clip = np.clip(p_corr_arr, min_p, 1.0)
 
-    if clamp_negative_enrichment:
+    if settings == "R_default":
+        # FigR.R: Enrichment.log10P[z < 0] <- 0 (equivalently p_enrich = 1 when z < 0)
+        enrichment_ok = z_arr >= 0.0 if clamp_negative_enrichment else np.ones_like(z_arr, dtype=bool)
+    elif clamp_negative_enrichment:
         enrichment_ok = z_arr > 0.0
     else:
         enrichment_ok = np.ones_like(z_arr, dtype=bool)
@@ -637,11 +664,16 @@ def run_figr_grn(
     E = np.where(enrichment_ok, -np.log10(p_m_clip), 0.0)
     C = -np.log10(p_c_clip)
 
-    if score_mode == "product":
+    if eff_score_mode == "product":
         score_arr = np.where(np.isfinite(r_arr) & np.isfinite(p_corr_arr), np.sign(r_arr) * E * C, np.nan)
     else:
-        p_union = np.clip(p_m_clip + p_c_clip - p_m_clip * p_c_clip, min_p, 1.0)
-        raw_union = np.where(enrichment_ok, np.sign(r_arr) * (-np.log10(p_union)), 0.0)
+        p_m_eff = np.where(enrichment_ok, p_m_clip, 1.0)
+        p_union = np.clip(p_m_eff + p_c_clip - p_m_eff * p_c_clip, min_p, 1.0)
+        raw_union = np.where(
+            enrichment_ok & (p_union < 1.0),
+            np.sign(r_arr) * (-np.log10(p_union)),
+            0.0,
+        )
         score_arr = np.where(np.isfinite(r_arr) & np.isfinite(p_corr_arr), raw_union, np.nan)
 
     role_list = [
@@ -667,5 +699,5 @@ def run_figr_grn(
         n_cells=n_cells,
         enrichment_method=eff_enrichment_method,
         corr_method=corr_method,
-        score_mode=score_mode,
+        score_mode=eff_score_mode,
     )
