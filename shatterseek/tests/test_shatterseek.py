@@ -263,3 +263,100 @@ def test_input_validation_and_empty_sv_edge_case():
             pval_exp_cluster=0.5,
             alpha=1.5,
         )
+
+    with pytest.raises(ValueError, match="settings"):
+        detect_chromothripsis(empty_sv, cn_df, settings="bad")  # type: ignore[arg-type]
+
+
+def test_r_default_shatterseek_parity():
+    """
+    Verify parklab/ShatterSeek v1.1 (function_criteria.R) parity under settings='R_default':
+    1. Restricts chromosomes to chr1-chr22, chrX (excludes chrY) and keeps only the
+       single largest interleaved SV cluster per chromosome.
+    2. Does NOT pre-merge adjacent equal-CN segments, and computes 3-state CN oscillation
+       as longest contiguous run satisfying abs(cn[i] - cn[i-2]) <= 1.
+    3. Links interchromosomal TRAs within tra_margin_bp=10_000, includes linked TRA
+       breakpoint orientations in the 4-way pval_fragment_joins count, requires >=6
+       breakpoints for pval_exp_cluster, and uses two-sided Binomial enrichment test.
+    """
+    # 1. CN oscillations:
+    # [2, 2, 1, 1, 2, 1, 2, 2]: default merges duplicates -> [2, 1, 2, 1, 2] (5);
+    # R_default does NOT pre-merge -> [1, 2, 1, 2] (4).
+    assert max_oscillating_cn_segments([2, 2, 1, 1, 2, 1, 2, 2], settings="default") == (5, 5)
+    assert max_oscillating_cn_segments([2, 2, 1, 1, 2, 1, 2, 2], settings="R_default") == (4, 4)
+
+    # [4, 1, 2, 1, 4]: default <=3 distinct states -> osc_3=5; R_default abs(cn[i]-cn[i-2])<=1 -> osc_3=3
+    assert max_oscillating_cn_segments([4, 1, 2, 1, 4], settings="default")[1] == 5
+    assert max_oscillating_cn_segments([4, 1, 2, 1, 4], settings="R_default")[1] == 3
+
+    # [1, 3, 2, 4, 3, 5, 4]: 5 distinct states -> default osc_3=4; R_default abs(cn[i]-cn[i-2])==1 -> osc_3=7
+    assert max_oscillating_cn_segments([1, 3, 2, 4, 3, 5, 4], settings="default")[1] == 4
+    assert max_oscillating_cn_segments([1, 3, 2, 4, 3, 5, 4], settings="R_default")[1] == 7
+
+    # 2. pval_exp_cluster requires >=6 breakpoints in R_default (4 breakpoints -> 1.0 in R_default)
+    four_bp = [100, 110, 10_000_000, 10_000_010]
+    assert pval_exp_cluster(four_bp, settings="default") < 0.5
+    assert pval_exp_cluster(four_bp, settings="R_default") == 1.0
+
+    # 3. Two-sided vs one-sided Binomial enrichment test (depleted chr1: 0 of 60 SVs on chr1)
+    p_one = pval_chr_breakpoint_enrichment(0, 60, 248_956_422, 3_000_000_000, settings="default")
+    p_two = pval_chr_breakpoint_enrichment(0, 60, 248_956_422, 3_000_000_000, settings="R_default")
+    assert p_one == 1.0
+    assert p_two < 0.05
+
+    # 4. End-to-end detect_chromothripsis:
+    # - chrY cluster excluded in R_default
+    # - chr1 has TWO clusters: a 2-SV minor cluster [1M..3M] and a 3-SV major cluster [10M..20M]
+    #   whose intra SVs are all DEL (+,-), PLUS 9 TRAs within 8 kb outside [10M..20M] carrying
+    #   (-,+), (+,+), (-,-) strands (3 each) to chr2!
+    #   In default: tra_margin_bp=0 misses the 8 kb flanking TRAs AND pval_fragment_joins=[3,0,0,0] <= 0.05!
+    #   In R_default: keeps single largest cluster on chr1, links all 9 TRAs within 10 kb margin,
+    #   and includes TRA orientations in pval_fragment_joins -> [3, 3, 3, 3] (p == 1.0) -> High confidence!
+    sv_df = pd.DataFrame(
+        [
+            # Minor 2-SV cluster on chr1 [1M..3M]
+            {"chrom1": "chr1", "pos1": 1_000_000, "strand1": "+", "chrom2": "chr1", "pos2": 2_000_000, "strand2": "-"},
+            {"chrom1": "chr1", "pos1": 1_500_000, "strand1": "-", "chrom2": "chr1", "pos2": 3_000_000, "strand2": "+"},
+            # Major 3-SV cluster on chr1 [10M..20M], all 3 DEL (+, -)
+            {"chrom1": "chr1", "pos1": 10_000_000, "strand1": "+", "chrom2": "chr1", "pos2": 16_000_000, "strand2": "-"},
+            {"chrom1": "chr1", "pos1": 12_000_000, "strand1": "+", "chrom2": "chr1", "pos2": 18_000_000, "strand2": "-"},
+            {"chrom1": "chr1", "pos1": 14_000_000, "strand1": "+", "chrom2": "chr1", "pos2": 20_000_000, "strand2": "-"},
+            # chrY SV (kept in default, excluded in R_default)
+            {"chrom1": "chrY", "pos1": 5_000_000, "strand1": "+", "chrom2": "chrY", "pos2": 8_000_000, "strand2": "-"},
+            # 9 TRAs sitting 5 kb outside [10M..20M] (at 9_995_000 and 20_005_000, within 10 kb margin!)
+            {"chrom1": "chr1", "pos1": 9_995_000, "strand1": "-", "chrom2": "chr2", "pos2": 50_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 9_996_000, "strand1": "-", "chrom2": "chr2", "pos2": 51_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 9_997_000, "strand1": "-", "chrom2": "chr2", "pos2": 52_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 20_002_000, "strand1": "+", "chrom2": "chr2", "pos2": 53_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 20_003_000, "strand1": "+", "chrom2": "chr2", "pos2": 54_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 20_004_000, "strand1": "+", "chrom2": "chr2", "pos2": 55_000_000, "strand2": "+"},
+            {"chrom1": "chr1", "pos1": 20_005_000, "strand1": "-", "chrom2": "chr2", "pos2": 56_000_000, "strand2": "-"},
+            {"chrom1": "chr1", "pos1": 20_006_000, "strand1": "-", "chrom2": "chr2", "pos2": 57_000_000, "strand2": "-"},
+            {"chrom1": "chr1", "pos1": 20_007_000, "strand1": "-", "chrom2": "chr2", "pos2": 58_000_000, "strand2": "-"},
+        ]
+    )
+    cn_df = pd.concat(
+        [
+            _make_oscillating_cn("chr1", 9_500_000, 1_500_000, [2, 1, 2, 1, 2, 1, 2, 1]),
+            _make_oscillating_cn("chrY", 4_000_000, 2_000_000, [1, 2, 1]),
+        ],
+        ignore_index=True,
+    )
+
+    res_def = detect_chromothripsis(sv_df, cn_df, settings="default")
+    res_r = detect_chromothripsis(sv_df, cn_df, settings="R_default")
+
+    assert len(res_def.clusters) == 3  # 2 on chr1 + 1 on chrY
+    assert any(c.chrom == "chrY" for c in res_def.clusters)
+    c1_major_def = [c for c in res_def.clusters if c.chrom == "chr1" and c.n_interleaved_svs == 3][0]
+    assert c1_major_def.n_tra == 0
+    assert c1_major_def.pval_fragment_joins < 0.05
+    assert c1_major_def.confidence == "None"
+
+    assert len(res_r.clusters) == 1  # single largest cluster on chr1, chrY excluded
+    c1_r = res_r.clusters[0]
+    assert c1_r.chrom == "chr1"
+    assert c1_r.n_interleaved_svs == 3
+    assert c1_r.n_tra == 9
+    assert np.isclose(c1_r.pval_fragment_joins, 1.0, atol=1e-12)
+    assert c1_r.confidence == "High"

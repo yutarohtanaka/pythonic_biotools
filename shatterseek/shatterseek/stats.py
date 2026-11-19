@@ -10,6 +10,16 @@ from typing import Literal, Sequence
 import numpy as np
 from scipy import special, stats
 
+SettingsMode = Literal["default", "R_default"]
+
+
+def validate_settings(settings: str) -> SettingsMode:
+    if settings not in ("default", "R_default"):
+        raise ValueError(
+            f"Invalid settings={settings!r}. Expected 'default' or 'R_default'."
+        )
+    return settings  # type: ignore[return-value]
+
 GRCH38_CHROM_LENGTHS: dict[str, int] = {
     "chr1": 248_956_422,
     "chr2": 242_193_529,
@@ -166,13 +176,16 @@ def pval_exp_cluster(
     breakpoints: Sequence[int | float] | np.ndarray,
     *,
     method: Literal["ks", "anderson"] = "ks",
+    settings: SettingsMode = "default",
 ) -> float:
     """
     Goodness-of-fit test comparing consecutive intra-cluster breakpoint spacings
     against an Exponential distribution (uniform random shattering null).
     """
+    validate_settings(settings)
     bp = np.sort(np.asarray(breakpoints, dtype=np.float64).ravel())
-    if bp.size < 3:
+    min_bp = 6 if settings == "R_default" else 3
+    if bp.size < min_bp:
         return 1.0
     spacings = np.diff(bp)
     spacings = spacings[spacings > 0.0]
@@ -219,35 +232,77 @@ def pval_chr_breakpoint_enrichment(
     n_total_svs: int,
     chr_length: int | float,
     genome_length: int | float,
+    *,
+    settings: SettingsMode = "default",
 ) -> float:
     """
-    Exact one-sided Binomial test comparing observed intrachromosomal SVs on
-    chromosome c against the genome-wide rate weighted by callable chromosome length.
+    Exact Binomial test comparing observed intrachromosomal SVs on chromosome c
+    against the genome-wide rate weighted by callable chromosome length.
+    Uses one-sided ('greater') in `settings='default'` and two-sided in `settings='R_default'`.
     """
+    validate_settings(settings)
     if n_chr_svs < 0 or n_total_svs < n_chr_svs:
         raise ValueError(f"Invalid SV counts: n_chr_svs={n_chr_svs}, n_total_svs={n_total_svs}.")
     if chr_length <= 0 or genome_length < chr_length:
         raise ValueError(f"Invalid lengths: chr_length={chr_length}, genome_length={genome_length}.")
-    if n_total_svs == 0 or n_chr_svs == 0:
+    if n_total_svs == 0:
+        return 1.0
+    if settings == "default" and n_chr_svs == 0:
         return 1.0
 
     p0 = float(chr_length) / float(genome_length)
     p0 = float(np.clip(p0, 0.0, 1.0))
-    return float(stats.binomtest(int(n_chr_svs), int(n_total_svs), p=p0, alternative="greater").pvalue)
+    alt: Literal["greater", "two-sided"] = "two-sided" if settings == "R_default" else "greater"
+    return float(stats.binomtest(int(n_chr_svs), int(n_total_svs), p=p0, alternative=alt).pvalue)
 
 
-def max_oscillating_cn_segments(cn_states: Sequence[int | float] | np.ndarray) -> tuple[int, int]:
+def max_oscillating_cn_segments(
+    cn_states: Sequence[int | float] | np.ndarray,
+    *,
+    settings: SettingsMode = "default",
+) -> tuple[int, int]:
     """
     Compute the maximum number of contiguous CN segments oscillating strictly
     between 2 copy-number states and at most 3 copy-number states.
 
-    Adjacent segments sharing an identical copy-number value are first collapsed
-    so contiguous fragmented segments of the same state never inflate or break
-    oscillation chains.
+    - `settings='default'`: Adjacent segments sharing an identical copy-number value
+      are first collapsed, and 3-state oscillation finds the longest subarray with <= 3
+      distinct states.
+    - `settings='R_default'`: Matches `parklab/ShatterSeek` v1.1 `function_criteria.R`
+      without pre-merging equal-CN segments, computing 3-state CN oscillation as the
+      longest contiguous run satisfying `abs(cn[i] - cn[i-2]) <= 1` (`%in% c(0, 1)`).
     """
+    validate_settings(settings)
     arr = np.asarray(cn_states, dtype=np.float64).ravel()
     if arr.size == 0:
         return 0, 0
+
+    if settings == "R_default":
+        if arr.size < 2:
+            return 0, 0
+        max_2 = 0
+        max_3 = 0
+        cur_2 = 1
+        cur_3 = 1
+        for idx in range(1, arr.size):
+            if arr[idx] == arr[idx - 1]:
+                cur_2 = 1
+                cur_3 = 1
+            else:
+                if cur_2 >= 2 and arr[idx] == arr[idx - 2]:
+                    cur_2 += 1
+                else:
+                    cur_2 = 2
+                if cur_2 > max_2:
+                    max_2 = cur_2
+
+                if cur_3 >= 2 and abs(float(arr[idx]) - float(arr[idx - 2])) <= 1.0 + 1e-9:
+                    cur_3 += 1
+                else:
+                    cur_3 = 2
+                if cur_3 > max_3:
+                    max_3 = cur_3
+        return max_2, max_3
 
     # Collapse adjacent identical states
     collapsed: list[float] = [float(arr[0])]

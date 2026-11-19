@@ -21,15 +21,18 @@ import pandas as pd
 from scipy.sparse import csgraph
 
 from .stats import (
+    SettingsMode,
     get_reference_chrom_lengths,
     max_oscillating_cn_segments,
     normalize_chrom,
     pval_chr_breakpoint_enrichment,
     pval_exp_cluster,
     pval_fragment_joins,
+    validate_settings,
 )
 
 VALID_SV_TYPES = frozenset({"DEL", "DUP", "h2hINV", "t2tINV", "TRA"})
+R_DEFAULT_CHROMS = frozenset({f"chr{i}" for i in range(1, 23)} | {"chrX"})
 ConfidenceTier = Literal["High", "Low", "None"]
 
 
@@ -331,26 +334,38 @@ def detect_chromothripsis(
     *,
     genome: str = "GRCh38",
     chrom_lengths: Mapping[str, int] | None = None,
-    tra_margin_bp: int = 0,
+    tra_margin_bp: int | None = None,
     joins_method: Literal["chisq", "gtest", "exact"] = "chisq",
     exp_cluster_method: Literal["ks", "anderson"] = "ks",
     alpha: float = 0.05,
+    settings: SettingsMode = "default",
 ) -> ShatterSeekResult:
     """
     Detect and classify chromothripsis regions across chromosomes from SVs and CN segments.
     """
-    if tra_margin_bp < 0:
+    validate_settings(settings)
+    eff_tra_margin_bp = (
+        (10_000 if settings == "R_default" else 0)
+        if tra_margin_bp is None
+        else int(tra_margin_bp)
+    )
+    if eff_tra_margin_bp < 0:
         raise ValueError("tra_margin_bp must be >= 0.")
     if not isinstance(sv_data, pd.DataFrame):
         sv_data = pd.DataFrame(sv_data)
 
     cn_df = _parse_cn_segments(cn_segments)
+    if settings == "R_default":
+        cn_df = cn_df.loc[cn_df["chrom"].isin(R_DEFAULT_CHROMS)].reset_index(drop=True)
 
     ref_lengths = (
         {normalize_chrom(k): int(v) for k, v in chrom_lengths.items()}
         if chrom_lengths is not None
         else get_reference_chrom_lengths(genome)
     )
+    if settings == "R_default":
+        ref_lengths = {k: v for k, v in ref_lengths.items() if k in R_DEFAULT_CHROMS}
+
     # Ensure any custom contig in CN/SV data has a valid reference length
     for ch, grp in cn_df.groupby("chrom", sort=False):
         max_end = int(grp["end"].max())
@@ -380,12 +395,12 @@ def detect_chromothripsis(
     has_type = "sv_type" in sv_data.columns
 
     intra_by_chrom: dict[str, list[tuple[int, int, str]]] = {}
-    tra_records: list[tuple[str, int, str, int]] = []
+    tra_records: list[tuple[str, int, str | None, str, int, str | None]] = []
     n_total_intra = 0
 
     for idx in range(len(sv_data)):
         row = sv_data.iloc[idx]
-        c1, p1, _, c2, p2, _, st = infer_sv_type(
+        c1, p1, s1, c2, p2, s2, st = infer_sv_type(
             chrom1=str(row["chrom1"]),
             pos1=int(row["pos1"]),
             strand1=row["strand1"] if has_s1 else None,
@@ -394,12 +409,17 @@ def detect_chromothripsis(
             strand2=row["strand2"] if has_s2 else None,
             sv_type=row["sv_type"] if has_type else None,
         )
+        if settings == "R_default" and (
+            c1 not in R_DEFAULT_CHROMS or c2 not in R_DEFAULT_CHROMS
+        ):
+            continue
+
         for ch_p, pos_p in ((c1, p1), (c2, p2)):
             if ch_p not in ref_lengths or ref_lengths[ch_p] < pos_p:
                 ref_lengths[ch_p] = max(pos_p, 1)
 
         if st == "TRA":
-            tra_records.append((c1, p1, c2, p2))
+            tra_records.append((c1, p1, s1, c2, p2, s2))
         else:
             intra_by_chrom.setdefault(c1, []).append((p1, p2, st))
             n_total_intra += 1
@@ -411,7 +431,9 @@ def detect_chromothripsis(
     cn_by_chrom: dict[str, pd.DataFrame] = {}
     for ch, grp in cn_df.groupby("chrom", sort=False):
         cn_by_chrom[str(ch)] = grp
-        chr_osc_map[str(ch)] = max_oscillating_cn_segments(grp["total_cn"].to_numpy())
+        chr_osc_map[str(ch)] = max_oscillating_cn_segments(
+            grp["total_cn"].to_numpy(), settings=settings
+        )
 
     # Step 1: Extract connected components of the interleaved SV graph per chromosome
     raw_clusters: list[dict[str, object]] = []
@@ -431,20 +453,29 @@ def detect_chromothripsis(
         adj = inter_ij | inter_ij.T
         n_comp, labels = csgraph.connected_components(adj.astype(np.int8), directed=False)
 
-        # Sort clusters along chromosome coordinate order
+        # Sort clusters along chromosome coordinate order (or single largest in R_default)
         comp_spans: list[tuple[int, int, np.ndarray]] = []
         for comp_id in range(n_comp):
             members = np.where(labels == comp_id)[0]
             c_start = int(np.min(a[members]))
             c_end = int(np.max(b[members]))
             comp_spans.append((c_start, c_end, members))
-        comp_spans.sort(key=lambda t: (t[0], t[1]))
+
+        if settings == "R_default":
+            # parklab/ShatterSeek reports only the single largest interleaved SV cluster per chromosome
+            comp_spans.sort(
+                key=lambda t: (-int(t[2].size), -(t[1] - t[0]), t[0])
+            )
+            comp_spans = comp_spans[:1]
+        else:
+            comp_spans.sort(key=lambda t: (t[0], t[1]))
 
         pval_chr_enr = pval_chr_breakpoint_enrichment(
             n_chr_svs=k_ch,
             n_total_svs=n_total_intra,
             chr_length=ref_lengths[ch],
             genome_length=genome_length,
+            settings=settings,
         )
 
         for local_idx, (c_start, c_end, members) in enumerate(comp_spans):
@@ -471,6 +502,7 @@ def detect_chromothripsis(
                     "n_dup": n_dup,
                     "n_h2h": n_h2h,
                     "n_t2t": n_t2t,
+                    "tra_orient_counts": [0, 0, 0, 0],
                     "bps": bps,
                     "pval_chr_enr": pval_chr_enr,
                     "n_tra": 0,
@@ -479,27 +511,39 @@ def detect_chromothripsis(
                 }
             )
 
+    tra_orient_bin = {
+        ("+", "-"): 0,
+        ("-", "+"): 1,
+        ("+", "+"): 2,
+        ("-", "-"): 3,
+    }
+
     # Step 2: Link interchromosomal translocations (TRA) to clusters across chromosomes
-    for c1, p1, c2, p2 in tra_records:
+    for c1, p1, s1, c2, p2, s2 in tra_records:
         matched_1 = [
             idx
             for idx, rc in enumerate(raw_clusters)
             if rc["chrom"] == c1
-            and int(rc["start"]) - tra_margin_bp <= p1 <= int(rc["end"]) + tra_margin_bp
+            and int(rc["start"]) - eff_tra_margin_bp <= p1 <= int(rc["end"]) + eff_tra_margin_bp
         ]
         matched_2 = [
             idx
             for idx, rc in enumerate(raw_clusters)
             if rc["chrom"] == c2
-            and int(rc["start"]) - tra_margin_bp <= p2 <= int(rc["end"]) + tra_margin_bp
+            and int(rc["start"]) - eff_tra_margin_bp <= p2 <= int(rc["end"]) + eff_tra_margin_bp
         ]
+        obin = tra_orient_bin.get((s1, s2)) if (s1 is not None and s2 is not None) else None
         for i1 in matched_1:
             raw_clusters[i1]["n_tra"] = int(raw_clusters[i1]["n_tra"]) + 1
+            if obin is not None:
+                raw_clusters[i1]["tra_orient_counts"][obin] += 1  # type: ignore[index]
             raw_clusters[i1]["partner_chroms"].append(c2)  # type: ignore[attr-defined]
             for i2 in matched_2:
                 raw_clusters[i1]["linked_clusters"].append(str(raw_clusters[i2]["cluster_id"]))  # type: ignore[attr-defined]
         for i2 in matched_2:
             raw_clusters[i2]["n_tra"] = int(raw_clusters[i2]["n_tra"]) + 1
+            if obin is not None:
+                raw_clusters[i2]["tra_orient_counts"][obin] += 1  # type: ignore[index]
             raw_clusters[i2]["partner_chroms"].append(c1)  # type: ignore[attr-defined]
             for i1 in matched_1:
                 raw_clusters[i2]["linked_clusters"].append(str(raw_clusters[i1]["cluster_id"]))  # type: ignore[attr-defined]
@@ -518,7 +562,9 @@ def detect_chromothripsis(
             ov_mask = (cn_ch["end"].to_numpy() >= c_start) & (cn_ch["start"].to_numpy() <= c_end)
             cn_sub = cn_ch.loc[ov_mask]
             n_cn_seg = len(cn_sub)
-            osc_2, osc_3 = max_oscillating_cn_segments(cn_sub["total_cn"].to_numpy())
+            osc_2, osc_3 = max_oscillating_cn_segments(
+                cn_sub["total_cn"].to_numpy(), settings=settings
+            )
             n_loh = int(np.sum(cn_sub["is_loh"].to_numpy()))
             inter_loh = bool(n_loh >= 1 and n_loh < n_cn_seg)
         else:
@@ -534,8 +580,13 @@ def detect_chromothripsis(
         n_interleaved = int(rc["n_interleaved"])
         n_tra = int(rc["n_tra"])
 
-        p_joins = pval_fragment_joins([n_del, n_dup, n_h2h, n_t2t], method=joins_method)
-        p_exp = pval_exp_cluster(rc["bps"], method=exp_cluster_method)  # type: ignore[arg-type]
+        join_counts = [n_del, n_dup, n_h2h, n_t2t]
+        if settings == "R_default":
+            t_orients = rc["tra_orient_counts"]  # type: ignore[assignment]
+            join_counts = [join_counts[i] + int(t_orients[i]) for i in range(4)]
+
+        p_joins = pval_fragment_joins(join_counts, method=joins_method)
+        p_exp = pval_exp_cluster(rc["bps"], method=exp_cluster_method, settings=settings)  # type: ignore[arg-type]
         p_enr = float(rc["pval_chr_enr"])
 
         tier = classify_chromothripsis(
