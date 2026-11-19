@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qdnaseq"
+version = "0.1.0"
+description = "Clean-room Python implementation of QDNAseq (Scheinin et al., Genome Research 2014) and ACE (Poell et al., Bioinformatics 2019) for shallow/low-pass WGS and cfDNA copy-number calling and reference-free cellularity/ploidy estimation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Yutaro Tanaka"}]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "pysam>=0.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qdnaseq*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
