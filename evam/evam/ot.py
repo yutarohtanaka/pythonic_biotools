@@ -63,8 +63,8 @@ def _error_weights(
     for i in range(1, m):
         pj, pi = md[parent[i]], md[i]
         est[i] = (obs_w[i] * pj - epos * (pi + pj) + epos ** 2) / ((pj - epos) * (1 - eneg - epos))
-    if (est[1:] >= 1).any() or not np.isfinite(est).all():
-        raise ValueError("edge probability >= 1")
+    if (est[1:] < 0).any() or (est[1:] >= 1).any() or not np.isfinite(est).all():
+        raise ValueError("edge probability outside [0, 1)")
     return est
 
 

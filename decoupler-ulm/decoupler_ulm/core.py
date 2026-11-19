@@ -9,8 +9,95 @@ to `decoupler.run_ulm`), `log2_dot`, and `top_k_zscore` projections.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
+from scipy import stats
+
+
+def _compute_gene_zscores(X_log: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """NaN-safe gene-wise Z-score across samples (or within-sample across genes if n_samples == 1)."""
+    n_genes, n_samples = X_log.shape
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        if n_samples == 1:
+            finite = np.isfinite(X_log[:, 0])
+            if int(finite.sum()) < 2:
+                return np.full_like(X_log, np.nan), np.zeros(n_genes, dtype=bool)
+            mu = float(np.nanmean(X_log[:, 0]))
+            sd = float(np.nanstd(X_log[:, 0], ddof=1))
+            if not np.isfinite(sd) or sd <= 1e-12:
+                Z = np.where(np.isfinite(X_log), 0.0, np.nan)
+                return Z, np.zeros(n_genes, dtype=bool)
+            Z = np.where(np.isfinite(X_log), (X_log - mu) / sd, np.nan)
+            return Z, finite
+
+        n_obs = np.sum(np.isfinite(X_log), axis=1)
+        g_mean = np.nanmean(X_log, axis=1, keepdims=True)
+        g_std = np.nanstd(X_log, axis=1, ddof=1, keepdims=True)
+        valid_g = (n_obs >= 2) & np.isfinite(g_std.ravel()) & (g_std.ravel() > 1e-12)
+
+        Z = np.where(np.isfinite(X_log), 0.0, np.nan)
+        if np.any(valid_g):
+            Z[valid_g] = (X_log[valid_g] - g_mean[valid_g]) / g_std[valid_g]
+        return Z, valid_g
+
+
+def _ols_ulm_tstat_and_pvals(
+    Y: np.ndarray,
+    W: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute exact per-(sample, program) OLS t-statistics and two-sided Student-t p-values."""
+    n_genes, n_samples = Y.shape
+    _, n_programs = W.shape
+
+    if np.all(np.isfinite(Y)) and np.all(np.isfinite(W)):
+        if n_genes < 3:
+            raise ValueError("Need at least 3 shared genes for ULM regression.")
+        df = float(n_genes - 2)
+        yc = Y - Y.mean(axis=0, keepdims=True)
+        wc = W - W.mean(axis=0, keepdims=True)
+        y_ss = (yc**2).sum(axis=0)
+        w_ss = (wc**2).sum(axis=0)
+        denom = np.sqrt(np.maximum(y_ss[:, None] * w_ss[None, :], 1e-300))
+        zero_var = (y_ss[:, None] <= 1e-24) | (w_ss[None, :] <= 1e-24)
+        r_mat = np.where(zero_var, 0.0, (yc.T @ wc) / denom)
+        r_mat = np.clip(r_mat, -1.0 + 1e-12, 1.0 - 1e-12)
+        t_mat = r_mat * np.sqrt(df / np.maximum(1.0 - r_mat**2, 1e-24))
+        p_mat = 2.0 * stats.t.sf(np.abs(t_mat), df=df)
+        return t_mat, p_mat
+
+    t_mat = np.full((n_samples, n_programs), np.nan, dtype=np.float64)
+    p_mat = np.full((n_samples, n_programs), np.nan, dtype=np.float64)
+    fin_y = np.isfinite(Y)
+    fin_w = np.isfinite(W)
+
+    for s_idx in range(n_samples):
+        ys = Y[:, s_idx]
+        fy = fin_y[:, s_idx]
+        for p_idx in range(n_programs):
+            mask = fy & fin_w[:, p_idx]
+            n_m = int(mask.sum())
+            if n_m < 3:
+                continue
+            yv = ys[mask]
+            wv = W[mask, p_idx]
+            yc = yv - float(yv.mean())
+            wc = wv - float(wv.mean())
+            y_ss = float(np.sum(yc * yc))
+            w_ss = float(np.sum(wc * wc))
+            if y_ss <= 1e-24 or w_ss <= 1e-24:
+                t_mat[s_idx, p_idx] = 0.0
+                p_mat[s_idx, p_idx] = 1.0
+                continue
+            r = float(np.clip(np.sum(yc * wc) / np.sqrt(y_ss * w_ss), -1.0 + 1e-12, 1.0 - 1e-12))
+            df = float(n_m - 2)
+            t_val = r * np.sqrt(df / max(1.0 - r * r, 1e-24))
+            t_mat[s_idx, p_idx] = t_val
+            p_mat[s_idx, p_idx] = float(2.0 * stats.t.sf(abs(t_val), df=df))
+
+    return t_mat, p_mat
 
 
 def project_gep_programs(
@@ -19,7 +106,10 @@ def project_gep_programs(
     is_log_transformed: bool = False,
     top_k_markers: int = 50,
     method: str = "ulm_tstat",
-) -> pd.DataFrame:
+    center_across_samples: bool = False,
+    zscore_genes: bool | None = None,
+    return_pvalues: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Project continuous gene-program weights (`genes x programs`) onto an expression matrix (`genes x samples`).
 
     Parameters
@@ -29,11 +119,23 @@ def project_gep_programs(
     program_weights_genes_by_programs : DataFrame (genes x programs)
         Continuous cNMF / NMF gene spectra / meta-gene weights.
     method : {'ulm_tstat', 'log2_dot', 'top_k_zscore'}
-        - `'ulm_tstat'`: Regresses gene-wise Z-scored log2 expression on continuous program weights
-          and returns the exact ordinary-least-squares t-statistic (`samples x programs`).
-        - `'log2_dot'`: Matrix product of log2 expression with L1-normalized positive weights.
-        - `'top_k_zscore'`: Mean gene-wise Z-score across the top-`top_k_markers` weighted genes per program.
+        - `'ulm_tstat'`: Regresses sample log2 expression (exact single-sample `decoupler.run_ulm` mode
+          when `center_across_samples=False`, or gene-wise Z-scored expression across samples when
+          `center_across_samples=True`) on continuous program weights and returns the exact OLS t-statistic.
+        - `'log2_dot'`: NaN-safe L1-renormalized matrix product of log2 expression with positive weights.
+        - `'top_k_zscore'`: NaN-safe mean gene-wise Z-score across the top-`top_k_markers` weighted genes.
+    center_across_samples : bool, default False
+        When `False` (default), `'ulm_tstat'` runs directly on each sample's log-expression vector
+        independently (`decoupler.run_ulm`-exact, supporting `n_samples == 1`). When `True`, genes are
+        first Z-scored across samples (`ddof=1`).
+    zscore_genes : bool, optional
+        Backward-compatible alias for `center_across_samples` if explicitly supplied.
+    return_pvalues : bool, default False
+        When `True`, returns `(scores_df, pvalues_df)`.
     """
+    if zscore_genes is not None:
+        center_across_samples = bool(zscore_genes)
+
     expr = expr_genes_by_samples.copy().astype(np.float64)
     weights = program_weights_genes_by_programs.copy().astype(np.float64)
     expr.index = expr.index.astype(str).str.upper()
@@ -46,48 +148,71 @@ def project_gep_programs(
     if len(shared_genes) < 10:
         raise ValueError(f"Fewer than 10 shared genes ({len(shared_genes)}) between expression and program weights.")
 
-    X_log = expr.loc[shared_genes].to_numpy(dtype=np.float64)
-    if not is_log_transformed:
-        X_log = np.log2(np.maximum(X_log, 0.0) + 1.0)
+    X_raw = expr.loc[shared_genes].to_numpy(dtype=np.float64)
+    if is_log_transformed:
+        X_log = X_raw
+    else:
+        X_log = np.where(np.isfinite(X_raw), np.log2(np.maximum(X_raw, 0.0) + 1.0), np.nan)
     W = weights.loc[shared_genes].to_numpy(dtype=np.float64)  # (G, P)
     samples = list(expr.columns)
     programs = list(weights.columns)
 
     if method == "log2_dot":
-        w_pos = np.maximum(W, 0.0)
-        w_norm = w_pos / np.maximum(w_pos.sum(axis=0, keepdims=True), 1e-12)
-        scores = X_log.T @ w_norm  # (S, P)
+        if return_pvalues:
+            raise ValueError("return_pvalues=True is not supported for method='log2_dot'.")
+        w_pos = np.where(np.isfinite(W) & (W > 0.0), W, 0.0)
+        finite_x = np.isfinite(X_log)
+        X_zero = np.where(finite_x, X_log, 0.0)
+        num = X_zero.T @ w_pos  # (S, P)
+        den = finite_x.astype(np.float64).T @ w_pos  # (S, P)
+        any_obs_sample = finite_x.any(axis=0)[:, None]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            scores = np.where(den > 1e-12, num / np.maximum(den, 1e-12), np.where(any_obs_sample, 0.0, np.nan))
         return pd.DataFrame(scores, index=samples, columns=programs)
-
-    # Gene-wise Z-score across samples: (G, S)
-    g_mean = X_log.mean(axis=1, keepdims=True)
-    g_std = X_log.std(axis=1, ddof=1, keepdims=True)
-    valid_g = (g_std.ravel() > 1e-12)
-    Z = np.zeros_like(X_log)
-    Z[valid_g] = (X_log[valid_g] - g_mean[valid_g]) / g_std[valid_g]
 
     if method == "top_k_zscore":
-        scores = np.zeros((len(samples), len(programs)), dtype=np.float64)
-        k_eff = min(top_k_markers, len(shared_genes))
+        Z, _ = _compute_gene_zscores(X_log)
+        scores = np.full((len(samples), len(programs)), np.nan, dtype=np.float64)
+        pvals = np.full((len(samples), len(programs)), np.nan, dtype=np.float64)
         for p_i in range(len(programs)):
-            top_idx = np.argsort(-W[:, p_i])[:k_eff]
-            scores[:, p_i] = Z[top_idx, :].mean(axis=0)
-        return pd.DataFrame(scores, index=samples, columns=programs)
+            w_col = W[:, p_i]
+            fin_idx = np.flatnonzero(np.isfinite(w_col))
+            if fin_idx.size == 0:
+                continue
+            k_eff = min(top_k_markers, fin_idx.size)
+            top_idx = fin_idx[np.argsort(-w_col[fin_idx], kind="mergesort")[:k_eff]]
+            Z_top = Z[top_idx, :]
+            n_k = np.sum(np.isfinite(Z_top), axis=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                mean_z = np.nanmean(Z_top, axis=0)
+            scores[:, p_i] = np.where(n_k >= 1, mean_z, np.nan)
+            if return_pvalues:
+                pvals[:, p_i] = np.where(n_k >= 1, 2.0 * stats.norm.sf(np.abs(mean_z) * np.sqrt(n_k)), np.nan)
+        scores_df = pd.DataFrame(scores, index=samples, columns=programs)
+        if return_pvalues:
+            return scores_df, pd.DataFrame(pvals, index=samples, columns=programs)
+        return scores_df
 
     if method == "ulm_tstat":
-        Z_sub = Z[valid_g, :]  # (G_val, S)
-        W_sub = W[valid_g, :]  # (G_val, P)
-        g_cnt = Z_sub.shape[0]
-        if g_cnt < 5:
-            raise ValueError("Fewer than 5 variable genes across samples for ULM regression.")
-        df = g_cnt - 2
-        zc = Z_sub - Z_sub.mean(axis=0, keepdims=True)
-        wc = W_sub - W_sub.mean(axis=0, keepdims=True)
-        z_norm = np.sqrt(np.maximum((zc**2).sum(axis=0), 1e-300))  # (S,)
-        w_norm = np.sqrt(np.maximum((wc**2).sum(axis=0), 1e-300))  # (P,)
-        r_mat = (zc.T @ wc) / (z_norm[:, None] * w_norm[None, :])   # (S, P)
-        r_mat = np.clip(r_mat, -0.9999999, 0.9999999)
-        t_mat = r_mat * np.sqrt(df / (1.0 - r_mat**2))
-        return pd.DataFrame(t_mat, index=samples, columns=programs)
+        if center_across_samples:
+            if X_log.shape[1] < 2:
+                raise ValueError("center_across_samples=True requires at least 2 samples.")
+            Z, valid_g = _compute_gene_zscores(X_log)
+            if int(valid_g.sum()) < 5:
+                raise ValueError("Fewer than 5 variable genes across samples for centered ULM regression.")
+            Y_reg = Z[valid_g, :]
+            W_reg = W[valid_g, :]
+        else:
+            Y_reg = X_log
+            W_reg = W
+            if Y_reg.shape[0] < 5:
+                raise ValueError("Fewer than 5 shared genes for ULM regression.")
+
+        t_mat, p_mat = _ols_ulm_tstat_and_pvals(Y_reg, W_reg)
+        scores_df = pd.DataFrame(t_mat, index=samples, columns=programs)
+        if return_pvalues:
+            return scores_df, pd.DataFrame(p_mat, index=samples, columns=programs)
+        return scores_df
 
     raise ValueError(f"Unsupported method {method!r}; choose from 'ulm_tstat', 'log2_dot', 'top_k_zscore'.")

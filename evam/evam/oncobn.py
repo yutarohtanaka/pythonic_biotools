@@ -3,10 +3,10 @@ Model re-implemented from the paper and checked against the OncoBN R package's l
 of the EvAM-Tools `do_OncoBN` interface (Diaz-Uriarte & Herrera-Nieto, AGPL-3.0).
 
 Each event i has a parent set Pa(i) (|Pa| <= k, acyclic; empty means 'hangs from WT'). If the parent condition holds
-(OR for DBN, AND for CBN; always true for WT) then x_i ~ Bernoulli(theta_i), otherwise x_i ~ Bernoulli(epsilon).
-theta_i is the MLE (fraction of samples with condition true and x_i = 1). Score = log-likelihood; structure search
-is exact DP over subsets (search='dp', n <= ~14) or, for larger n, exhaustive parent sets under the order of
-decreasing frequency (search='freq_order').
+(OR for DBN, AND for CBN; always true for WT) then x_i ~ Bernoulli(theta_i), otherwise x_i ~ Bernoulli(epsilon),
+subject to the progression positivity constraint theta_i > epsilon (Nicol et al., 2021).
+Score = penalized log-likelihood (default BIC penalty `-0.5 * log(N) * |Pa(i)|`); structure search is exact DP
+over subsets (search='dp', n <= ~14) or exhaustive parent sets under decreasing frequency (search='freq_order').
 """
 from __future__ import annotations
 
@@ -41,9 +41,13 @@ def fit_oncobn(
     k: int = 3,
     epsilon: float | None = None,
     search: str | None = None,
+    penalty: str = "bic",
 ) -> EvamResult:
     if model not in ("DBN", "CBN"):
         raise ValueError("model must be DBN or CBN")
+    if penalty not in ("bic", "aic", "none"):
+        raise ValueError(f"penalty must be 'bic', 'aic', or 'none', got {penalty!r}")
+
     X = check_binary(X)
     events = list(X.columns)
     A = X.to_numpy()
@@ -53,14 +57,29 @@ def fit_oncobn(
     search = search or ("dp" if n <= 14 else "freq_order")
     agg = (lambda cols: A[:, cols].any(1)) if model == "DBN" else (lambda cols: A[:, cols].all(1))
 
-    cache: dict[tuple[int, tuple[int, ...]], tuple[float, float]] = {}
+    if penalty == "bic":
+        edge_pen = 0.5 * float(np.log(max(N, 1)))
+    elif penalty == "aic":
+        edge_pen = 1.0
+    else:
+        edge_pen = 0.0
 
-    def local(i: int, P: tuple[int, ...]) -> tuple[float, float]:
+    raw_cache: dict[tuple[int, tuple[int, ...]], tuple[float, float]] = {}
+
+    def local_raw(i: int, P: tuple[int, ...]) -> tuple[float, float]:
         key = (i, P)
-        if key not in cache:
+        if key not in raw_cache:
             cond = np.ones(N, bool) if len(P) == 0 else agg(list(P))
-            cache[key] = _local(A[:, i], cond, eps)
-        return cache[key]
+            raw_cache[key] = _local(A[:, i], cond, eps)
+        return raw_cache[key]
+
+    def local_scored(i: int, P: tuple[int, ...]) -> float:
+        ll, theta = local_raw(i, P)
+        if len(P) > 0:
+            if not (theta > eps):
+                return float("-inf")
+            ll -= edge_pen * len(P)
+        return ll
 
     parents: dict[int, tuple[int, ...]] = {}
     if search == "dp":
@@ -72,10 +91,10 @@ def fit_oncobn(
             if key in best_local:
                 return best_local[key]
             members = [j for j in range(n) if (U >> j) & 1]
-            bs, bp = local(i, ())[0], ()
+            bs, bp = local_scored(i, ()), ()
             for r in range(1, min(k, len(members)) + 1):
                 for P in itertools.combinations(members, r):
-                    s = local(i, P)[0]
+                    s = local_scored(i, P)
                     if s > bs + 1e-12:
                         bs, bp = s, P
             best_local[key] = (bs, bp)
@@ -100,32 +119,35 @@ def fit_oncobn(
             assert v is not None and P is not None
             parents[v] = P
             S &= ~(1 << v)
-        total = score[full][0]
+        total_score = score[full][0]
     elif search == "freq_order":
         order_idx = np.argsort(-A.mean(0), kind="stable")
-        total = 0.0
+        total_score = 0.0
         for pos, i in enumerate(order_idx):
             members = [int(x) for x in order_idx[:pos]]
-            bs, bp = local(int(i), ())[0], ()
+            bs, bp = local_scored(int(i), ()), ()
             for r in range(1, min(k, len(members)) + 1):
                 for P in itertools.combinations(members, r):
-                    s = local(int(i), P)[0]
+                    s = local_scored(int(i), P)
                     if s > bs + 1e-12:
                         bs, bp = s, P
             parents[int(i)] = bp
-            total += bs
+            total_score += bs
     else:
         raise ValueError(f"Unsupported search={search!r}; expected 'dp' or 'freq_order'")
 
     thetas, rows, pdict = {}, [], {}
+    raw_loglik = 0.0
     for i in range(n):
         P = tuple(parents[i])
-        thetas[events[i]] = local(i, P)[1]
+        ll_i, th_i = local_raw(i, P)
+        raw_loglik += ll_i
+        thetas[events[i]] = th_i
         pdict[events[i]] = [events[j] for j in P] or ["Root"]
         for j in P or ():
-            rows.append((events[j], events[i], thetas[events[i]]))
+            rows.append((events[j], events[i], th_i))
         if not P:
-            rows.append(("Root", events[i], thetas[events[i]]))
+            rows.append(("Root", events[i], th_i))
     edges = pd.DataFrame(rows, columns=["From", "To", "weight"])
     order = structural_order(
         events,
@@ -137,6 +159,14 @@ def fit_oncobn(
         events,
         edges,
         order,
-        model=dict(parents=pdict, theta=thetas, epsilon=eps, loglik=float(total), k=k),
-        meta=dict(order_route="structural", search=search),
+        model=dict(
+            parents=pdict,
+            theta=thetas,
+            epsilon=eps,
+            loglik=float(raw_loglik),
+            score=float(total_score),
+            penalty=penalty,
+            k=k,
+        ),
+        meta=dict(order_route="structural", search=search, penalty=penalty),
     )

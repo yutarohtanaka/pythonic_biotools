@@ -9,7 +9,7 @@ description = "Univariate Linear Model (ULM), log2-dot, and top-k z-score gene-p
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["numpy>=1.24", "pandas>=2.0"]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "pandas>=2.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["decoupler_ulm"]

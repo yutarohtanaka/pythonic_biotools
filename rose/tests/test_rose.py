@@ -1,6 +1,13 @@
 from __future__ import annotations
+
+import sys
+import types
+
 import pandas as pd
-from rose import call_rose_super_enhancers
+import pytest
+
+from rose import call_rose_super_enhancers, load_bed_intervals
+
 
 def test_rose_super_enhancer_stitching_and_threshold():
     tss_df = pd.DataFrame([{"chrom": "chr8", "tss": 127_736_000, "gene_name": "GENE_A", "gene_type": "protein_coding"}])
@@ -16,3 +23,98 @@ def test_rose_super_enhancer_stitching_and_threshold():
     res = call_rose_super_enhancers(pd.DataFrame(peaks), tss_df=tss_df, stitch_bp=12_500, tss_exclusion_bp=2_500)
     assert len(res.stitched_regions) == 41
     assert res.super_enhancers.iloc[0]["n_constituent_peaks"] == 3
+
+
+def test_rose_broad_promoter_exclusion_flat_signal_and_merged_blacklist(tmp_path, monkeypatch):
+    # 1. Missing bigWig / control bigWig must raise FileNotFoundError instead of silently falling back to SPM
+    peaks_min = pd.DataFrame([{"chrom": "chr1", "start": 10_000, "end": 11_000, "score": 20.0}])
+    with pytest.raises(FileNotFoundError, match="bigwig_path"):
+        call_rose_super_enhancers(peaks_min, bigwig_path=tmp_path / "nonexistent_chip.bw")
+
+    chip_bw = tmp_path / "chip.bw"
+    chip_bw.write_bytes(b"stub")
+    with pytest.raises(FileNotFoundError, match="control_bigwig_path"):
+        call_rose_super_enhancers(peaks_min, bigwig_path=chip_bw, control_bigwig_path=tmp_path / "missing_ctrl.bw")
+    with pytest.raises(ValueError, match="control_bigwig_path requires bigwig_path"):
+        call_rose_super_enhancers(peaks_min, control_bigwig_path=chip_bw)
+
+    # 2. Control bigWig subtraction via mocked pyBigWig
+    ctrl_bw = tmp_path / "ctrl.bw"
+    ctrl_bw.write_bytes(b"stub")
+
+    class _FakeBW:
+        def __init__(self, path: str):
+            self.is_ctrl = "ctrl" in path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stats(self, chrom: str, s: int, e: int, type: str = "mean"):
+            if self.is_ctrl:
+                return [2.0]
+            return [20.0 if chrom == "chr8" else 2.5]
+
+    fake_mod = types.ModuleType("pyBigWig")
+    fake_mod.open = lambda p: _FakeBW(p)
+    monkeypatch.setitem(sys.modules, "pyBigWig", fake_mod)
+
+    bw_peaks = pd.DataFrame(
+        [{"chrom": "chr8", "start": 100_000, "end": 110_000, "score": 1.0}]
+        + [{"chrom": "chr1", "start": 1_000_000 + i * 50_000, "end": 1_001_000 + i * 50_000, "score": 1.0} for i in range(25)]
+    )
+    res_bw = call_rose_super_enhancers(bw_peaks, bigwig_path=chip_bw, control_bigwig_path=ctrl_bw)
+    assert res_bw.signal_unit == "bp_x_bigwig_bg_subtracted"
+    assert len(res_bw.super_enhancers) == 1
+    assert res_bw.super_enhancers.iloc[0]["signal"] == pytest.approx(10_000 * (20.0 - 2.0))
+
+    # 3. Broad promoter peak (width 6 kb > 2.5 kb) overlapping TSS must be excluded by default so flanking
+    # distal enhancers (16 kb apart without the promoter bridge) do NOT stitch across the TSS!
+    tss_df = pd.DataFrame([{"chrom": "chr2", "tss": 500_000, "gene_name": "MYGENE"}])
+    promoter_bridge_peaks = pd.DataFrame(
+        [
+            {"chrom": "chr2", "start": 491_000, "end": 492_000, "score": 50.0},  # upstream enhancer
+            {"chrom": "chr2", "start": 497_000, "end": 503_000, "score": 400.0},  # 6 kb broad promoter spanning TSS
+            {"chrom": "chr2", "start": 508_000, "end": 509_000, "score": 50.0},  # downstream enhancer (508k - 492k = 16k > 12.5k!)
+        ]
+    )
+    res_excl = call_rose_super_enhancers(promoter_bridge_peaks, tss_df=tss_df, stitch_bp=12_500, tss_exclusion_bp=2_500)
+    assert len(res_excl.stitched_regions) == 2  # separated into 2 distal enhancers!
+    res_allow = call_rose_super_enhancers(
+        promoter_bridge_peaks,
+        tss_df=tss_df,
+        stitch_bp=12_500,
+        tss_exclusion_bp=2_500,
+        allow_broad_promoter_peaks=True,
+    )
+    assert len(res_allow.stitched_regions) == 1  # stitched into 1 domain when broad promoter peak is kept
+
+    # 4. Flat constant signals must call ZERO super-enhancers (strict sig > cutoff_val)
+    flat_peaks = pd.DataFrame(
+        [{"chrom": "chr1", "start": 100_000 + i * 50_000, "end": 101_000 + i * 50_000, "score": 25.0} for i in range(30)]
+    )
+    res_flat = call_rose_super_enhancers(flat_peaks)
+    assert len(res_flat.super_enhancers) == 0
+
+    # 5. load_bed_intervals merges overlapping intervals & >5 Mb wide centromeric blacklist blocks work cleanly
+    bl_df = pd.DataFrame(
+        [
+            {"chrom": "chr1", "start": 100, "end": 500},
+            {"chrom": "chr1", "start": 300, "end": 12_000_000},  # 12 Mb wide block (> 5 Mb!)
+            {"chrom": "chr1", "start": 15_000_000, "end": 15_001_000},
+        ]
+    )
+    merged = load_bed_intervals(bl_df)
+    assert merged["chr1"] == [(100, 12_000_000), (15_000_000, 15_001_000)]
+
+    test_peaks_bl = pd.DataFrame(
+        [
+            {"chrom": "chr1", "start": 11_500_000, "end": 11_500_500, "score": 100.0},  # 11.5 Mb inside wide blacklist!
+            {"chrom": "chr1", "start": 13_000_000, "end": 13_000_500, "score": 100.0},  # outside blacklist
+        ]
+    )
+    res_bl = call_rose_super_enhancers(test_peaks_bl, blacklist=bl_df)
+    assert len(res_bl.stitched_regions) == 1
+    assert int(res_bl.stitched_regions.iloc[0]["start"]) == 13_000_000

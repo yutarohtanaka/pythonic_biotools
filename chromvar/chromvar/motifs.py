@@ -102,12 +102,27 @@ def build_log_odds_pwm(
     pseudocount: float = 0.01,
     bg_probs: Sequence[float] = (0.25, 0.25, 0.25, 0.25),
 ) -> np.ndarray:
-    """Convert a `(K, 4)` Position Frequency Matrix (`A, C, G, T`) into a log2-odds PWM."""
+    """Convert a `(K, 4)` Position Frequency Matrix (`A, C, G, T`) into a scale-invariant log2-odds PWM.
+
+    Normalizes each position's base counts/frequencies to probabilities summing to 1.0 before adding
+    `pseudocount`, so raw JASPAR count matrices and normalized probability matrices produce identical PWMs.
+    """
     arr = np.asarray(pfm, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 4:
         raise ValueError(f"Expected PFM of shape (K, 4) for [A, C, G, T], got {arr.shape}.")
+    if np.any(~np.isfinite(arr)) or np.any(arr < 0.0):
+        raise ValueError("PFM entries must be finite and non-negative.")
+    row_sums = arr.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("Each position in PFM must have positive total frequency/count.")
+
     bg = np.asarray(bg_probs, dtype=np.float64).reshape(1, 4)
-    probs = (arr + pseudocount) / (arr.sum(axis=1, keepdims=True) + 4.0 * pseudocount)
+    if np.any(bg <= 0.0):
+        raise ValueError("Background base probabilities must be strictly positive.")
+    bg = bg / bg.sum()
+
+    p_norm = arr / row_sums
+    probs = (p_norm + pseudocount) / (1.0 + 4.0 * pseudocount)
     return np.log2(probs / bg)
 
 
@@ -126,10 +141,46 @@ def score_kmer_strand_max(kmer: str, pwm: np.ndarray) -> tuple[float, str]:
 
 
 def compute_variant_pwm_disruption(ref_kmer: str, alt_kmer: str, pwm: np.ndarray) -> float:
-    r"""Compute $\Delta S_{\text{PWM}} = S_{\text{PWM}}(\text{Alt}) - S_{\text{PWM}}(\text{Ref})$."""
-    s_ref, _ = score_kmer_strand_max(ref_kmer, pwm)
-    s_alt, _ = score_kmer_strand_max(alt_kmer, pwm)
-    return float(s_alt - s_ref)
+    r"""Compute $\Delta S_{\text{PWM}} = \max_w S_{\text{PWM}}(\text{Alt}_w) - \max_w S_{\text{PWM}}(\text{Ref}_w)$
+    across all $k$-mer windows overlapping the variant.
+
+    Accepts exact length-$k$ sequences or longer flanking sequences (`len >= k`, e.g. `2k - 1` bp centered
+    on a SNV or indel) and evaluates all $k$-mer windows spanning the altered allele.
+    """
+    k = pwm.shape[0]
+    ref_up = ref_kmer.upper()
+    alt_up = alt_kmer.upper()
+    if len(ref_up) < k or len(alt_up) < k:
+        raise ValueError(
+            f"ref_kmer ({len(ref_up)} bp) and alt_kmer ({len(alt_up)} bp) must have length >= PWM length ({k})."
+        )
+
+    if len(ref_up) == k and len(alt_up) == k:
+        s_ref, _ = score_kmer_strand_max(ref_up, pwm)
+        s_alt, _ = score_kmer_strand_max(alt_up, pwm)
+        return float(s_alt - s_ref)
+
+    if ref_up == alt_up:
+        return 0.0
+
+    # Identify common flanking prefix & suffix so only k-mer windows overlapping the variant are scored
+    min_len = min(len(ref_up), len(alt_up))
+    p_len = 0
+    while p_len < min_len and ref_up[p_len] == alt_up[p_len]:
+        p_len += 1
+    s_len = 0
+    while s_len < (min_len - p_len) and ref_up[len(ref_up) - 1 - s_len] == alt_up[len(alt_up) - 1 - s_len]:
+        s_len += 1
+
+    def _max_overlapping_score(seq: str) -> float:
+        start_i = max(0, p_len - k + 1)
+        last_i = min(len(seq) - k, max(0, len(seq) - s_len - 1))
+        if last_i < start_i:
+            start_i = min(start_i, len(seq) - k)
+            last_i = start_i
+        return max(score_kmer_strand_max(seq[i : i + k], pwm)[0] for i in range(start_i, last_i + 1))
+
+    return float(_max_overlapping_score(alt_up) - _max_overlapping_score(ref_up))
 
 
 def scan_sequence_pwm(

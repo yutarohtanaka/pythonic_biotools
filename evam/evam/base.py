@@ -102,9 +102,12 @@ def ctmc_order_mc(rate_fn, n: int, n_paths: int = 4000, seed: int = 0) -> np.nda
 def structural_order(events: list[str], parents: dict, semantics: str) -> pd.DataFrame:
     """parents[e] = list of parent events (empty/['Root'] -> hangs from Root). semantics 'and' (tree/CBN: all parents
     needed -> a precedes b iff a is an ancestor) or 'or' (a precedes b iff a dominates b: every Root->b path hits a)."""
+    if semantics not in ("and", "or"):
+        raise ValueError(f"semantics must be 'and' or 'or', got {semantics!r}")
     pa = {e: [p for p in parents.get(e, []) if p != "Root"] for e in events}
     o = empty_order(events)
     anc: dict[str, set[str]] = {}
+    dom: dict[str, set[str]] = {}
 
     def ancestors(e: str, stack: tuple[str, ...] = ()) -> set[str]:
         if e in anc:
@@ -117,11 +120,23 @@ def structural_order(events: list[str], parents: dict, semantics: str) -> pd.Dat
         anc[e] = out
         return out
 
-    def dominators(e: str) -> set[str]:
+    def dominators(e: str, stack: tuple[str, ...] = ()) -> set[str]:
+        if e in dom:
+            return dom[e]
+        if e in stack:
+            raise ValueError("cycle in restriction graph")
         if not pa[e]:
-            return set()
-        sets = [({p} | dominators(p)) for p in pa[e]]
-        return set.intersection(*sets)
+            dom[e] = set()
+            return dom[e]
+        sets = [({p} | dominators(p, stack + (e,))) for p in pa[e]]
+        dom[e] = set.intersection(*sets)
+        return dom[e]
+
+    for ev in events:
+        if semantics == "and":
+            ancestors(ev)
+        else:
+            dominators(ev)
 
     for a in events:
         for b in events:

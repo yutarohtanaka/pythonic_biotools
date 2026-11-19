@@ -18,15 +18,46 @@ import requests
 FIREHOSE_ROOT = "https://gdac.broadinstitute.org/runs/analyses__latest/data"
 
 
+def _safe_extract_tar_member(tar: tarfile.TarFile, member_name: str, dest_root: Path) -> Path:
+    """Safely extract a single regular file from `tar` under `dest_root` (Python 3.10+ compatible)."""
+    root_resolved = dest_root.resolve()
+    dest_path = (dest_root / member_name).resolve()
+    if not dest_path.is_relative_to(root_resolved):
+        raise ValueError(f"Unsafe path traversal detected in tar member: {member_name!r}")
+
+    info = tar.getmember(member_name)
+    if not info.isfile():
+        raise ValueError(f"Refusing to extract non-regular tar member: {member_name!r}")
+
+    src = tar.extractfile(info)
+    if src is None:
+        raise ValueError(f"Unable to read tar member bytes: {member_name!r}")
+    with src:
+        data = src.read()
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(data)
+    return dest_path
+
+
 def download_gistic_peak_files(
     study_code: str,
     run_date: str = "20160128",
     cache_dir: str | Path = "data/firehose_cache",
+    tumor_type_code: str = "TP",
 ) -> tuple[Path, Path]:
-    """Download and cache `amp_genes.conf_99.txt` and `del_genes.conf_99.txt` from Broad Firehose."""
+    """Download and cache `amp_genes.conf_99.txt` and `del_genes.conf_99.txt` from Broad Firehose.
+
+    Parameters
+    ----------
+    study_code : str
+        TCGA / Firehose study code (e.g., `'LUAD'`, `'SKCM'`, `'LAML'`).
+    tumor_type_code : str, default `'TP'`
+        Firehose sample type suffix (`'TP'` primary solid tumor, `'TM'` metastatic e.g. SKCM, `'TB'` blood e.g. LAML).
+    """
     cdir = Path(cache_dir)
     cdir.mkdir(parents=True, exist_ok=True)
-    archive_dir = f"gdac.broadinstitute.org_{study_code}-TP.CopyNumber_Gistic2.Level_4.{run_date}00.0.0"
+    archive_dir = f"gdac.broadinstitute.org_{study_code}-{tumor_type_code}.CopyNumber_Gistic2.Level_4.{run_date}00.0.0"
     amp_path = cdir / archive_dir / "amp_genes.conf_99.txt"
     del_path = cdir / archive_dir / "del_genes.conf_99.txt"
     if amp_path.exists() and del_path.exists():
@@ -37,7 +68,7 @@ def download_gistic_peak_files(
     resp.raise_for_status()
     with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
         for member in (f"{archive_dir}/amp_genes.conf_99.txt", f"{archive_dir}/del_genes.conf_99.txt"):
-            tar.extract(member, path=cdir, filter="data")
+            _safe_extract_tar_member(tar, member, cdir)
     return amp_path, del_path
 
 
