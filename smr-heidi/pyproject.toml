@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smr-heidi"
+version = "0.1.0"
+description = "Python implementation of SMR, HEIDI, and SMR-multi (Zhu et al., Nature Genetics 2016; Wu et al., Nature Communications 2018)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+include = ["smr_heidi*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
