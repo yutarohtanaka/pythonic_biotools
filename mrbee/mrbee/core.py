@@ -7,8 +7,175 @@ filtering horizontal-pleiotropy outliers via iterative IMRP Sidak testing.
 """
 from __future__ import annotations
 
+from typing import Literal
 import numpy as np
 from scipy import optimize, stats
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+
+
+def _huber_rlm_no_intercept(
+    X: np.ndarray,
+    y: np.ndarray,
+    k: float = 1.345,
+    max_iter: int = 20,
+    tol: float = 1e-4,
+) -> np.ndarray:
+    """Huber M-estimation without intercept (`MASS::rlm(y ~ X - 1)` IRLS)."""
+    theta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    for _ in range(max_iter):
+        r = y - X @ theta
+        scale = float(np.median(np.abs(r))) / 0.6744897501960817
+        if scale <= 1e-12:
+            break
+        u = np.abs(r) / scale
+        w = np.where(u <= k, 1.0, k / u)
+        sw = np.sqrt(w)
+        theta_new, _, _, _ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+        denom = max(float(np.linalg.norm(theta)), 1e-12)
+        if float(np.linalg.norm(theta_new - theta)) / denom < tol:
+            theta = theta_new
+            break
+        theta = theta_new
+    return theta
+
+
+def _fit_bee_r_default(
+    bx_mat: np.ndarray,
+    sx_mat: np.ndarray,
+    by_vec: np.ndarray,
+    sy_vec: np.ndarray,
+    r_xx: np.ndarray,
+    r_xy: np.ndarray,
+    pleio_p_thresh: float | None,
+    max_iter: int,
+    tol: float,
+) -> dict:
+    """Upstream `noahlorinczcomi/MRBEE` v1.0.0 (`MRBEE.IMRP.R` / `MRBEE.IMRP.UV.R`) routine."""
+    m, p = bx_mat.shape
+    sy2 = sy_vec ** 2
+
+    # Pre-standardize once up front (fixed weights w_j = 1 / sey_j^2, no overdispersion tau^2)
+    by_std = by_vec / sy_vec
+    bx_std = bx_mat / sy_vec[:, None]
+    sigma_xx = sx_mat[:, :, None] * r_xx[None, :, :] * sx_mat[:, None, :]
+    sigma_xy = sy_vec[:, None] * sx_mat * r_xy[None, :]
+    sigma_xx_std = sigma_xx / sy2[:, None, None]
+    sigma_xy_std = sigma_xy / sy2[:, None]
+
+    def _solve_std(valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        bx_v = bx_std[valid_mask]
+        by_v = by_std[valid_mask]
+        xtx = bx_v.T @ bx_v
+        sum_sxx = np.sum(sigma_xx_std[valid_mask], axis=0)
+        sum_sxy = np.sum(sigma_xy_std[valid_mask], axis=0)
+        xty = bx_v.T @ by_v
+
+        shrink = 1.0
+        h_mat = 0.5 * ((xtx - sum_sxx) + (xtx - sum_sxx).T)
+        ref_scale = max(float(np.trace(xtx)) / max(p, 1), 1e-30)
+        if float(np.linalg.eigvalsh(h_mat).min()) <= 1e-8 * ref_scale:
+            for cand in (0.85, 0.70, 0.50, 0.25, 0.0):
+                h_try = 0.5 * ((xtx - cand * sum_sxx) + (xtx - cand * sum_sxx).T)
+                if float(np.linalg.eigvalsh(h_try).min()) > 1e-8 * ref_scale:
+                    shrink = cand
+                    h_mat = h_try
+                    break
+            else:
+                shrink = 0.0
+                h_mat = xtx + 1e-8 * ref_scale * np.eye(p)
+
+        g_vec = xty - shrink * sum_sxy
+        theta_sol = np.linalg.solve(h_mat, g_vec)
+        return theta_sol, h_mat, shrink
+
+    # Huber RLM initialization + 3 * MAD residual trimming + ||theta||_2 <= 3 ||theta_init||_2 cap
+    theta_init = _huber_rlm_no_intercept(bx_std, by_std)
+    norm_init = float(np.linalg.norm(theta_init))
+    max_norm = 3.0 * norm_init
+
+    def _cap_theta(th: np.ndarray) -> np.ndarray:
+        nrm = float(np.linalg.norm(th))
+        if norm_init > 0.0 and nrm > max_norm:
+            return th * (max_norm / nrm)
+        return th
+
+    r_init = by_std - bx_std @ theta_init
+    mad_r = 1.4826 * float(np.median(np.abs(r_init - np.median(r_init))))
+    if mad_r > 1e-12:
+        init_valid = np.abs(r_init) <= 3.0 * mad_r
+        valid = init_valid if int(init_valid.sum()) > p + 1 else np.ones(m, dtype=bool)
+    else:
+        valid = np.ones(m, dtype=bool)
+
+    theta = theta_init.copy()
+    converged = False
+
+    for it in range(max_iter):
+        theta_old = theta.copy()
+        valid_old = valid.copy()
+        if int(valid.sum()) <= p:
+            break
+
+        theta, _, _ = _solve_std(valid)
+        theta = _cap_theta(theta)
+
+        resid_std = by_std - bx_std @ theta
+        if pleio_p_thresh is not None and pleio_p_thresh > 0.0 and int(valid.sum()) > p + 1:
+            vare = max(float(np.var(resid_std[valid], ddof=1)), 1e-30)
+            q_j = (resid_std ** 2) / vare
+            p_raw = np.clip(stats.chi2.sf(q_j, df=1), 0.0, 1.0)
+            p_adj = -np.expm1(m * np.log1p(-p_raw))
+            new_valid = p_adj >= pleio_p_thresh
+            if int(new_valid.sum()) > p + 1:
+                valid = new_valid
+
+        if it >= 1 and np.array_equal(valid, valid_old) and float(np.max(np.abs(theta - theta_old))) < tol:
+            converged = True
+            break
+
+    if int(valid.sum()) > p:
+        theta, h_mat, shrink = _solve_std(valid)
+        theta = _cap_theta(theta)
+    else:
+        _, h_mat, shrink = _solve_std(np.ones(m, dtype=bool))
+
+    h_inv = np.linalg.pinv(h_mat)
+    bx_v = bx_std[valid]
+    by_v = by_std[valid]
+    sxx_v = sigma_xx_std[valid]
+    sxy_v = sigma_xy_std[valid]
+
+    h_ii = np.einsum("ip,pq,iq->i", bx_v, h_inv, bx_v)
+    lev_denom = np.maximum(1.0 - h_ii, 0.5)
+
+    bx_by_v = bx_v * by_v[:, None] - shrink * sxy_v
+    bx_bx_th_v = bx_v * (bx_v @ theta)[:, None] - shrink * np.einsum("ikl,l->ik", sxx_v, theta)
+    psi_v = (bx_by_v - bx_bx_th_v) / lev_denom[:, None]
+
+    n_val = int(valid.sum())
+    dof_scale = m / max(n_val - p, 1)
+    meat = dof_scale * (psi_v.T @ psi_v)
+    cov_theta = h_inv @ meat @ h_inv.T
+    se = np.sqrt(np.maximum(np.diag(cov_theta), 1e-30))
+    z975 = float(stats.norm.ppf(0.975))
+    pvals = 2.0 * stats.norm.sf(np.abs(theta) / se)
+
+    return dict(
+        b=theta,
+        b_se=se,
+        cov=cov_theta,
+        pval=pvals,
+        b_ci=np.column_stack([theta - z975 * se, theta + z975 * se]),
+        n_snps_used=n_val,
+        n_outliers=int((~valid).sum()),
+        valid_mask=valid,
+        tau2=0.0,
+        converged=bool(converged),
+    )
 
 
 def _estimate_overlap_rho_e(zx: np.ndarray, zy: np.ndarray) -> float:
@@ -51,9 +218,13 @@ def fit_mrbee(
     pleio_p_thresh: float = 0.05,
     max_iter: int = 30,
     tol: float = 1e-6,
-    wc_correct: bool = True,
+    wc_correct: bool | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Fit univariable MRBEE on summary statistics `(xbeta, xse, ybeta, yse)`."""
+    _validate_settings(settings)
+    wc_use = (settings == "default") if wc_correct is None else bool(wc_correct)
+
     xbeta, xse, ybeta, yse = (np.asarray(v, dtype=np.float64) for v in (xbeta, xse, ybeta, yse))
     n_all = len(xbeta)
     zx_all = xbeta / xse
@@ -66,7 +237,7 @@ def fit_mrbee(
         idx = idx[np.abs(zx_all[idx]) >= c_thresh]
     else:
         min_abs_z = float(np.min(np.abs(zx_all[idx]))) if len(idx) > 0 else 0.0
-        c_thresh = min_abs_z if (wc_correct and min_abs_z >= 3.0 and len(idx) < 0.8 * n_all) else 0.0
+        c_thresh = min_abs_z if (wc_use and min_abs_z >= 3.0 and len(idx) < 0.8 * n_all) else 0.0
 
     if len(idx) < 3:
         return dict(
@@ -83,7 +254,37 @@ def fit_mrbee(
         )
 
     xb, xs, yb, ys = xbeta[idx], xse[idx], ybeta[idx], yse[idx]
-    gamma_wc = _wc_factor(xb / xs, c_thresh) if wc_correct else 1.0
+    gamma_wc = _wc_factor(xb / xs, c_thresh) if wc_use else 1.0
+
+    if settings == "R_default":
+        mv_res = _fit_bee_r_default(
+            xb[:, None],
+            (np.sqrt(gamma_wc) * xs)[:, None],
+            yb,
+            ys,
+            np.ones((1, 1), dtype=np.float64),
+            np.array([rho_e_hat], dtype=np.float64),
+            pleio_p_thresh,
+            max_iter,
+            tol,
+        )
+        b_hat = float(mv_res["b"][0])
+        b_se = float(mv_res["b_se"][0])
+        z975 = float(stats.norm.ppf(0.975))
+        pval = float(min(1.0, 2.0 * stats.norm.sf(abs(b_hat) / max(b_se, 1e-300))))
+        return dict(
+            b=b_hat,
+            b_se=b_se,
+            pval=pval,
+            b_ci=[b_hat - z975 * b_se, b_hat + z975 * b_se],
+            n_snps_used=mv_res["n_snps_used"],
+            n_outliers=mv_res["n_outliers"],
+            rho_e=rho_e_hat,
+            gamma_wc=gamma_wc,
+            tau2=0.0,
+            converged=mv_res["converged"],
+        )
+
     sx2_eff = gamma_wc * (xs ** 2)
     sxy_eff = gamma_wc * rho_e_hat * xs * ys
     sy2 = ys ** 2
@@ -175,6 +376,7 @@ def fit_mvmr_bee(
     pleio_p_thresh: float = 0.05,
     max_iter: int = 50,
     tol: float = 1e-6,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Fit Multivariable MRBEE (`MRBEE.IMRP`, Lorincz-Comi et al., AJHG 2024).
 
@@ -190,7 +392,11 @@ def fit_mvmr_bee(
         Instrument-outcome effect sizes and standard errors.
     Rxy : optional (P + 1, P + 1) array_like
         Estimation-error correlation matrix ordered `[X_1, ..., X_P, y]`. Defaults to `I_{P+1}`.
+    settings : {"default", "R_default"}, default "default"
+        `"default"` uses iterative theta-dependent weights with DerSimonian-Laird `tau2`.
+        `"R_default"` matches upstream `noahlorinczcomi/MRBEE` v1.0.0 (`MRBEE.IMRP.R`).
     """
+    _validate_settings(settings)
     bx_mat = np.asarray(bX, dtype=np.float64)
     if bx_mat.ndim == 1:
         bx_mat = bx_mat[:, None]
@@ -216,6 +422,9 @@ def fit_mvmr_bee(
 
     r_xx = r_full[:p, :p]
     r_xy = r_full[:p, p]
+
+    if settings == "R_default":
+        return _fit_bee_r_default(bx_mat, sx_mat, by_vec, sy_vec, r_xx, r_xy, pleio_p_thresh, max_iter, tol)
 
     # Per-SNP error covariances Sigma_XX[j] (m, p, p) and sigma_Xy[j] (m, p)
     sigma_xx = sx_mat[:, :, None] * r_xx[None, :, :] * sx_mat[:, None, :]
