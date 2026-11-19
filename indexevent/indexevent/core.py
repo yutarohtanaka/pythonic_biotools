@@ -6,10 +6,16 @@ for selection on an index trait (`xbeta`).
 """
 from __future__ import annotations
 
+from typing import Literal
 import numpy as np
 from scipy import optimize, stats
 
 _TOL = np.finfo(float).eps ** 0.25
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 
 def _wls(y: np.ndarray, X: np.ndarray, w: np.ndarray):
@@ -114,8 +120,10 @@ def indexevent(
     B: int = 10,
     lambdas: np.ndarray | None = None,
     seed: int = 2018,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Adjust summary statistics for index-event bias (`indexevent::indexevent`)."""
+    _validate_settings(settings)
     if not isinstance(method, str):
         raise ValueError("method must be a string: 'CWLS', 'Hedges-Olkin', or 'Simex'")
     m = method.strip().lower()
@@ -127,10 +135,15 @@ def indexevent(
     prune_idx = np.arange(len(xbeta)) if prune is None else np.asarray(prune, dtype=int)
     xb_raw, xs, yb_raw, ys = xbeta[prune_idx], xse[prune_idx], ybeta[prune_idx], yse[prune_idx]
 
-    # Orient xb >= 0 (using +1 when xb == 0) for exact allele-coding invariance
-    signs = np.where(xb_raw >= 0.0, 1.0, -1.0)
-    xb = xb_raw * signs
-    yb = yb_raw * signs
+    if settings == "R_default":
+        # Upstream indexevent.R fits raw signed WLS without orienting xb >= 0
+        xb = xb_raw
+        yb = yb_raw
+    else:
+        # Orient xb >= 0 (using +1 when xb == 0) for exact allele-coding invariance
+        signs = np.where(xb_raw >= 0.0, 1.0, -1.0)
+        xb = xb_raw * signs
+        yb = yb_raw * signs
     weight = 1.0 / ys ** 2 if weighted else np.ones(len(prune_idx))
 
     coef, _, res, cov = _wls(yb, np.column_stack([np.ones(len(xb)), xb]), weight)

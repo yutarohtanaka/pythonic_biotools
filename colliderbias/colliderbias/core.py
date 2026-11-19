@@ -8,8 +8,14 @@ Provides:
 """
 from __future__ import annotations
 
+from typing import Literal
 import numpy as np
 from scipy import stats
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 
 def _wls(y: np.ndarray, X: np.ndarray, w: np.ndarray):
@@ -53,8 +59,10 @@ def method_cb(
     weighted: str = "1",
     model: str = "ivw",
     rho_overlap: float = 0.0,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Port of `ColliderBias::methodCB` (CWLS estimator)."""
+    _validate_settings(settings)
     if not (np.isfinite(rho_overlap) and abs(rho_overlap) <= 1.0):
         raise ValueError("rho_overlap must be finite and in [-1, 1].")
 
@@ -65,8 +73,8 @@ def method_cb(
     if model_l not in ("ivw", "egger"):
         raise ValueError("model must be 'ivw' or 'egger'")
 
-    # Orient xb >= 0 for coding-invariant Egger regression
-    if model_l == "egger":
+    # Orient xb >= 0 for coding-invariant Egger regression in Pythonic default mode
+    if settings == "default" and model_l == "egger":
         signs = np.where(xb >= 0.0, 1.0, -1.0)
         xb = xb * signs
         yb = yb * signs
@@ -75,13 +83,18 @@ def method_cb(
         weight = 1.0 / (ys ** 2)
         b_raw, b_raw_se, ho = _fit_cwls_given_weights(xb, xs, yb, weight, model_l)
     elif weighted_s == "2":
-        # Iterate slope once from first-order weights so xb == 0 never divides by zero
-        w1 = 1.0 / (ys ** 2)
-        b_raw_1, _, ho_1 = _fit_cwls_given_weights(xb, xs, yb, w1, model_l)
-        b_step1 = b_raw_1 * ho_1
-        v2 = np.maximum(ys ** 2 + (b_step1 ** 2) * (xs ** 2) - 2.0 * b_step1 * rho_overlap * xs * ys, 1e-300)
-        weight = 1.0 / v2
-        b_raw, b_raw_se, ho = _fit_cwls_given_weights(xb, xs, yb, weight, model_l)
+        if settings == "R_default":
+            xb_safe = np.where(xb == 0.0, 1e-12, xb)
+            weight = 1.0 / (ys ** 2 + ((yb / xb_safe) ** 2) * (xs ** 2))
+            b_raw, b_raw_se, ho = _fit_cwls_given_weights(xb, xs, yb, weight, model_l)
+        else:
+            # Iterate slope once from first-order weights so xb == 0 never divides by zero
+            w1 = 1.0 / (ys ** 2)
+            b_raw_1, _, ho_1 = _fit_cwls_given_weights(xb, xs, yb, w1, model_l)
+            b_step1 = b_raw_1 * ho_1
+            v2 = np.maximum(ys ** 2 + (b_step1 ** 2) * (xs ** 2) - 2.0 * b_step1 * rho_overlap * xs * ys, 1e-300)
+            weight = 1.0 / v2
+            b_raw, b_raw_se, ho = _fit_cwls_given_weights(xb, xs, yb, weight, model_l)
     elif weighted_s == "0":
         weight = np.ones(len(prune_idx))
         b_raw, b_raw_se, ho = _fit_cwls_given_weights(xb, xs, yb, weight, model_l)
@@ -95,14 +108,17 @@ def method_cb(
     b_pval = float(2.0 * stats.norm.sf(abs(b) / max(b_se, 1e-300)))
 
     ybeta_adj = ybeta - b * xbeta
-    var_adj = np.maximum(
-        yse ** 2
-        + (b ** 2) * (xse ** 2)
-        + (b_se ** 2) * (xbeta ** 2)
-        + (b_se ** 2) * (xse ** 2)
-        - 2.0 * b * rho_overlap * xse * yse,
-        1e-300,
-    )
+    if settings == "R_default":
+        var_adj = np.maximum(yse ** 2 + (b ** 2) * (xse ** 2), 1e-300)
+    else:
+        var_adj = np.maximum(
+            yse ** 2
+            + (b ** 2) * (xse ** 2)
+            + (b_se ** 2) * (xbeta ** 2)
+            + (b_se ** 2) * (xse ** 2)
+            - 2.0 * b * rho_overlap * xse * yse,
+            1e-300,
+        )
     yse_adj = np.sqrt(var_adj)
     ychisq_adj = (ybeta_adj / yse_adj) ** 2
     return dict(
@@ -152,8 +168,10 @@ def cwbls(
     yse: np.ndarray,
     n_boot: int = 100,
     seed: int | None = None,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Port of `ColliderBias::CWBLS` (`x*` = exposure, `d*` = collider/disease, `y*` = outcome)."""
+    _validate_settings(settings)
     arr = [np.asarray(v, dtype=float) for v in (xbeta, xse, dbeta, dse, ybeta, yse)]
     n = len(arr[0])
     b, beta_d = _cwbls_point(*arr)

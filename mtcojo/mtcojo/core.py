@@ -10,14 +10,27 @@ from __future__ import annotations
 
 from collections import Counter
 import os
+from typing import Literal
 import warnings
 import numpy as np
 import pandas as pd
 from scipy import optimize, stats
 
+SettingsMode = Literal["default", "R_default"]
+
 EPS = 1e-6
 _COMP = {"A": "T", "T": "A", "C": "G", "G": "C"}
 _PALINDROMIC = {"AT", "TA", "CG", "GC"}
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
+
+
+def _is_freq_col(col: str) -> bool:
+    u = col.upper()
+    return u.startswith("FREQ") or u in ("YFREQ", "REF_FREQ") or u.startswith("XFREQ")
 
 
 def _p_from_beta_se(beta: np.ndarray, se: np.ndarray) -> np.ndarray:
@@ -29,14 +42,16 @@ def align_sumstats_to_bim(
     bim_df: pd.DataFrame,
     G: np.ndarray | None = None,
     align_target: str = "bim",
+    settings: SettingsMode = "default",
 ) -> tuple[pd.DataFrame, np.ndarray | None]:
     """Match summary statistics `df` to PLINK `.bim` (`bim_df`) and genotype matrix `G` by SNP ID.
 
-    Drops strand-ambiguous palindromic SNPs (`A/T`, `C/G`) and incompatible allele mismatches,
-    resolves non-palindromic strand complements, and flips `XBETA*`, `YBETA`, `FREQ -> 1 - FREQ`
-    (when `align_target='bim'`, default) or genotype dosages `2 - G` (when `align_target='sumstats'`)
-    on allele swaps.
+    In `'default'` mode, drops strand-ambiguous palindromic SNPs (`A/T`, `C/G`) and resolves
+    non-palindromic strand complements. In `'R_default'` mode (matching upstream `gcta --mtcojo`),
+    performs exact-string allele matching `(A1, A2) == (ref_A1, ref_A2)` or swapped `(ref_A2, ref_A1)`
+    without strand-complement flipping.
     """
+    _validate_settings(settings)
     if align_target not in ("bim", "sumstats"):
         raise ValueError("align_target must be 'bim' or 'sumstats'.")
     if G is not None and G.shape[1] != len(bim_df):
@@ -76,17 +91,21 @@ def align_sumstats_to_bim(
     a1_s = merged[s_a1_name].astype(str).str.upper()
     a2_s = merged[s_a2_name].astype(str).str.upper()
 
-    pal = (a1_s + a2_s).isin(_PALINDROMIC) | (a1_b_s + a2_b_s).isin(_PALINDROMIC)
-    a1_b_c = a1_b_s.map(_COMP).fillna("")
-    a2_b_c = a2_b_s.map(_COMP).fillna("")
-
     same = (a1_s == a1_b_s) & (a2_s == a2_b_s)
     swap = (a1_s == a2_b_s) & (a2_s == a1_b_s)
-    comp = (a1_s == a1_b_c) & (a2_s == a2_b_c)
-    comp_swap = (a1_s == a2_b_c) & (a2_s == a1_b_c)
 
-    keep = (~pal) & (same | swap | comp | comp_swap)
-    swapped = (swap | comp_swap)[keep].to_numpy()
+    if settings == "R_default":
+        keep = same | swap
+        swapped = swap[keep].to_numpy()
+    else:
+        pal = (a1_s + a2_s).isin(_PALINDROMIC) | (a1_b_s + a2_b_s).isin(_PALINDROMIC)
+        a1_b_c = a1_b_s.map(_COMP).fillna("")
+        a2_b_c = a2_b_s.map(_COMP).fillna("")
+        comp = (a1_s == a1_b_c) & (a2_s == a2_b_c)
+        comp_swap = (a1_s == a2_b_c) & (a2_s == a1_b_c)
+        keep = (~pal) & (same | swap | comp | comp_swap)
+        swapped = (swap | comp_swap)[keep].to_numpy()
+
     sub = merged.loc[keep].copy()
     bim_idx = sub["_bim_idx"].to_numpy(dtype=int)
 
@@ -115,7 +134,7 @@ def align_sumstats_to_bim(
             ucol = col.upper()
             if ucol in ("YBETA", "BETA") or ucol.startswith("XBETA"):
                 out[col] = out[col].to_numpy(dtype=float) * sign
-            elif ucol.startswith("FREQ"):
+            elif _is_freq_col(col):
                 f_vals = out[col].to_numpy(dtype=float)
                 out[col] = np.where(swapped, 1.0 - f_vals, f_vals)
     else:
@@ -245,8 +264,9 @@ def _psatt(x: float, lam: np.ndarray) -> float:
     return float(stats.chi2.sf(x / a, b))
 
 
-def pchisqsum(x: float, lam: np.ndarray) -> float:
+def pchisqsum(x: float, lam: np.ndarray, *, settings: SettingsMode = "default") -> float:
     """Upper-tail p-value of a weighted sum of 1-df chi-square variables (saddle-point + Satterthwaite fallback)."""
+    _validate_settings(settings)
     lam_a = np.asarray(lam, dtype=float)
     p = _psadd(x, lam_a)
     if p > 1.0 or not np.isfinite(p):
@@ -326,8 +346,18 @@ def ldsc_gcov_one_step(z12, ng, ref_ld, w_ld, i1, h1, n1, i2, h2, n2, M) -> tupl
     return float(ig), float(gcov / np.sqrt(h1 * h2))
 
 
-def mtcojo_ldsc(z: np.ndarray, n: np.ndarray, ref_ld: np.ndarray, w_ld: np.ndarray, M: float, trait_names=None):
+def mtcojo_ldsc(
+    z: np.ndarray,
+    n: np.ndarray,
+    ref_ld: np.ndarray,
+    w_ld: np.ndarray,
+    M: float,
+    trait_names=None,
+    *,
+    settings: SettingsMode = "default",
+):
     """Univariate and bivariate LDSC across `T` traits (`z`, `n` of shape `(S, T)`)."""
+    _validate_settings(settings)
     S, T = z.shape
     if np.any((z ** 2).sum(0) / S > 10.0):
         return None, None, False
@@ -590,8 +620,10 @@ def gsmr_meta(
     nsnp_min: int = 10,
     beta_version: int = 1,
     n_ref: int | None = None,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Port of `gcta::gsmr_meta` with LD clumping and HEIDI-outlier filtering."""
+    _validate_settings(settings)
     res = dict(bxy=np.nan, se=np.nan, p=np.nan, n_snps=np.nan, heidi_p=np.nan, instruments=[], pleio=[], err=None)
     n_ref = G.shape[0] if n_ref is None else n_ref
     chi = np.where(valid, (bzx / bzx_se) ** 2, -np.inf)
@@ -668,14 +700,20 @@ def gsmr_meta(
     return res
 
 
-def cond_single(bzy, bzy_se, bzx, bzx_se, bxy: float, intercept_xy: float = 0.0):
+def cond_single(
+    bzy, bzy_se, bzx, bzx_se, bxy: float, intercept_xy: float = 0.0, *, settings: SettingsMode = "default"
+):
+    _validate_settings(settings)
     b = bzy - bzx * bxy
     var = np.maximum(bzy_se ** 2 + bxy ** 2 * bzx_se ** 2 - 2.0 * bxy * intercept_xy * bzx_se * bzy_se, 1e-30)
     se = np.sqrt(var)
     return b, se
 
 
-def cond_multiple(bzy, bzy_se, bzx, bzx_se, bxy, ldsc_intercept, ldsc_slope, vp):
+def cond_multiple(
+    bzy, bzy_se, bzx, bzx_se, bxy, ldsc_intercept, ldsc_slope, vp, *, settings: SettingsMode = "default"
+):
+    _validate_settings(settings)
     C = bzx.shape[1]
     Dm = np.diag(np.sqrt(np.maximum(np.diag(ldsc_slope)[1:] * vp[1:], 1e-30)))
     Rm = np.eye(C)
@@ -713,8 +751,10 @@ def mtcojo(
     gsmr_beta_version: int = 1,
     intercept_xy: float | None = None,
     verbose: bool = False,
+    settings: SettingsMode = "default",
 ) -> dict:
     """Run GCTA-mtCOJO multi-trait conditional analysis on summary statistics `df`."""
+    _validate_settings(settings)
     suffix = [""] + [str(c) for c in range(2, ncov + 1)]
     S = len(df)
     ybeta, yse = df["YBETA"].to_numpy(float), df["YSE"].to_numpy(float)
@@ -722,27 +762,65 @@ def mtcojo(
     xs = np.column_stack([df["XSE" + s].to_numpy(float) for s in suffix])
     keep = np.all(np.isfinite(xb) & np.isfinite(xs), 1) & np.isfinite(ybeta) & np.isfinite(yse) & (yse >= EPS) & np.all(xs >= EPS, 1)
     log = print if verbose else (lambda *a, **k: None)
-    freq = df["FREQ"].to_numpy(float) if "FREQ" in df.columns else None
+    freq = df["FREQ"].to_numpy(float) if "FREQ" in df.columns else (
+        df["YFREQ"].to_numpy(float) if "YFREQ" in df.columns else (
+            df["FREQ_Y"].to_numpy(float) if "FREQ_Y" in df.columns else None
+        )
+    )
 
-    if G is not None:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            ref_af = np.nanmean(G, 0) / 2.0
-        keep &= np.isfinite(ref_af) & (np.minimum(ref_af, 1.0 - ref_af) > 0.0)
-        if freq is not None and keep.any():
-            diff = (np.abs(ref_af - freq) > freq_thresh) & keep
-            if diff.sum() > 0.05 * keep.sum():
-                raise ValueError("Too many SNPs show large allele-frequency differences against the LD reference.")
-            keep &= ~diff
+    if settings == "R_default":
+        active_freq_cols: list[str] = []
+        for nm in ("FREQ", "YFREQ", "FREQ_Y", "REF_FREQ", "FREQ_REF"):
+            if nm in df.columns and nm not in active_freq_cols:
+                active_freq_cols.append(nm)
+        for c, s in enumerate(suffix):
+            cands = (f"XFREQ{s}", f"FREQ_X{s}", f"FREQ{c + 1}") + (("XFREQ1", "FREQ_X1") if c == 0 else ())
+            for nm in cands:
+                if nm in df.columns and nm not in active_freq_cols:
+                    active_freq_cols.append(nm)
+        freq_list: list[np.ndarray] = []
+        for col in active_freq_cols:
+            f_arr = df[col].to_numpy(float)
+            keep &= np.isfinite(f_arr)
+            freq_list.append(f_arr)
+        if G is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                ref_af = np.nanmean(G, 0) / 2.0
+            keep &= np.isfinite(ref_af) & (np.minimum(ref_af, 1.0 - ref_af) > 0.0)
+            freq_list.append(ref_af)
+        if len(freq_list) >= 2 and keep.any():
+            bad_freq = np.zeros(S, dtype=bool)
+            for i_f in range(len(freq_list) - 1):
+                for j_f in range(i_f + 1, len(freq_list)):
+                    bad_freq |= np.abs(freq_list[i_f] - freq_list[j_f]) > freq_thresh
+            keep &= ~bad_freq
+    else:
+        if G is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                ref_af = np.nanmean(G, 0) / 2.0
+            keep &= np.isfinite(ref_af) & (np.minimum(ref_af, 1.0 - ref_af) > 0.0)
+            if freq is not None and keep.any():
+                diff = (np.abs(ref_af - freq) > freq_thresh) & keep
+                if diff.sum() > 0.05 * keep.sum():
+                    raise ValueError("Too many SNPs show large allele-frequency differences against the LD reference.")
+                keep &= ~diff
     log(f"[mtcojo] {int(keep.sum())} of {S} SNPs retained after QC")
 
     vp = np.ones(ncov + 1)
-    if freq is not None and "YN" in df.columns:
-        h = 2.0 * freq * (1.0 - freq)
-        vp[0] = float(np.nanmedian((h * ybeta ** 2 + h * df["YN"].to_numpy(float) * yse ** 2)[keep]))
+    if freq is not None and "YN" in df.columns and keep.any():
+        h_y = 2.0 * freq * (1.0 - freq)
+        vp[0] = float(np.nanmedian((h_y * ybeta ** 2 + h_y * df["YN"].to_numpy(float) * yse ** 2)[keep]))
         for c, s in enumerate(suffix):
             if "XN" + s in df.columns:
-                vp[c + 1] = float(np.nanmedian((h * xb[:, c] ** 2 + h * df["XN" + s].to_numpy(float) * xs[:, c] ** 2)[keep]))
+                if settings == "R_default":
+                    xf_col = next((nm for nm in (f"XFREQ{s}", f"FREQ_X{s}", f"FREQ{c + 1}") if nm in df.columns), None)
+                    f_x = df[xf_col].to_numpy(float) if xf_col is not None else freq
+                    h_x = 2.0 * f_x * (1.0 - f_x)
+                else:
+                    h_x = h_y
+                vp[c + 1] = float(np.nanmedian((h_x * xb[:, c] ** 2 + h_x * df["XN" + s].to_numpy(float) * xs[:, c] ** 2)[keep]))
 
     inter = np.zeros((ncov + 1, ncov + 1))
     slope = np.zeros_like(inter)
@@ -796,6 +874,7 @@ def mtcojo(
                 ld_fdr_thresh,
                 nsnp_gsmr,
                 gsmr_beta_version,
+                settings=settings,
             )
             if res["err"]:
                 warnings.warn(res["err"])

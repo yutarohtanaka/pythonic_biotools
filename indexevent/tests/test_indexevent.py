@@ -82,3 +82,31 @@ def test_indexevent_weak_instruments_positive_se_and_simex_profile_ci():
     for bad in ("", "c", "h", "s", "unknown"):
         with pytest.raises(ValueError):
             indexevent(xb, xse, yb, yse, method=bad)
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(109)
+    m = 120
+    b_true = 0.55
+    x_true = rng.uniform(0.03, 0.12, m) * rng.choice([-1.0, 1.0], m)
+    xse = np.full(m, 0.012)
+    yse = np.full(m, 0.015)
+    xb = x_true + rng.normal(0.0, xse)
+    yb = 0.025 + b_true * x_true + rng.normal(0.0, yse)
+
+    flip = np.where(np.arange(m) % 3 == 0, -1.0, 1.0)
+
+    # In settings="R_default", indexevent.R runs raw signed WLS without orienting xb >= 0
+    r_signed_1 = indexevent(xb, xse, yb, yse, method="CWLS", settings="R_default")
+    r_signed_2 = indexevent(xb * flip, xse, yb * flip, yse, method="CWLS", settings="R_default")
+    assert not np.isclose(r_signed_1["b"], r_signed_2["b"])
+
+    # Verify exact raw signed CWLS formula against R_default
+    w = 1.0 / (yse ** 2)
+    sw = float(w.sum())
+    numer = float(sw * np.sum(w * xb * yb) - np.sum(w * xb) * np.sum(w * yb))
+    denom = float(sw * np.sum(w * xb ** 2) - np.sum(w * xb) ** 2 - sw * np.sum(w * xse ** 2))
+    np.testing.assert_allclose(r_signed_1["b"], numer / denom, rtol=1e-13)
+
+    with pytest.raises(ValueError, match="Unknown settings"):
+        indexevent(xb, xse, yb, yse, settings="bad")  # type: ignore[arg-type]

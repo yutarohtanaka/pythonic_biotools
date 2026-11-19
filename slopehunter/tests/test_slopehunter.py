@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from slopehunter import harmonise_effects, hunt, sh_adj, shclust
 
 
@@ -83,3 +84,29 @@ def test_slopehunter_signed_bootstrap_se_at_null():
     assert np.any(bts > 0) and np.any(bts < 0)
     np.testing.assert_allclose(res["bse"], np.std(bts, ddof=1), rtol=1e-13)
     assert res["bse"] > np.std(np.abs(bts), ddof=1) * 1.15
+
+
+def test_r_default_settings():
+    rng = np.random.default_rng(314)
+    m = 250
+    xbeta_true = rng.normal(0.0, 0.12, m)
+    direct_y = np.concatenate([np.zeros(190), rng.normal(0.0, 0.10, 60)])
+    xse = np.full(m, 0.01)
+    yse = np.full(m, 0.015)
+    xbeta = xbeta_true + rng.normal(0.0, xse)
+    ybeta = direct_y + 0.0 * xbeta_true + rng.normal(0.0, yse)
+
+    res_def = hunt(xbeta, xse, ybeta, yse, xp_thresh=0.05, bootstrapping=True, M=50, seed=23, settings="default")
+    res_r = hunt(xbeta, xse, ybeta, yse, xp_thresh=0.05, bootstrapping=True, M=50, seed=23, settings="R_default")
+
+    bts = res_r["Bts_est"]
+    np.testing.assert_allclose(bts, res_def["Bts_est"], rtol=1e-13)
+    np.testing.assert_allclose(res_r["bse"], np.std(np.abs(bts), ddof=1), rtol=1e-13)
+    assert res_r["bse"] < res_def["bse"]
+
+    with pytest.raises(ValueError, match="Unknown settings"):
+        hunt(xbeta, xse, ybeta, yse, xp_thresh=0.05, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        shclust(xbeta, ybeta, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        sh_adj(res_r, xbeta, xse, ybeta, yse, settings="invalid")  # type: ignore[arg-type]

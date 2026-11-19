@@ -6,10 +6,16 @@ both traits directly ("Pleiotropic" cluster), and computes bias-adjusted summary
 """
 from __future__ import annotations
 
+from typing import Literal
 import warnings
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+
+def _validate_settings(settings: str) -> None:
+    if settings not in ("default", "R_default"):
+        raise ValueError(f"Unknown settings {settings!r}; expected 'default' or 'R_default'.")
 
 _TINY = 1e-300
 _COMP = {"A": "T", "T": "A", "C": "G", "G": "C"}
@@ -38,8 +44,10 @@ def shclust(
     sxy1: float = 1e-5,
     rng: np.random.Generator | None = None,
     max_iter: int = 50000,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Two-component bivariate Gaussian mixture EM clustering (`SlopeHunter::shclust`)."""
+    _validate_settings(settings)
     rng = np.random.default_rng() if rng is None else rng
     xbeta, ybeta = np.asarray(xbeta, dtype=float), np.asarray(ybeta, dtype=float)
     n = len(xbeta)
@@ -123,8 +131,10 @@ def hunt(
     bootstrapping: bool = True,
     M: int = 100,
     seed: int = 777,
+    settings: Literal["default", "R_default"] = "default",
 ) -> dict:
     """Fit SlopeHunter (`SlopeHunter::hunt`) on SNPs passing `xp <= xp_thresh`."""
+    _validate_settings(settings)
     xbeta, xse, ybeta, yse = (np.asarray(v, dtype=float) for v in (xbeta, xse, ybeta, yse))
     xp_arr = _p_from_beta_se(xbeta, xse) if xp is None else np.asarray(xp, dtype=float)
     snp_arr = np.array([f"snp{i + 1}" for i in range(len(xbeta))]) if snp is None else np.asarray(snp)
@@ -133,7 +143,7 @@ def hunt(
     if keep.sum() < 10:
         raise ValueError(f"Only {int(keep.sum())} SNPs pass xp_thresh={xp_thresh}; at least 10 are required.")
 
-    model = shclust(gx, gy, init_pi, init_sigmaIP, rng=np.random.default_rng(seed))
+    model = shclust(gx, gy, init_pi, init_sigmaIP, rng=np.random.default_rng(seed), settings=settings)
     b = float(model["b"])
     out = dict(
         b=b,
@@ -150,13 +160,16 @@ def hunt(
             rng = np.random.default_rng(seed + i)
             ii = rng.integers(0, len(gx), len(gx))
             try:
-                bts[i - 1] = shclust(gx[ii], gy[ii], init_pi, init_sigmaIP, rng=rng)["b"]
+                bts[i - 1] = shclust(gx[ii], gy[ii], init_pi, init_sigmaIP, rng=rng, settings=settings)["b"]
             except (ValueError, FloatingPointError):
                 bts[i - 1] = np.nan
         if np.isnan(bts).any():
             warnings.warn(f"Only {int((~np.isnan(bts)).sum())} of {M} bootstrap resamples converged.")
             bts = bts[~np.isnan(bts)]
-        bse = float(np.std(bts, ddof=1)) if len(bts) > 1 else float("nan")
+        if len(bts) > 1:
+            bse = float(np.std(np.abs(bts), ddof=1)) if settings == "R_default" else float(np.std(bts, ddof=1))
+        else:
+            bse = float("nan")
         out.update(bse=bse, b_CI=(b - 1.96 * bse, b + 1.96 * bse), Bts_est=bts)
     else:
         out.update(bse=model["bse"], b_CI=model["b_CI"])
@@ -169,8 +182,10 @@ def sh_adj(
     xse: np.ndarray,
     ybeta: np.ndarray,
     yse: np.ndarray,
+    settings: Literal["default", "R_default"] = "default",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Adjust summary statistics `(ybeta, yse)` using a fitted SlopeHunter result (`SlopeHunter::SHadj`)."""
+    _validate_settings(settings)
     xbeta, xse, ybeta, yse = (np.asarray(v, dtype=float) for v in (xbeta, xse, ybeta, yse))
     b, bse = float(res["b"]), float(res["bse"])
     yb = ybeta - b * xbeta

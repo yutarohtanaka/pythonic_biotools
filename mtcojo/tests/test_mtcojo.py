@@ -7,6 +7,7 @@ from scipy import stats
 from mtcojo import (
     align_sumstats_to_bim,
     cond_multiple,
+    cond_single,
     genotype_corr,
     gsmr_meta,
     mtcojo,
@@ -220,3 +221,98 @@ def test_align_sumstats_to_bim():
     np.testing.assert_allclose(G_s[:, 0], G[:, 0])
     np.testing.assert_allclose(G_s[:, 1], 2.0 - G[:, 1])
     np.testing.assert_allclose(G_s[:, 2], 2.0 - G[:, 3])
+
+
+def test_r_default_settings():
+    bim_df = pd.DataFrame(
+        {
+            "CHR": [1, 1, 1, 1, 1],
+            "SNP": ["rs_same", "rs_swap", "rs_comp", "rs_comp_swap", "rs_pal_swap"],
+            "CM": 0.0,
+            "BP": [1000, 2000, 3000, 4000, 5000],
+            "A1": ["A", "A", "A", "A", "A"],
+            "A2": ["G", "G", "G", "G", "T"],
+        }
+    )
+    G_bim = np.array(
+        [
+            [0.0, 2.0, 1.0, 2.0, 2.0],
+            [1.0, 1.0, 2.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    sumstats = pd.DataFrame(
+        {
+            "SNP": ["rs_same", "rs_swap", "rs_comp", "rs_comp_swap", "rs_pal_swap"],
+            "A1": ["A", "G", "T", "C", "T"],
+            "A2": ["G", "A", "C", "T", "A"],
+            "YFREQ": [0.25, 0.80, 0.25, 0.75, 0.70],
+            "XFREQ": [0.26, 0.78, 0.25, 0.75, 0.68],
+            "XBETA": [0.12, -0.15, 0.14, -0.20, -0.18],
+            "XSE": [0.02] * 5,
+            "YBETA": [0.06, -0.08, 0.07, -0.10, -0.09],
+            "YSE": [0.02] * 5,
+        }
+    )
+
+    # 1. Invalid settings raises ValueError across entrypoints
+    with pytest.raises(ValueError, match="Unknown settings"):
+        align_sumstats_to_bim(sumstats, bim_df, G_bim, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        mtcojo(sumstats, bxy_external=[0.4], settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        cond_single(np.ones(2), np.ones(2), np.ones(2), np.ones(2), 0.5, settings="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown settings"):
+        pchisqsum(5.0, np.ones(3), settings="invalid")  # type: ignore[arg-type]
+
+    # 2. Exact-string allele alignment in R_default (no strand-complement flipping of T/C or C/T vs A/G)
+    df_def, _ = align_sumstats_to_bim(sumstats, bim_df, G_bim, settings="default")
+    df_r, G_r = align_sumstats_to_bim(sumstats, bim_df, G_bim, settings="R_default")
+    assert "rs_comp" in list(df_def["SNP"]) and "rs_comp_swap" in list(df_def["SNP"])
+    assert list(df_r["SNP"]) == ["rs_same", "rs_swap", "rs_pal_swap"]
+    np.testing.assert_allclose(df_r["YFREQ"].to_numpy(), [0.25, 0.20, 0.30])
+    np.testing.assert_allclose(df_r["XFREQ"].to_numpy(), [0.26, 0.22, 0.32])
+    np.testing.assert_allclose(df_r["XBETA"].to_numpy(), [0.12, 0.15, 0.18])
+    np.testing.assert_allclose(df_r["YBETA"].to_numpy(), [0.06, 0.08, 0.09])
+    np.testing.assert_allclose(G_r, G_bim[:, [0, 1, 4]])
+
+    # 3. Pairwise allele-frequency differences checked across ALL summary-stat & reference columns
+    # Construct G_ref with ref_af == 0.50 across 6 SNPs:
+    # - SNP 0..3: concordant across YFREQ, XFREQ, XFREQ2, and ref_af (0.50)
+    # - SNP 4: YFREQ=0.35, XFREQ=0.65, XFREQ2=0.50, ref_af=0.50
+    #   Notice |YFREQ - ref_af|=0.15 <= 0.20 and |XFREQ - ref_af|=0.15 <= 0.20,
+    #   so default (which only checks FREQ vs ref_af) keeps SNP 4,
+    #   whereas R_default catches |YFREQ - XFREQ| = 0.30 > 0.20!
+    # - SNP 5: YFREQ=0.50, XFREQ=0.50, XFREQ2=0.78, ref_af=0.50 -> caught by |XFREQ2 - ref_af| = 0.28 > 0.20!
+    G_ref = np.array([[0.0] * 6, [1.0] * 6, [2.0] * 6])  # mean = 1.0 => ref_af = 0.50
+    df_freq = pd.DataFrame(
+        {
+            "SNP": [f"rs{i}" for i in range(6)],
+            "CHR": 1,
+            "BP": np.arange(6) * 1000,
+            "FREQ": [0.50, 0.48, 0.52, 0.49, 0.35, 0.50],
+            "XFREQ": [0.50, 0.49, 0.51, 0.50, 0.65, 0.50],
+            "XFREQ2": [0.50, 0.51, 0.49, 0.50, 0.50, 0.78],
+            "XBETA": [0.10, -0.08, 0.12, -0.05, 0.15, 0.09],
+            "XSE": [0.02] * 6,
+            "XBETA2": [0.05, 0.06, -0.04, 0.07, -0.10, 0.08],
+            "XSE2": [0.02] * 6,
+            "YBETA": [0.08, -0.02, 0.06, 0.01, 0.04, -0.03],
+            "YSE": [0.02] * 6,
+            "YN": 50_000.0,
+            "XN": 50_000.0,
+            "XN2": 50_000.0,
+        }
+    )
+    # Two-covariate comparison: default keeps SNPs 4 & 5 (|FREQ - ref_af| <= 0.20), R_default drops SNPs 4 & 5
+    res_def_2 = mtcojo(df_freq, G=G_ref, bxy_external=[0.30, -0.20], ncov=2, freq_thresh=0.20, settings="default")
+    assert list(res_def_2["keep"]) == [True, True, True, True, True, True]
+
+    res_r_2 = mtcojo(df_freq, G=G_ref, bxy_external=[0.30, -0.20], ncov=2, freq_thresh=0.20, settings="R_default")
+    assert list(res_r_2["keep"]) == [True, True, True, True, False, False]
+    assert np.all(np.isfinite(res_r_2["ybeta_adj"][:4]))
+    assert np.all(np.isnan(res_r_2["ybeta_adj"][4:]))
+
+    # Even without G (G=None), R_default checks pairwise summary-stat frequencies (FREQ vs XFREQ vs XFREQ2)
+    res_r_no_g = mtcojo(df_freq, G=None, bxy_external=[0.30, -0.20], ncov=2, freq_thresh=0.20, settings="R_default")
+    assert list(res_r_no_g["keep"]) == [True, True, True, True, False, False]
