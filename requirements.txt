@@ -1,4 +1,0 @@
-pysam
-pandas
-numpy
-setuptools

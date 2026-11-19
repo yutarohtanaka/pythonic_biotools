@@ -11,3 +11,11 @@ build/
 .venv/
 venv/
 .DS_Store
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+*.bam
+*.bai
+*.vcf
+*.vcf.gz
+*.h5ad
