@@ -1,5 +1,6 @@
 """GCTA-mtCOJO & GSMR: Multi-trait conditional & joint GWAS summary analysis (Zhu et al., 2018)."""
 from .core import (
+    align_sumstats_to_bim,
     cond_multiple,
     cond_single,
     genotype_corr,
@@ -14,6 +15,7 @@ from .core import (
 )
 
 __all__ = [
+    "align_sumstats_to_bim",
     "cond_multiple",
     "cond_single",
     "genotype_corr",

@@ -16,10 +16,113 @@ import pandas as pd
 from scipy import optimize, stats
 
 EPS = 1e-6
+_COMP = {"A": "T", "T": "A", "C": "G", "G": "C"}
+_PALINDROMIC = {"AT", "TA", "CG", "GC"}
 
 
 def _p_from_beta_se(beta: np.ndarray, se: np.ndarray) -> np.ndarray:
     return stats.chi2.sf((np.asarray(beta, dtype=float) / np.asarray(se, dtype=float)) ** 2, 1)
+
+
+def align_sumstats_to_bim(
+    df: pd.DataFrame,
+    bim_df: pd.DataFrame,
+    G: np.ndarray | None = None,
+    align_target: str = "bim",
+) -> tuple[pd.DataFrame, np.ndarray | None]:
+    """Match summary statistics `df` to PLINK `.bim` (`bim_df`) and genotype matrix `G` by SNP ID.
+
+    Drops strand-ambiguous palindromic SNPs (`A/T`, `C/G`) and incompatible allele mismatches,
+    resolves non-palindromic strand complements, and flips `XBETA*`, `YBETA`, `FREQ -> 1 - FREQ`
+    (when `align_target='bim'`, default) or genotype dosages `2 - G` (when `align_target='sumstats'`)
+    on allele swaps.
+    """
+    if align_target not in ("bim", "sumstats"):
+        raise ValueError("align_target must be 'bim' or 'sumstats'.")
+    if G is not None and G.shape[1] != len(bim_df):
+        raise ValueError(f"G column count ({G.shape[1]}) must match len(bim_df) ({len(bim_df)}).")
+
+    a1_col = "A1" if "A1" in df.columns else ("EA" if "EA" in df.columns else None)
+    a2_col = "A2" if "A2" in df.columns else ("OA" if "OA" in df.columns else None)
+    if a1_col is None or a2_col is None:
+        raise KeyError("df must contain allele columns ('A1', 'A2') or ('EA', 'OA').")
+    if not {"SNP", "A1", "A2"}.issubset(bim_df.columns):
+        raise KeyError("bim_df must contain 'SNP', 'A1', and 'A2' columns.")
+
+    bim_work = bim_df.copy()
+    bim_work["_bim_idx"] = np.arange(len(bim_work))
+    bim_work["SNP"] = bim_work["SNP"].astype(str)
+    bim_work = bim_work.drop_duplicates(subset=["SNP"], keep="first")
+
+    df_work = df.copy()
+    df_work["SNP"] = df_work["SNP"].astype(str)
+    df_work = df_work.drop_duplicates(subset=["SNP"], keep="first")
+
+    merged = bim_work[["SNP", "A1", "A2", "_bim_idx"] + [c for c in ("CHR", "BP") if c in bim_work.columns]].merge(
+        df_work, on="SNP", how="inner", suffixes=("_bim", "")
+    )
+    if merged.empty:
+        empty_df = df_work.iloc[0:0].copy()
+        empty_g = G[:, :0].copy() if G is not None else None
+        return empty_df, empty_g
+
+    a1_b = (merged["A1_bim"] if "A1_bim" in merged.columns else bim_work.set_index("SNP").loc[merged["SNP"], "A1"].to_numpy())
+    a2_b = (merged["A2_bim"] if "A2_bim" in merged.columns else bim_work.set_index("SNP").loc[merged["SNP"], "A2"].to_numpy())
+    a1_b_s = pd.Series(a1_b, index=merged.index).astype(str).str.upper()
+    a2_b_s = pd.Series(a2_b, index=merged.index).astype(str).str.upper()
+
+    s_a1_name = a1_col if a1_col != "A1" or "A1_bim" in merged.columns else "A1"
+    s_a2_name = a2_col if a2_col != "A2" or "A2_bim" in merged.columns else "A2"
+    a1_s = merged[s_a1_name].astype(str).str.upper()
+    a2_s = merged[s_a2_name].astype(str).str.upper()
+
+    pal = (a1_s + a2_s).isin(_PALINDROMIC) | (a1_b_s + a2_b_s).isin(_PALINDROMIC)
+    a1_b_c = a1_b_s.map(_COMP).fillna("")
+    a2_b_c = a2_b_s.map(_COMP).fillna("")
+
+    same = (a1_s == a1_b_s) & (a2_s == a2_b_s)
+    swap = (a1_s == a2_b_s) & (a2_s == a1_b_s)
+    comp = (a1_s == a1_b_c) & (a2_s == a2_b_c)
+    comp_swap = (a1_s == a2_b_c) & (a2_s == a1_b_c)
+
+    keep = (~pal) & (same | swap | comp | comp_swap)
+    swapped = (swap | comp_swap)[keep].to_numpy()
+    sub = merged.loc[keep].copy()
+    bim_idx = sub["_bim_idx"].to_numpy(dtype=int)
+
+    out_cols = list(df_work.columns)
+    out = pd.DataFrame(index=sub.index)
+    for col in out_cols:
+        out[col] = sub[col]
+
+    # Populate CHR / BP from bim_df if present in bim_df so rows follow reference genome order
+    for pos_col in ("CHR", "BP"):
+        bim_pos_col = f"{pos_col}_bim" if f"{pos_col}_bim" in sub.columns else (pos_col if pos_col in sub.columns else None)
+        if bim_pos_col is not None and (pos_col in out.columns or pos_col in bim_df.columns):
+            out[pos_col] = sub[bim_pos_col]
+
+    G_aligned = G[:, bim_idx].astype(np.float64, copy=True) if G is not None else None
+    sign = np.where(swapped, -1.0, 1.0)
+
+    if align_target == "bim":
+        out["A1"] = a1_b_s.loc[keep].to_numpy()
+        out["A2"] = a2_b_s.loc[keep].to_numpy()
+        if a1_col != "A1" and a1_col in out.columns:
+            out[a1_col] = out["A1"]
+        if a2_col != "A2" and a2_col in out.columns:
+            out[a2_col] = out["A2"]
+        for col in out.columns:
+            ucol = col.upper()
+            if ucol in ("YBETA", "BETA") or ucol.startswith("XBETA"):
+                out[col] = out[col].to_numpy(dtype=float) * sign
+            elif ucol.startswith("FREQ"):
+                f_vals = out[col].to_numpy(dtype=float)
+                out[col] = np.where(swapped, 1.0 - f_vals, f_vals)
+    else:
+        if G_aligned is not None and np.any(swapped):
+            G_aligned[:, swapped] = 2.0 - G_aligned[:, swapped]
+
+    return out.reset_index(drop=True), G_aligned
 
 
 def read_bed(prefix: str) -> tuple[np.ndarray, pd.DataFrame]:
@@ -40,14 +143,20 @@ def read_bed(prefix: str) -> tuple[np.ndarray, pd.DataFrame]:
 def genotype_corr(G: np.ndarray) -> np.ndarray:
     """SNP x SNP Pearson correlation matrix with mean-imputation of missing genotypes."""
     Gc = np.array(G, dtype=np.float64, copy=True)
-    mu = np.nanmean(Gc, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mu = np.nanmean(Gc, axis=0)
+    mu = np.where(np.isnan(mu), 0.0, mu)
     bad = np.isnan(Gc)
-    Gc[bad] = np.take(mu, np.where(bad)[1])
+    if bad.any():
+        Gc[bad] = np.take(mu, np.where(bad)[1])
     Gc -= Gc.mean(axis=0)
     nrm = np.sqrt((Gc ** 2).sum(axis=0))
     nrm[nrm == 0] = np.inf
     Gc /= nrm
-    return Gc.T @ Gc
+    corr = Gc.T @ Gc
+    np.fill_diagonal(corr, 1.0)
+    return corr
 
 
 def quantile(vals_sorted: np.ndarray, prob: float) -> float:
@@ -75,15 +184,11 @@ def bh_fdr(p: list[float] | np.ndarray) -> np.ndarray:
 
 
 def _pnorm_upper(x: float) -> float:
-    z = -x if x > 0 else x
-    t0 = 1.0 / (1.0 + 0.2316419 * abs(z))
-    z1 = np.exp(-0.5 * z * z) / 2.50662827463
-    p0 = z1 * t0 * (0.31938153 + t0 * (-0.356563782 + t0 * (1.781477937 + t0 * (-1.821255978 + 1.330274429 * t0))))
-    return float(p0 if x >= 0 else 1.0 - p0)
+    return float(stats.norm.sf(x))
 
 
 def _K(z: float, lam: np.ndarray) -> float:
-    return float(-0.5 * np.log(1.0 - 2.0 * z * lam).sum())
+    return float(-0.5 * np.log(np.maximum(1.0 - 2.0 * z * lam, 1e-300)).sum())
 
 
 def _Kp(z: float, lam: np.ndarray) -> float:
@@ -97,7 +202,7 @@ def _Kpp(z: float, lam: np.ndarray) -> float:
 def _brent_kp(lam: np.ndarray, x: float, lo: float, hi: float, tol: float = 1e-8) -> float:
     fa, fb = _Kp(lo, lam) - x, _Kp(hi, lam) - x
     if fa * fb >= 0:
-        return lo if fa < fb else hi
+        return lo if abs(fa) < abs(fb) else hi
     return float(optimize.brentq(lambda z: _Kp(z, lam) - x, lo, hi, xtol=tol, rtol=4.0 * np.finfo(float).eps))
 
 
@@ -108,6 +213,8 @@ def _psadd(x: float, lam: np.ndarray) -> float:
     lam = lam / d
     x = x / d
     m = float(lam.min())
+    if m >= 0.0 and x <= 0.0:
+        return 1.0
     if m < 0:
         lmin = 0.499995 / m
     elif x > lam.sum():
@@ -118,10 +225,13 @@ def _psadd(x: float, lam: np.ndarray) -> float:
     hz = _brent_kp(lam, x, lmin, lmax)
     if hz > lmax + 9:
         return 2.0
+    arg = 2.0 * (hz * x - _K(hz, lam))
+    if arg <= 0.0 or abs(hz) < 1e-4:
+        return 2.0
     sign = -1.0 if hz < 0 else 1.0
-    w = sign * np.sqrt(2.0 * (hz * x - _K(hz, lam)))
+    w = sign * np.sqrt(arg)
     v = hz * np.sqrt(_Kpp(hz, lam))
-    if abs(hz) < 1e-4:
+    if v / w <= 0.0:
         return 2.0
     return _pnorm_upper(w + np.log(v / w) / w)
 
@@ -139,9 +249,9 @@ def pchisqsum(x: float, lam: np.ndarray) -> float:
     """Upper-tail p-value of a weighted sum of 1-df chi-square variables (saddle-point + Satterthwaite fallback)."""
     lam_a = np.asarray(lam, dtype=float)
     p = _psadd(x, lam_a)
-    if p > 1.0:
+    if p > 1.0 or not np.isfinite(p):
         p = _psatt(x, lam_a)
-    return p
+    return float(np.clip(p, 0.0, 1.0))
 
 
 def _w_hsq(intercept, h, M, ref_ld, w_ld, n):
@@ -275,9 +385,13 @@ def clump(chi, chrom, bp, G, chi_thresh, wind_kb, r2_thresh) -> list[int]:
     cand_set = np.zeros(len(chi), bool)
     cand_set[cand] = True
     Gc = G.astype(np.float64)
-    mu = np.nanmean(Gc, 0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mu = np.nanmean(Gc, 0)
+    mu = np.where(np.isnan(mu), 0.0, mu)
     bad = np.isnan(Gc)
-    Gc[bad] = np.take(mu, np.where(bad)[1])
+    if bad.any():
+        Gc[bad] = np.take(mu, np.where(bad)[1])
     Gc = Gc - Gc.mean(0)
     index = []
     for i in order:
@@ -289,7 +403,7 @@ def clump(chi, chrom, bp, G, chi_thresh, wind_kb, r2_thresh) -> list[int]:
             xi = Gc[:, i]
             num = Gc[:, near].T @ xi
             den = np.sqrt((xi @ xi) * (Gc[:, near] ** 2).sum(0))
-            r2 = (num / den) ** 2
+            r2 = np.where(den > 0, (num / np.where(den > 0, den, 1.0)) ** 2, 0.0)
             flagged[near[r2 >= r2_thresh]] = True
         index.append(int(i))
     return index
@@ -370,14 +484,15 @@ def _topsnp_heidi_outlier(inst, kept, ci) -> int:
     probs = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
     lo = [quantile(bs, probs[i]) for i in range(5)]
     hi = [quantile(bs, probs[i + 1]) for i in range(5)]
-    top = [0] * 5
+    top = [int(cand[0])] * 5
     mx = [0.0] * 5
     sm = [0.0] * 5
     cnt = [0.0] * 5
     for c in cand:
         s = k[c]
         for j in range(5):
-            if inst.bxy[s] < lo[j] or inst.bxy[s] >= hi[j]:
+            above_hi = (inst.bxy[s] > hi[j]) if j == 4 else (inst.bxy[s] >= hi[j])
+            if inst.bxy[s] < lo[j] or above_hi:
                 continue
             ch = float((inst.bzx[s] / inst.bzx_se[s]) ** 2)
             sm[j] += ch
@@ -386,7 +501,7 @@ def _topsnp_heidi_outlier(inst, kept, ci) -> int:
                 mx[j] = ch
                 top[j] = int(c)
             break
-    topsnp, best = 0, 0.0
+    topsnp, best = int(cand[0]), -1.0
     for j in range(5):
         if cnt[j] < 1:
             continue
@@ -401,15 +516,17 @@ def _heidi_outlier_topsnp(inst, cov, kept, top: int, multi: bool):
     d = inst.bzy[k] / inst.bzx[k] - inst.bxy[k[top]]
     var_d = cov + cov[top, top] - cov[:, [top]] - cov[[top], :]
     var_d[top, top] = 1.0
-    indi = stats.chi2.sf(d ** 2 / np.diag(var_d), 1)
+    diag_vd = np.maximum(np.diag(var_d), 1e-30)
+    indi = stats.chi2.sf(d ** 2 / diag_vd, 1)
     if not multi:
         return indi, 0.0
     d2 = np.delete(d, top)
     v2 = np.delete(np.delete(var_d, top, 0), top, 1)
-    sd = np.sqrt(np.diag(v2))
+    diag_v2 = np.maximum(np.diag(v2), 1e-30)
+    sd = np.sqrt(diag_v2)
     corr = v2 / np.outer(sd, sd)
     np.fill_diagonal(corr, 1.0)
-    chival = float(np.sum(d2 ** 2 / np.diag(v2)))
+    chival = float(np.sum(d2 ** 2 / diag_v2))
     ev = np.linalg.eigvalsh((corr + corr.T) / 2.0)
     return indi, pchisqsum(chival, ev)
 
@@ -438,6 +555,8 @@ def _indi_iter(inst, cov, kept, heidi_thresh: float):
 def _global_iter(inst, cov, kept, heidi_thresh: float):
     k = np.asarray(kept)
     cand = [i for i in range(len(k)) if inst.bzy_p[k[i]] >= 5e-8]
+    if len(cand) < 5:
+        cand = list(range(len(k)))
     bvals = inst.bxy[k]
     ci = _interval(np.sort(bvals[cand]) if cand else np.array([]), bvals, cand, 0.05, 0.95)
     if not ci:
@@ -469,7 +588,7 @@ def gsmr_meta(
     global_heidi_thresh: float = 0.01,
     ld_fdr_thresh: float = 0.05,
     nsnp_min: int = 10,
-    beta_version: int = 0,
+    beta_version: int = 1,
     n_ref: int | None = None,
 ) -> dict:
     """Port of `gcta::gsmr_meta` with LD clumping and HEIDI-outlier filtering."""
@@ -551,13 +670,14 @@ def gsmr_meta(
 
 def cond_single(bzy, bzy_se, bzx, bzx_se, bxy: float, intercept_xy: float = 0.0):
     b = bzy - bzx * bxy
-    se = np.sqrt(bzy_se ** 2 + bxy ** 2 * bzx_se ** 2 - 2.0 * bxy * intercept_xy * bzx_se * bzy_se)
+    var = np.maximum(bzy_se ** 2 + bxy ** 2 * bzx_se ** 2 - 2.0 * bxy * intercept_xy * bzx_se * bzy_se, 1e-30)
+    se = np.sqrt(var)
     return b, se
 
 
 def cond_multiple(bzy, bzy_se, bzx, bzx_se, bxy, ldsc_intercept, ldsc_slope, vp):
     C = bzx.shape[1]
-    Dm = np.diag(np.sqrt(np.diag(ldsc_slope)[1:] * vp[1:]))
+    Dm = np.diag(np.sqrt(np.maximum(np.diag(ldsc_slope)[1:] * vp[1:], 1e-30)))
     Rm = np.eye(C)
     for i in range(C):
         for j in range(C):
@@ -572,7 +692,8 @@ def cond_multiple(bzy, bzy_se, bzx, bzx_se, bxy, ldsc_intercept, ldsc_slope, vp)
     cross = (bzx_se * bzy_se[:, None] * bj[None, :] * ldsc_intercept[0, 1:][None, :]).sum(1)
     sv = bzx_se * bj[None, :]
     var = np.einsum("si,ij,sj->s", sv, I_mat, sv)
-    return b, np.sqrt(bzy_se ** 2 + var - 2.0 * cross)
+    total_var = np.maximum(bzy_se ** 2 + var - 2.0 * cross, 1e-30)
+    return b, np.sqrt(total_var)
 
 
 def mtcojo(
@@ -589,7 +710,7 @@ def mtcojo(
     global_heidi_thresh: float = 0.01,
     ld_fdr_thresh: float = 0.05,
     nsnp_gsmr: int = 10,
-    gsmr_beta_version: int = 0,
+    gsmr_beta_version: int = 1,
     intercept_xy: float | None = None,
     verbose: bool = False,
 ) -> dict:
@@ -604,13 +725,15 @@ def mtcojo(
     freq = df["FREQ"].to_numpy(float) if "FREQ" in df.columns else None
 
     if G is not None:
-        ref_af = np.nanmean(G, 0) / 2.0
-        if freq is not None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            ref_af = np.nanmean(G, 0) / 2.0
+        keep &= np.isfinite(ref_af) & (np.minimum(ref_af, 1.0 - ref_af) > 0.0)
+        if freq is not None and keep.any():
             diff = (np.abs(ref_af - freq) > freq_thresh) & keep
             if diff.sum() > 0.05 * keep.sum():
                 raise ValueError("Too many SNPs show large allele-frequency differences against the LD reference.")
             keep &= ~diff
-        keep &= ~(np.minimum(ref_af, 1.0 - ref_af) == 0)
     log(f"[mtcojo] {int(keep.sum())} of {S} SNPs retained after QC")
 
     vp = np.ones(ncov + 1)
@@ -649,7 +772,8 @@ def mtcojo(
             raise ValueError("GSMR requires an LD reference genotype matrix `G` or external `bxy_external`.")
         chrom = df["CHR"].astype(str).to_numpy()
         bp = df["BP"].to_numpy(float)
-        if not all(np.all(np.diff(bp[chrom == c]) >= 0) for c in np.unique(chrom)):
+        n_runs = (1 + int(np.sum(chrom[1:] != chrom[:-1]))) if len(chrom) > 0 else 0
+        if n_runs != len(np.unique(chrom)) or not all(np.all(np.diff(bp[chrom == c]) >= 0) for c in np.unique(chrom)):
             raise ValueError("Input rows must be sorted by CHR then BP.")
         for c in range(ncov):
             valid = keep & np.isfinite(xb[:, c])

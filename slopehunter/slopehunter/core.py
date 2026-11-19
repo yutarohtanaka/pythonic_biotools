@@ -19,11 +19,16 @@ def _p_from_beta_se(beta: np.ndarray, se: np.ndarray) -> np.ndarray:
     return stats.chi2.sf((np.asarray(beta, dtype=float) / np.asarray(se, dtype=float)) ** 2, 1)
 
 
+def _log_dmvnorm0(x: np.ndarray, y: np.ndarray, sx2: float, sy2: float, sxy: float) -> np.ndarray:
+    """Log-density of a zero-mean bivariate normal distribution."""
+    det = max(sx2 * sy2 - sxy ** 2, _TINY)
+    quad = (sy2 * x ** 2 - 2.0 * sxy * x * y + sx2 * y ** 2) / det
+    return -np.log(2.0 * np.pi) - 0.5 * np.log(det) - 0.5 * quad
+
+
 def _dmvnorm0(x: np.ndarray, y: np.ndarray, sx2: float, sy2: float, sxy: float) -> np.ndarray:
     """Density of a zero-mean bivariate normal distribution."""
-    det = sx2 * sy2 - sxy ** 2
-    quad = (sy2 * x ** 2 - 2.0 * sxy * x * y + sx2 * y ** 2) / det
-    return np.exp(-0.5 * quad) / (2.0 * np.pi * np.sqrt(det))
+    return np.exp(_log_dmvnorm0(x, y, sx2, sy2, sxy))
 
 
 def shclust(
@@ -38,36 +43,45 @@ def shclust(
     rng = np.random.default_rng() if rng is None else rng
     xbeta, ybeta = np.asarray(xbeta, dtype=float), np.asarray(ybeta, dtype=float)
     n = len(xbeta)
-    sx0 = sx1 = float(np.std(xbeta, ddof=1))
-    sy0 = sy1 = float(np.std(ybeta, ddof=1))
-    dir0 = float(np.sign(np.cov(xbeta, ybeta)[0, 1]))
-    if dir0 == 0.0:
+    sx0 = sx1 = max(float(np.std(xbeta, ddof=1)), 1e-15)
+    sy0 = sy1 = max(float(np.std(ybeta, ddof=1)), 1e-15)
+    if sx0 <= 1e-15 or sy0 <= 1e-15:
         raise ValueError("Associations with at least one of x or y are constant.")
+    cov_xy = float(np.cov(xbeta, ybeta)[0, 1])
+    dir0 = float(np.sign(cov_xy)) if cov_xy != 0.0 else float(rng.choice([1.0, -1.0]))
+    if abs(sxy1) > 0.75 * sx1 * sy1:
+        sxy1 = float(np.sign(sxy1) * 0.75 * sx1 * sy1)
 
-    loglkl_ck = 0.0
+    loglkl = -np.inf
+    loglkl_ck: float | None = None
     it = 0
     pt = np.full(n, 0.5)
     for it in range(1, max_iter + 1):
         sxy0 = sx0 * sy0 * dir0 * 0.95
-        f0 = np.maximum(_dmvnorm0(xbeta, ybeta, sx0 ** 2, sy0 ** 2, sxy0), _TINY)
-        f1 = np.maximum(_dmvnorm0(xbeta, ybeta, sx1 ** 2, sy1 ** 2, sxy1), _TINY)
-        loglkl = float(np.sum(np.log(pi0 * f0 + (1.0 - pi0) * f1)))
-        pt = np.minimum(pi0 * f0 / (pi0 * f0 + (1.0 - pi0) * f1), 0.9999999)
+        lf0 = _log_dmvnorm0(xbeta, ybeta, sx0 ** 2, sy0 ** 2, sxy0)
+        lf1 = _log_dmvnorm0(xbeta, ybeta, sx1 ** 2, sy1 ** 2, sxy1)
+        la = np.log(pi0) + lf0
+        lb = np.log(1.0 - pi0) + lf1
+        l_mix = np.logaddexp(la, lb)
+        loglkl = float(np.sum(l_mix))
+        pt = np.clip(np.exp(la - l_mix), 1e-7, 1.0 - 1e-7)
 
+        sum_pt = float(pt.sum())
+        sum_po = float(n - sum_pt)
         pi0 = float(np.clip(pt.mean(), 0.0001, 0.9999))
-        sx0 = float(np.sqrt(np.sum(pt * xbeta ** 2) / pt.sum()))
-        sy0 = float(np.sqrt(np.sum(pt * ybeta ** 2) / pt.sum()))
-        dir0 = float(np.sign(np.sum(pt * xbeta * ybeta) / pt.sum()))
+        sx0 = max(float(np.sqrt(np.sum(pt * xbeta ** 2) / sum_pt)), 1e-15)
+        sy0 = max(float(np.sqrt(np.sum(pt * ybeta ** 2) / sum_pt)), 1e-15)
+        dir0 = float(np.sign(np.sum(pt * xbeta * ybeta) / sum_pt))
         if dir0 == 0.0:
             dir0 = float(rng.choice([1.0, -1.0]))
-        sx1 = float(np.sqrt(np.sum((1.0 - pt) * xbeta ** 2) / (n - pt.sum())))
-        sy1 = float(np.sqrt(np.sum((1.0 - pt) * ybeta ** 2) / (n - pt.sum())))
-        sxy1 = float(np.sum((1.0 - pt) * xbeta * ybeta) / (n - pt.sum()))
+        sx1 = max(float(np.sqrt(np.sum((1.0 - pt) * xbeta ** 2) / sum_po)), 1e-15)
+        sy1 = max(float(np.sqrt(np.sum((1.0 - pt) * ybeta ** 2) / sum_po)), 1e-15)
+        sxy1 = float(np.sum((1.0 - pt) * xbeta * ybeta) / sum_po)
         if abs(sxy1) > 0.75 * sx1 * sy1:
             sxy1 = float(np.sign(sxy1) * 0.75 * sx1 * sy1)
 
         if it % 10 == 0:
-            if (loglkl - loglkl_ck) / loglkl < 1e-10:
+            if loglkl_ck is not None and abs(loglkl - loglkl_ck) / (abs(loglkl) + 1e-12) < 1e-10:
                 break
             loglkl_ck = loglkl
 
@@ -81,6 +95,7 @@ def shclust(
         bse=0.0,
         b_CI=(slope, slope),
         iter=it,
+        loglkl=loglkl,
         pi0=pi0,
         entropy=entropy,
         Fit=pd.DataFrame(
@@ -126,6 +141,7 @@ def hunt(
         entropy=model["entropy"],
         Fit=model["Fit"].assign(SNP=snp_arr[keep]),
         iter=model["iter"],
+        loglkl=model["loglkl"],
         n_fit=int(keep.sum()),
     )
     if bootstrapping:
@@ -140,7 +156,7 @@ def hunt(
         if np.isnan(bts).any():
             warnings.warn(f"Only {int((~np.isnan(bts)).sum())} of {M} bootstrap resamples converged.")
             bts = bts[~np.isnan(bts)]
-        bse = float(np.std(np.abs(bts), ddof=1))
+        bse = float(np.std(bts, ddof=1)) if len(bts) > 1 else float("nan")
         out.update(bse=bse, b_CI=(b - 1.96 * bse, b + 1.96 * bse), Bts_est=bts)
     else:
         out.update(bse=model["bse"], b_CI=model["b_CI"])

@@ -31,43 +31,75 @@ def _optimise(f, lower: float, upper: float) -> tuple[float, float]:
 def simexllhd(pvar: float, pmean: float, simex_estimates: np.ndarray) -> float:
     """Negative log-likelihood of SIMEX slope estimates (`indexevent::simexllhd`)."""
     lam = simex_estimates[:, 0]
-    mean = pmean / (1.0 + (lam + 1.0) * np.exp(pvar))
-    sd = np.sqrt(simex_estimates[:, 2])
+    mean = pmean / (1.0 + (lam + 1.0) * np.exp(np.clip(pvar, -50.0, 50.0)))
+    sd = np.sqrt(np.maximum(simex_estimates[:, 2], 1e-30))
     return float(-np.sum(stats.norm.logpdf(simex_estimates[:, 1], loc=mean, scale=sd)))
 
 
 def simexprofilellhd(p: float, simex_estimates: np.ndarray, variance_ratio: float) -> float:
     """Profile negative log-likelihood over the nuisance variance ratio (`indexevent::simexprofilellhd`)."""
     lam = simex_estimates[:, 0]
-    lowerbound = (p ** 2 * variance_ratio - 1.0) / (lam + 1.0)
-    if np.min(lowerbound) > 0:
-        lowerbound = np.array([np.max(np.log(lowerbound / (lam + 1.0)))])
-    interval = np.concatenate([np.atleast_1d(lowerbound), [10.0]])
-    _, obj = _optimise(lambda v: simexllhd(v, p, simex_estimates), float(interval.min()), float(interval.max()))
+    lb_raw = p ** 2 * variance_ratio - 1.0
+    if lb_raw > 0.0:
+        lb = max(float(np.max(np.log(lb_raw / (lam + 1.0)))), -10.0)
+    else:
+        lb = -10.0
+    ub = max(10.0, lb + 10.0)
+    _, obj = _optimise(lambda v: simexllhd(v, p, simex_estimates), lb, ub)
     return obj
+
+
+def _bracket_and_brentq(g, pmin: float, direction: float, bound: float) -> float:
+    """Step geometrically from pmin (where g(pmin) < 0) toward bound to bracket root g(p) = 0 for brentq."""
+    prev = pmin
+    step = 0.005
+    while True:
+        cand = pmin + direction * step
+        hit_bound = (cand <= bound) if direction < 0 else (cand >= bound)
+        if hit_bound:
+            cand = bound
+        gc = g(cand)
+        if gc >= 0.0:
+            a, b = (cand, prev) if direction < 0 else (prev, cand)
+            return float(optimize.brentq(g, a, b, xtol=_TOL))
+        if hit_bound:
+            break
+        prev = cand
+        step *= 2.0
+    lo, hi = (bound, pmin) if direction < 0 else (pmin, bound)
+    fallback, _ = _optimise(lambda p: g(p) ** 2, lo, hi)
+    return fallback
 
 
 def simexprofileCI(simex_estimates: np.ndarray, variance_ratio: float) -> np.ndarray:
     """MLE and 95% profile-likelihood confidence interval of the SIMEX slope (`indexevent::simexprofileCI`)."""
     f = lambda p: simexprofilellhd(p, simex_estimates, variance_ratio)
-    pmin, pobj = _optimise(f, -100.0, 100.0)
-    crit = stats.chi2.ppf(0.95, 1)
-    obj = lambda p: (2.0 * (f(p) - pobj) - crit) ** 2
-    lo, _ = _optimise(obj, -100.0, pmin)
-    hi, _ = _optimise(obj, pmin, 100.0)
-    return np.array([pmin, lo, hi])
+    b0 = float(np.clip(simex_estimates[0, 1], -95.0, 95.0))
+    p_loc, obj_loc = _optimise(f, max(-100.0, b0 - 5.0), min(100.0, b0 + 5.0))
+    p_glb, obj_glb = _optimise(f, -100.0, 100.0)
+    pmin, pobj = (p_loc, obj_loc) if obj_loc <= obj_glb else (p_glb, obj_glb)
+
+    crit = float(stats.chi2.ppf(0.95, 1))
+    g = lambda p: 2.0 * (f(p) - pobj) - crit
+    lo = _bracket_and_brentq(g, pmin, -1.0, -100.0)
+    hi = _bracket_and_brentq(g, pmin, 1.0, 100.0)
+    lo_s, hi_s = float(min(lo, hi)), float(max(lo, hi))
+    return np.array([pmin, lo_s, hi_s])
 
 
 def _resid_sandwich(weight: np.ndarray, x: np.ndarray, res: np.ndarray) -> float:
     sw = weight.sum()
     swx = (weight * x).sum()
+    denom = (sw * np.sum(weight * x ** 2) - swx ** 2) ** 2
+    if denom <= 0.0:
+        return 1e-12
     return float(
         (
             swx ** 2 * np.sum(weight * res ** 2)
             - 2.0 * sw * swx * np.sum(weight * x * res ** 2)
             + sw ** 2 * np.sum(weight * x ** 2 * res ** 2)
         )
-        / (sw * np.sum(weight * x ** 2) - swx ** 2) ** 2
+        / denom
     )
 
 
@@ -84,29 +116,47 @@ def indexevent(
     seed: int = 2018,
 ) -> dict:
     """Adjust summary statistics for index-event bias (`indexevent::indexevent`)."""
+    if not isinstance(method, str):
+        raise ValueError("method must be a string: 'CWLS', 'Hedges-Olkin', or 'Simex'")
+    m = method.strip().lower()
+    if m not in ("cwls", "hedges-olkin", "hedges_olkin", "simex"):
+        raise ValueError(f"method must be one of 'CWLS', 'Hedges-Olkin', or 'Simex' (got {method!r})")
+
     lambdas_arr = np.arange(0.25, 5.0 + 1e-9, 0.25) if lambdas is None else np.asarray(lambdas, dtype=float)
     xbeta, xse, ybeta, yse = (np.asarray(v, dtype=float) for v in (xbeta, xse, ybeta, yse))
     prune_idx = np.arange(len(xbeta)) if prune is None else np.asarray(prune, dtype=int)
-    xb, xs, yb, ys = xbeta[prune_idx], xse[prune_idx], ybeta[prune_idx], yse[prune_idx]
+    xb_raw, xs, yb_raw, ys = xbeta[prune_idx], xse[prune_idx], ybeta[prune_idx], yse[prune_idx]
+
+    # Orient xb >= 0 (using +1 when xb == 0) for exact allele-coding invariance
+    signs = np.where(xb_raw >= 0.0, 1.0, -1.0)
+    xb = xb_raw * signs
+    yb = yb_raw * signs
     weight = 1.0 / ys ** 2 if weighted else np.ones(len(prune_idx))
 
     coef, _, res, cov = _wls(yb, np.column_stack([np.ones(len(xb)), xb]), weight)
-    b_raw, b_se_raw = float(coef[1]), float(np.sqrt(cov[1, 1]))
-    m = method.lower()
+    b_raw, b_se_raw = float(coef[1]), float(np.sqrt(max(cov[1, 1], 0.0)))
     z975 = float(stats.norm.ppf(0.975))
     simex_estimates = None
 
-    if "cwls".startswith(m):
-        sw = weight.sum()
-        numer = sw * np.sum(weight * xb * yb) - np.sum(weight * xb) * np.sum(weight * yb)
-        denom = sw * np.sum(weight * xb ** 2) - np.sum(weight * xb) ** 2 - sw * np.sum(weight * xs ** 2)
+    if m == "cwls":
+        sw = float(weight.sum())
+        numer = float(sw * np.sum(weight * xb * yb) - np.sum(weight * xb) * np.sum(weight * yb))
+        denom_raw = float(sw * np.sum(weight * xb ** 2) - np.sum(weight * xb) ** 2)
+        denom = float(denom_raw - sw * np.sum(weight * xs ** 2))
         b = float(numer / denom)
-        b_ci = np.array([b - z975 * b_se_raw * b / b_raw, b + z975 * b_se_raw * b / b_raw])
-    elif "hedges-olkin".startswith(m):
-        ho = float(np.var(xb, ddof=1) / (np.var(xb, ddof=1) - np.mean(xs ** 2)))
+        if abs(b_raw) >= 1e-12:
+            scale = abs(b / b_raw)
+        else:
+            scale = abs(denom_raw / denom) if abs(denom) > 1e-30 else 1.0
+        half_w = z975 * b_se_raw * scale
+        b_ci = np.sort(np.array([b - half_w, b + half_w], dtype=float))
+    elif m in ("hedges-olkin", "hedges_olkin"):
+        var_xb = float(np.var(xb, ddof=1))
+        ho = float(var_xb / (var_xb - float(np.mean(xs ** 2))))
         b = float(b_raw * ho)
-        b_ci = np.array([b - z975 * b_se_raw * ho, b + z975 * b_se_raw * ho])
-    elif "simex".startswith(m):
+        half_w = z975 * b_se_raw * abs(ho)
+        b_ci = np.sort(np.array([b - half_w, b + half_w], dtype=float))
+    else:  # m == "simex"
         rng = np.random.default_rng(seed)
         est = [b_raw]
         var_sw = [_resid_sandwich(weight, xb, res)]
@@ -121,12 +171,12 @@ def indexevent(
             est.append(float(coefs.mean()))
             var_sw.append(_resid_sandwich(weight, sim, r2) / B)
         simex_estimates = np.column_stack([np.concatenate([[0.0], lambdas_arr]), est, var_sw])
-        mle = simexprofileCI(simex_estimates, float(np.var(xb, ddof=1) / np.var(yb, ddof=1)))
-        b, b_ci = float(mle[0]), mle[1:3]
-    else:
-        raise ValueError("method must be one of 'CWLS', 'Hedges-Olkin', or 'Simex'")
+        var_y = max(float(np.var(yb, ddof=1)), 1e-30)
+        mle = simexprofileCI(simex_estimates, float(np.var(xb, ddof=1) / var_y))
+        b = float(mle[0])
+        b_ci = np.sort(np.asarray(mle[1:3], dtype=float))
 
-    b_se = float((b_ci[1] - b_ci[0]) / (2.0 * z975))
+    b_se = float(max((b_ci[1] - b_ci[0]) / (2.0 * z975), 0.0))
     ybeta_adj = ybeta - b * xbeta
     yse_adj = np.sqrt(yse ** 2 + b ** 2 * xse ** 2 + b_se ** 2 * xbeta ** 2 + b_se ** 2 * xse ** 2)
     chisq = (ybeta_adj / yse_adj) ** 2
