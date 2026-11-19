@@ -28,6 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install numpy scipy pandas anndata pysam scikit-learn requests pytest
 
+      - name: Verify workspace imports and PEP 561 py.typed across all 70 packages
+        run: |
+          python pythonic_biotools_cli.py check-imports --bundle all
+
       - name: Run unit tests across all standalone packages
         run: |
           set -euo pipefail
@@ -36,3 +40,7 @@ jobs:
             echo "=== Testing ${pkg_dir} ==="
             PYTHONPATH="${pkg_dir}" pytest "${test_dir}" -q
           done
+
+      - name: Run cross-package integration workflows and R_default golden benchmarks
+        run: |
+          pytest tests_integration benchmarks/r_parity -q

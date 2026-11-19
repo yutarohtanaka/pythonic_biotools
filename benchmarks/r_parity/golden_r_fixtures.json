@@ -1,0 +1,66 @@
+{
+  "metadata": {
+    "description": "Frozen upstream R / C++ analytical reference fixtures verifying settings='R_default' parity across pythonic_biotools.",
+    "tolerance_strict": 1e-9,
+    "tolerance_numerical_opt": 1e-4
+  },
+  "xenofilterR_private_R": {
+    "nm": 2,
+    "soft_clip": 3,
+    "insertion": 2,
+    "hard_clip": 4,
+    "expected_default_edit_distance": 9,
+    "expected_R_default_edit_distance": 7,
+    "unmapped_mate_R_default_penalty": 8,
+    "expected_R_default_single_mapped_pair_score": 7.5
+  },
+  "coloc_abf_wakefield_cc": {
+    "beta1": [0.42, 0.03, -0.02],
+    "se1": [0.07, 0.08, 0.08],
+    "beta2": [0.39, -0.01, 0.04],
+    "se2": [0.065, 0.075, 0.075],
+    "dataset_type1": "cc",
+    "dataset_type2": "cc",
+    "expected_R_default_prior_w": 0.2,
+    "expected_lead_snp": "rs1",
+    "expected_pp_h4": 0.9999939525692554
+  },
+  "mutationtimer_pi_to_time": {
+    "cn_2_1_mid": {"major": 2, "minor": 1, "pi": [0.7, 0.3], "expected_T": 0.6923076923076923},
+    "cn_2_0": {"major": 2, "minor": 0, "pi": [0.6, 0.4], "expected_T": 0.5714285714285714},
+    "cn_2_2_wgd": {"major": 2, "minor": 2, "pi": [0.5, 0.5], "expected_T": 0.6666666666666666}
+  },
+  "smr_single_exact": {
+    "b_zy": 0.15,
+    "se_zy": 0.03,
+    "b_zx": 0.5,
+    "se_zx": 0.05,
+    "expected_b_xy": 0.3,
+    "expected_t_smr_chi2": 20.0
+  },
+  "survrm2_km_exact": {
+    "time_arm0": [2.0, 4.0, 6.0, 8.0, 10.0],
+    "status_arm0": [1, 1, 1, 1, 1],
+    "time_arm1": [4.0, 6.0, 8.0, 10.0, 12.0],
+    "status_arm1": [1, 1, 1, 1, 1],
+    "tau": 10.0,
+    "expected_rmst0": 6.0,
+    "expected_rmst1": 7.6,
+    "expected_rmst_diff": 1.6,
+    "expected_rmst_ratio": 1.2666666666666666
+  },
+  "buysetest_peron_uncensored": {
+    "arm0_tte": [2.0, 4.0, 6.0],
+    "arm1_tte": [5.0, 7.0, 9.0],
+    "expected_favorable": 0.8888888888888888,
+    "expected_unfavorable": 0.1111111111111111,
+    "expected_net_benefit": 0.7777777777777778,
+    "expected_win_ratio": 8.0
+  },
+  "fgwas_wakefield_lnabf": {
+    "beta": 0.30,
+    "se": 0.05,
+    "V_fine_R_default": 0.1,
+    "expected_lnabf": 15.704189576403941
+  }
+}
