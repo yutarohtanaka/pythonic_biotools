@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cohort-curation"
+version = "0.1.0"
+description = "Public cancer genomics database clients and parsers: cBioPortal REST API, Broad Firehose GISTIC2, AACR GENIE panel masking, HGNC symbol repair, and ExPASy Cellosaurus"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cohort_curation"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
