@@ -7,6 +7,7 @@ import pysam
 import pytest
 
 from xenofilterR import (
+    Xenofilter,
     classify_reads,
     count_mismatches,
     run_xenofilter,
@@ -16,6 +17,7 @@ from xenofilterR.cli import main as cli_main
 
 
 BAM_CMATCH = 0
+BAM_CINS = 1
 BAM_CSOFT_CLIP = 4
 BAM_CHARD_CLIP = 5
 
@@ -355,4 +357,132 @@ def test_wdl_awk_classification_parity(tmp_path):
     assert float(rows["r_softclip_host"][2]) == pytest.approx(20.0)
     assert rows["r_half_host"][3] == "graft"
     assert float(rows["r_half_host"][2]) == pytest.approx(50.0)
+
+
+def test_settings_validation(tmp_path):
+    with pytest.raises(ValueError, match="settings"):
+        Xenofilter(settings="invalid")  # type: ignore[arg-type]
+
+    h_header = _make_header("chr1")
+    hb = tmp_path / "h.bam"
+    mb = tmp_path / "m.bam"
+    _write_bam(hb, h_header, [])
+    _write_bam(mb, h_header, [])
+
+    with pytest.raises(ValueError, match="settings"):
+        classify_reads(hb, mb, settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        run_xenofilter(hb, mb, tmp_path / "out.bam", settings="bad_mode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="settings"):
+        count_mismatches(None, settings="bad_mode")  # type: ignore[arg-type]
+
+
+def test_r_default_edit_distance_and_unmapped_penalty():
+    header = _make_header()
+
+    # CIGAR: 10H 5S 3I 92M, NM=4 (where NM includes the 3I + 1 mismatch)
+    # default: NM(4) + S(5) + H(10) = 19
+    # R_default (.Count_MM): NM(4) + S(5) + I(3) = 12 (no H, double-counts I!)
+    seg = _make_segment(
+        header,
+        "r_ins_hard",
+        seq_len=100,
+        cigar=[
+            (BAM_CHARD_CLIP, 10),
+            (BAM_CSOFT_CLIP, 5),
+            (BAM_CINS, 3),
+            (BAM_CMATCH, 92),
+        ],
+        nm=4,
+    )
+    assert count_mismatches(seg, settings="default") == 19
+    assert count_mismatches(seg, settings="R_default") == 12
+
+    # Unmapped mate penalty: default uses read length (100), R_default uses fixed 8
+    r1 = _make_segment(header, "half_pair", seq_len=100, nm=2, is_read1=True, mate_unmapped=True)
+    assert score_pair(r1, None, mismatch_cutoff=4, settings="default") == pytest.approx(51.0)
+    assert score_pair(
+        r1, None, mismatch_cutoff=4, unmapped_penalty=8, settings="R_default"
+    ) == pytest.approx(5.0)
+    assert score_pair(
+        r1, None, mismatch_cutoff=4, unmapped_penalty=12, settings="R_default"
+    ) == pytest.approx(7.0)
+
+
+def test_r_default_gating_supplementary_and_xenofilter_class(tmp_path):
+    h_header = _make_header("chr1_human")
+    m_header = _make_header("chr1_mouse")
+
+    human_bam = tmp_path / "r_human.bam"
+    mouse_bam = tmp_path / "r_mouse.bam"
+    out_default = tmp_path / "out_default.bam"
+    out_r = tmp_path / "out_r.bam"
+
+    human_records = [
+        # 1. Exact boundary ED == cutoff (4): default (<=4) keeps, R_default (<4) rejects
+        _make_segment(h_header, "boundary_se", nm=4, is_paired=False, pos=100),
+        # 2. Graft-only pair with R1=2 (<4) and R2=8 (>=4) -> avg=5.0:
+        #    default rejects (5.0 > 4), R_default keeps (min(2, 8) < 4 when unmapped in mouse!)
+        _make_segment(h_header, "graft_only_asym", nm=2, is_read1=True, pos=200),
+        _make_segment(h_header, "graft_only_asym", nm=8, is_read1=False, pos=400),
+        # 3. Dual-mapped pair with human R1=0, R2=5 (avg=2.5) vs mouse R1=4, R2=4 (avg=4.0):
+        #    default keeps (2.5 < 4.0 and 2.5 <= 4), R_default rejects because human R2=5 >= 4!
+        _make_segment(h_header, "dual_one_bad_mate", nm=0, is_read1=True, pos=600),
+        _make_segment(h_header, "dual_one_bad_mate", nm=5, is_read1=False, pos=800),
+        # 4. Supplementary-only alignment (0x800) with NM=1:
+        #    default filters out supplementary (unmapped -> inf -> ambiguous),
+        #    R_default retains supplementary and classifies as human!
+        _make_segment(
+            h_header,
+            "supp_human",
+            nm=1,
+            is_paired=False,
+            is_supplementary=True,
+            pos=1000,
+        ),
+        # 5. Half-mapped human pair (R1=1, R2 unmapped -> R_default avg=(1+8)/2=4.5) vs
+        #    half-mapped mouse pair (R1=3, R2 unmapped -> R_default avg=(3+8)/2=5.5):
+        #    default rejects (human avg=(1+100)/2=50.5 > 4),
+        #    R_default keeps because 4.5 < 5.5 AND mapped human mate R1=1 < 4!
+        _make_segment(
+            h_header, "half_both", nm=1, is_read1=True, mate_unmapped=True, pos=1200
+        ),
+    ]
+    mouse_records = [
+        _make_segment(m_header, "dual_one_bad_mate", nm=4, is_read1=True, pos=600),
+        _make_segment(m_header, "dual_one_bad_mate", nm=4, is_read1=False, pos=800),
+        _make_segment(
+            m_header, "half_both", nm=3, is_read1=True, mate_unmapped=True, pos=1200
+        ),
+    ]
+
+    _write_bam(human_bam, h_header, human_records)
+    _write_bam(mouse_bam, m_header, mouse_records)
+
+    xf_def = Xenofilter(mismatch_cutoff=4, settings="default")
+    xf_r = Xenofilter(mismatch_cutoff=4, unmapped_penalty=8, settings="R_default")
+
+    df_def = xf_def.run(human_bam, mouse_bam, out_default).set_index("read_name")
+    df_r = xf_r.run(human_bam, mouse_bam, out_r).set_index("read_name")
+
+    assert df_def.loc["boundary_se", "classification"] == "human"
+    assert df_r.loc["boundary_se", "classification"] == "ambiguous"
+
+    assert df_def.loc["graft_only_asym", "classification"] == "ambiguous"
+    assert df_r.loc["graft_only_asym", "classification"] == "human"
+
+    assert df_def.loc["dual_one_bad_mate", "classification"] == "human"
+    assert df_r.loc["dual_one_bad_mate", "classification"] == "ambiguous"
+
+    assert "supp_human" not in df_def.index
+    assert df_r.loc["supp_human", "classification"] == "human"
+
+    assert df_def.loc["half_both", "classification"] == "ambiguous"
+    assert df_r.loc["half_both", "classification"] == "human"
+    assert df_r.loc["half_both", "human_mm"] == pytest.approx(4.5)
+    assert df_r.loc["half_both", "mouse_mm"] == pytest.approx(5.5)
+
+    with pysam.AlignmentFile(str(out_r), "rb") as bam_r:
+        kept_r = {rec.query_name for rec in bam_r.fetch(until_eof=True)}
+    assert kept_r == {"graft_only_asym", "supp_human", "half_both"}
 
