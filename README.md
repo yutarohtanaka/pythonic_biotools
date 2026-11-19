@@ -10,6 +10,7 @@ Each directory is an independent, self-contained package (`pyproject.toml` + `py
 
 - **[Use Cases by Biological & Statistical Problem (`docs/USE_CASES_BY_PROBLEM.md`)](docs/USE_CASES_BY_PROBLEM.md)** — Problem-driven guide mapping analysis tasks to standalone tools and multi-tool workflows.
 - **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables for selecting among Mendelian Randomization, colocalization/mediation, conditional/collider-adjusted GWAS, bulk deconvolution, differential expression/mixed-model/shrinkage, somatic cancer genomics/progression-modeling, and epigenomics/single-cell multi-omics tools.
+- **[Upstream Parity Guide & Dual Scorecard (`docs/UPSTREAM_PARITY_AND_SCORECARD.md`)](docs/UPSTREAM_PARITY_AND_SCORECARD.md)** — Complete 42-package source-to-source comparison against upstream R/C++/Fortran repositories and Bioconda, documenting `settings="default"` (`88.3%` mean parity) vs. `settings="R_default"` (`97.8%` mean parity, `95%–100%` across all 42 packages).
 
 ---
 
@@ -101,6 +102,24 @@ pythonic_biotools/
 ## Licensing Note
 
 Root repository scaffolding and MIT-designated packages are licensed under the [MIT License](LICENSE). Individual ports derived from copyleft upstream statistical packages carry their respective compatible copyleft SPDX licenses in their local `pyproject.toml` (`GPL-2.0-or-later` in `timeroc`; `GPL-3.0-or-later` in `cause`, `mrpresso`, `mrraps`, `mtcojo`, and `smr-heidi`; `AGPL-3.0-or-later` in `evam`).
+
+---
+
+## Upstream Parity Mode (`settings="R_default"`)
+
+Every package supports `settings="default"` (statistically hardened, numerically stabilized Pythonic defaults) and `settings="R_default"` (strict formula-, threshold-, and convention-level replication of the original R / C++ / Fortran tool):
+
+```python
+from xenofilterR import Xenofilter
+from mrbee import fit_mrbee
+from facets import run_facets
+
+xf = Xenofilter(mismatch_cutoff=4, settings="R_default")
+res_mrbee = fit_mrbee(bx, sx, by, sy, settings="R_default")
+res_facets = run_facets(pileup_df, settings="R_default")
+```
+
+See [`docs/UPSTREAM_PARITY_AND_SCORECARD.md`](docs/UPSTREAM_PARITY_AND_SCORECARD.md) for the full 42-package dual scorecard (`88.3%` mean parity under `default` vs. `97.8%` mean parity under `R_default`).
 
 ---
 
