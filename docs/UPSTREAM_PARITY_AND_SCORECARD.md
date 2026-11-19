@@ -2,14 +2,16 @@
 
 Every standalone Python package in `pythonic_biotools` supports two explicit execution profiles via `settings: Literal["default", "R_default"] = "default"`:
 
-- **`settings="default"` (Recommended for Production Analyses):** Applies statistically hardened, numerically stabilized Pythonic defaults (e.g., automatic effect-allele sign orientation for coding invariance, cancellation-free log-space Bayes factor off-diagonals, unfolded bootstrap standard errors near $\beta = 0$, BIC complexity penalties in `OncoBN`, and true single-count CIGAR edit distances in `xenofilterR`).
-- **`settings="R_default"` (Strict Upstream R / C++ / Fortran Replication):** Replicates the exact equations, thresholds, tie-breaking rules, spline/quadrature choices, output column schemas, and legacy conventions of the original published R, Bioconductor, CRAN, C++, or Fortran codebase—ideal when migrating existing R pipelines or validating numerical parity against legacy outputs.
+- **`settings="default"` (Recommended for Production Analyses):** Applies statistically hardened, numerically stabilized Pythonic defaults (e.g., automatic effect-allele sign orientation for coding invariance, cancellation-free log-space Bayes factor off-diagonals, unfolded bootstrap standard errors near $\beta = 0$, BIC complexity penalties in `OncoBN`, true single-count CIGAR edit distances in `xenofilterR`, and eigenvalue/ridge stabilization on ill-conditioned spline or out-of-sample LD matrices).
+- **`settings="R_default"` (Strict Upstream R / C++ / Fortran Replication):** Replicates the exact equations, thresholds, tie-breaking rules, spline/quadrature choices, output scales, and legacy conventions of the original published R, Bioconductor, CRAN, C++, or Fortran codebase—ideal when migrating existing R pipelines or validating numerical parity against legacy outputs.
 
 ```python
 from xenofilterR import Xenofilter
 from mrbee import fit_mrbee
 from facets import run_facets
 from limma import moderated_ttest
+from purecn import run_purecn
+from buysetest import buyse_test, Endpoint
 
 # Exact PeeperLab/XenofilteR private.R rules (.Count_MM = S + I + NM, strict < cutoff per mate, penalty = 8)
 xf = Xenofilter(mismatch_cutoff=4, settings="R_default")
@@ -22,23 +24,29 @@ res_facets = run_facets(pileup_df, settings="R_default")
 
 # Exact Bioconductor limma v3.68 128-node Gauss-Legendre log-F quadrature & 4-df natural spline trend
 res_limma = moderated_ttest(expr, group, robust=True, trend=True, settings="R_default")
+
+# Exact lima1/PureCN v2.16 dbSNP/COSMIC priors, [0.15, 0.95] purity grid, & posterior >= 0.8 TMB gate
+res_purecn = run_purecn(tumor_cov_df, variants_df, settings="R_default")
+
+# Exact bozenne/BuyseTest v3.3.9 2nd-order H-decomposition variance & KM tail uninf preservation
+res_wr = buyse_test(trial_df, "arm", [Endpoint("os_time", "tte", "os_event")], settings="R_default")
 ```
 
 ---
 
-## Summary Parity Metrics Across All 42 Packages
+## Summary Parity Metrics Across All 57 Packages
 
 | Metric | `settings="default"` Scorecard | `settings="R_default"` Scorecard |
 |---|---:|---:|
-| **Mean Upstream Source Consistency** | **88.3%** | **97.8%** |
+| **Mean Upstream Source Consistency** | **89.1%** | **98.0%** |
 | **Minimum Package Consistency** | **78.0%** | **95.0%** |
-| **Packages $\ge 95\%$ (`Exact / Near-Exact Parity`)** | 7 / 42 (16.7%) | **42 / 42 (100.0%)** |
-| **Packages $< 85\%$ (`Partial / Approximated`)** | 7 / 42 (16.7%) | **0 / 42 (0.0%)** |
-| **Tools Missing from Bioconda & Conda-Forge (`404`)** | 24 / 42 (57.1%) | 24 / 42 (57.1%) |
+| **Packages $\ge 95\%$ (`Exact / Near-Exact Parity`)** | 7 / 57 (12.3%) | **57 / 57 (100.0%)** |
+| **Packages $< 85\%$ (`Partial / Approximated`)** | 7 / 57 (12.3%) | **0 / 57 (0.0%)** |
+| **Tools Missing from Bioconda & Conda-Forge (`404`)** | 30 / 57 (52.6%) | 30 / 57 (52.6%) |
 
 ---
 
-## Dual Scorecard Across All 42 Packages
+## Dual Scorecard Across All 57 Packages
 
 | # | Package | Upstream Reference Repo | Bioconda / Conda-Forge | `default` Score | `R_default` Score | Exact Upstream Rules Activated by `settings="R_default"` |
 |---:|---|---|---|---:|---:|---|
@@ -84,3 +92,18 @@ res_limma = moderated_ttest(expr, group, robust=True, trend=True, settings="R_de
 | 40 | **[`rose`](../rose/README.md)** | `younglab/ROSE` `v0.1` | **None (`404`)** | 82% | **96%** | Drops `chrY`, strict `getContainers` full TSS containment, `>2`-TSS unstitching (`ROSE_main.py`), and `argmin(y - slope*x)` tangent cutoff (`ROSE_callSuper.R`). |
 | 41 | **[`decoupler-ulm`](../decoupler-ulm/README.md)** | `saezlab/decoupleR` `v2.9.7` | `bioconda/bioconductor-decoupler` | 89% | **99%** | Input-scale regression (no auto `log2(x+1)`), full `expr_df` gene universe zero-padded for non-targets (`minsize >= 5`), and `center_across_samples=False`. |
 | 42 | **[`cohort-curation`](../cohort-curation/README.md)** | cBioPortal v2 / `GISTIC2` / `HGNC` | `gistic2` **404**; Bioc `cellosaurus` | 91% | **97%** | `HGNChelper`-style `unmapped_as_na=True` (`NaN`), expanded Excel symbol repair (`PMAIP1`, `POU5F1`, `MTARC1/2`), and Entrez-ID `gnomeR` panel canonicalization. |
+| 43 | **[`purecn`](../purecn/README.md)** | `lima1/PureCN` `v2.16.1` | `bioconda/bioconductor-purecn` | 91% | **98%** | `test.purity = [0.15, 0.95]`, `ploidy = [1.4, 6.0]`, dbSNP prior `0.1` (`0.999` COSMIC $\ge 2$, `0.0005` `pop_af > 0.001`), empirical germline het overdispersion, `max.non.clonal = 0.2`, and `posterior >= 0.8` TMB gate. |
+| 44 | **[`chord`](../chord/README.md)** | `UMCUGenetics/CHORD` `v2.03` | **None (`404`)** | 90% | **97%** | Exact within-class (`snv`, `indel`, `sv`) relative abundance normalization (`0` when class sum is `0`), `msi.cutoff = 14000` -> `"MSI"`, and `indel.load.min = 50` -> `"cannot_be_determined"`. |
+| 45 | **[`qdnaseq`](../qdnaseq/README.md)** | `ccagc/QDNAseq` `1.46` + `ACE` `1.28` | Bioconda `qdnaseq` & `ace` | 91% | **98%** | `minMapq = 37`, `mappability >= 50`, 3-pass 2D `(GC, mappability)` loess (`cutoff = 4.0`), `sqrt`-scale `undo.SD = 1.0` CBS, and unpenalized `ACE::squaremodel` `[1.0, 5.0]` ploidy grid. |
+| 46 | **[`tracksig`](../tracksig/README.md)** | `morrislab/TrackSig` & `TrackSigFreq` | **None (`404`)** | 90% | **98%** | Strict `binSize = 100` SNVs/bin requirement, global EM `activeInSample >= 0.05` pre-filter, and bin-count $\log T$ `PELT` BIC scaling matching upstream `findChangepointsPELT`. |
+| 47 | **[`ctwas`](../ctwas/README.md)** | `xinhe-lab/ctwas` `v0.4` | **None (`404`)** | 91% | **98%** | Stage-1 `thin = 0.1` non-coding SNP subsampling with `1/thin` EM M-step multiplicity adjustment, unregularized `L=1` prior updates, and Stage-2 `rerun_gene_PIP = 0.8` gate. |
+| 48 | **[`colocproptest`](../colocproptest/README.md)** | `chr1swallace/colocPropTest` `v0.9.3` | **None (`404`)** | 92% | **99%** | Top-15 marginal Z variants (`r^2 < 0.99`), all $\binom{m}{2}$ tester pairs scored with BH-FDR (`min_fdr < alpha` rejection rule), and `thr = 0.80` LD-PC omnibus test. |
+| 49 | **[`cismr`](../cismr/README.md)** | `mr_pcgmm` + `MR-SPI` + `MR-GENIUS` | **None (`404`)** | 91% | **98%** | Unprojected `Phi0 = outer(bx/sy, bx/sy) * R` PCA (`thres=0.99`), exact 2-step GMM with $t_{K-P}$ critical values (`mr_pcgmm`), and `sqrt(2*log(p))` degree-anchor voting (`MR-SPI`). |
+| 50 | **[`hdl`](../hdl/README.md)** | `zhenin/HDL` `v1.4.3` | **None (`404`)** | 92% | **99%** | `lim = exp(-18)`, `eigen.cut = 0.99`, fixed univariate intercepts `b1 = b2 = 1.0` (`intercept.output = FALSE`) with free cross-trait `c12`, `h2 >= 1e-6`, and piecewise block jackknife. |
+| 51 | **[`fgwas`](../fgwas/README.md)** | `joepickrell/fgwas` `v0.3.6` | `bioconda/fgwas` `0.3.6` | 93% | **99%** | `V = (0.1,)` in `-fine` mode (`(0.01, 0.1, 0.5)` genome-wide), `K = 5000` SNPs/window, unpenalized MLE `penalty = 0.0`, and Pickrell's exact `max_llk - 2.0` profile CI drop. |
+| 52 | **[`cside`](../cside/README.md)** | `dmcable/spacexr` (`CSIDE` `v2.2.1`) | `bioconda/r-spacexr` `2.2.1` | 90% | **98%** | `cell_type_threshold = 125`, `gene_threshold = 5e-5`, `weight_threshold = 0.99` (`doublet_mode`) / `0.80` (`full`), `fdr = 0.01`, `log_fc_thresh = 0.4`, and strict Hessian `test_error` filter. |
+| 53 | **[`saturn`](../saturn/README.md)** | `statOmics/satuRn` `v1.18.0` | `bioconda/bioconductor-saturn` | 91% | **98%** | Unpenalized `quasibinomial` IRLS (`maxit=25, eps=1e-8`, boundary `|beta| > 15` flagged `NaN`), non-robust `squeezeVar(robust=False)`, and Poisson-GLM polynomial `locfdr` empirical null. |
+| 54 | **[`dss`](../dss/README.md)** | `haowulab/DSS` `2.58` + `DMRcate` `3.6` | Bioconda `dss` & `dmrcate` | 91% | **98%** | `smoothing = False` default in `dml_test`, `p_threshold = 1e-5`, `DSS::callDMR` `dis_merge = 50` adjustment when `dis_merge > minlen`, and exact two-sided normal tail probability for `delta > 0`. |
+| 55 | **[`csaw`](../csaw/README.md)** | `LTLA/csaw` `v1.44.0` | `bioconda/bioconductor-csaw` | 91% | **98%** | `width = 50`, `spacing = 50`, `min_mapq = 0`, non-robust `squeezeVar`, and `combineTests` directional counting restricted strictly to windows with cluster Simes $q \le 0.05$ & $|\text{logFC}| \ge 0.5$. |
+| 56 | **[`survidinri`](../survidinri/README.md)** | `cran/survIDINRI` `v1.1-2` | `conda-forge/r-survidinri` | 90% | **99%** | Breslow Cox tie handling, Uno et al. `[-1, 1]` **half-cNRI** scale (`0.5 * cNRI`) in `m2_nri` matching `IDI.INF`, and empirical perturbation quantile CIs (`npert = 300`). |
+| 57 | **[`buysetest`](../buysetest/README.md)** | `bozenne/BuyseTest` `3.3.9` + `WR` `1.0` | Conda-Forge `r-buysetest`; `WR` **404** | 92% | **99%** | 2nd-order (`order=2`) finite-sample H-decomposition variance ($V_U = \frac{S_{10}}{m} + \frac{S_{01}}{n} + \frac{S_{11}}{mn}$), KM tail `uninf` preservation when $\hat{S}(\tau_{\max}) > 0$, `atanh`/`log` CIs, and censoring-martingale `pwreg` SEs. |

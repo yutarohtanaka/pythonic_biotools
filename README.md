@@ -1,36 +1,42 @@
 # Pythonic Biotools
 
-Pythonic implementations of published R, C++, Fortran, and command-line bioinformatics, cancer genomics, and statistical genetics libraries.
+Pythonic implementations of published R, C++, Fortran, and command-line bioinformatics, cancer genomics, spatial/single-cell omics, clinical trial biostatistics, and statistical genetics libraries.
 
-Each directory is an independent, self-contained package (`pyproject.toml` + `pytest` suite) so any individual tool—such as [`slopehunter`](slopehunter/README.md), [`mrpresso`](mrpresso/README.md), [`hyprcoloc`](hyprcoloc/README.md), [`facets`](facets/README.md), [`dndscv`](dndscv/README.md), [`sva`](sva/README.md), [`variancepartition`](variancepartition/README.md), [`mashr`](mashr/README.md), [`numbat`](numbat/README.md), [`discover`](discover/README.md), [`shatterseek`](shatterseek/README.md), [`limma`](limma/README.md), or [`chromvar`](chromvar/README.md)—can be installed and used standalone without `rpy2`, compiled Fortran toolchains, or external R sessions.
+Each directory is an independent, self-contained package (`pyproject.toml` + `pytest` suite) so any individual tool—such as [`slopehunter`](slopehunter/README.md), [`mrpresso`](mrpresso/README.md), [`hyprcoloc`](hyprcoloc/README.md), [`ctwas`](ctwas/README.md), [`cismr`](cismr/README.md), [`hdl`](hdl/README.md), [`facets`](facets/README.md), [`purecn`](purecn/README.md), [`chord`](chord/README.md), [`qdnaseq`](qdnaseq/README.md), [`tracksig`](tracksig/README.md), [`dndscv`](dndscv/README.md), [`sva`](sva/README.md), [`variancepartition`](variancepartition/README.md), [`mashr`](mashr/README.md), [`numbat`](numbat/README.md), [`cside`](cside/README.md), [`saturn`](saturn/README.md), [`dss`](dss/README.md), [`csaw`](csaw/README.md), [`survidinri`](survidinri/README.md), or [`buysetest`](buysetest/README.md)—can be installed and used standalone without `rpy2`, compiled Fortran toolchains, or external R sessions.
 
 ---
 
 ## Documentation Guides
 
 - **[Use Cases by Biological & Statistical Problem (`docs/USE_CASES_BY_PROBLEM.md`)](docs/USE_CASES_BY_PROBLEM.md)** — Problem-driven guide mapping analysis tasks to standalone tools and multi-tool workflows.
-- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables for selecting among Mendelian Randomization, colocalization/mediation, conditional/collider-adjusted GWAS, bulk deconvolution, differential expression/mixed-model/shrinkage, somatic cancer genomics/progression-modeling, and epigenomics/single-cell multi-omics tools.
-- **[Upstream Parity Guide & Dual Scorecard (`docs/UPSTREAM_PARITY_AND_SCORECARD.md`)](docs/UPSTREAM_PARITY_AND_SCORECARD.md)** — Complete 42-package source-to-source comparison against upstream R/C++/Fortran repositories and Bioconda, documenting `settings="default"` (`88.3%` mean parity) vs. `settings="R_default"` (`97.8%` mean parity, `95%–100%` across all 42 packages).
+- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables for selecting among Mendelian Randomization, cis-MR/causal TWAS/colocalization, genetic correlation/functional fine-mapping, conditional/collider-adjusted GWAS, bulk & spatial deconvolution/DE, differential expression/isoform DTU/mixed-model/shrinkage, clinical survival & trial endpoints, somatic cancer genomics, and epigenomics/methylation tools.
+- **[Upstream Parity Guide & Dual Scorecard (`docs/UPSTREAM_PARITY_AND_SCORECARD.md`)](docs/UPSTREAM_PARITY_AND_SCORECARD.md)** — Complete 57-package source-to-source comparison against upstream R/C++/Fortran repositories and Bioconda, documenting `settings="default"` (`89.1%` mean parity) vs. `settings="R_default"` (`98.0%` mean parity, `95%–100%` across all 57 packages).
 
 ---
 
-## Tools Implemented (42 Python Packages + WDL Workflows)
+## Tools Implemented (57 Python Packages + WDL Workflows)
 
-### 1. Bulk Deconvolution & Xenograft Read Filtering
+### 1. Bulk & Spatial Deconvolution, Spatial Cell-Type DE & Xenograft Filtering
 | Directory | Import Name | License | Published Tool & Citation |
 |---|---|---|---|
-| **[`xenofilterR/`](xenofilterR/README.md)** | `xenofilterR` | MIT | **XenofilteR**: Read-level `NM` + CIGAR clip edit-distance filtering of host reads from xenograft BAMs (Kluin et al., *BMC Bioinformatics* 2018). |
+| **[`xenofilterR/`](xenofilterR/README.md)** | `xenofilterr` / `xenofilterR` | MIT | **XenofilteR**: Read-level `NM` + CIGAR clip edit-distance filtering of host reads from xenograft BAMs (Kluin et al., *BMC Bioinformatics* 2018). |
 | **[`music/`](music/README.md)** | `music` | MIT | **MuSiC / MuSiC2**: Cross-subject variance-weighted NNLS bulk RNA-seq deconvolution on `AnnData` (Wang et al., *Nat Commun* 2019; Fan et al., *Brief Bioinform* 2022). |
 | **[`bayesprism/`](bayesprism/README.md)** | `pythonic_bayesprism` | MIT | **BayesPrism**: Bayesian Gibbs deconvolution of cell-type fractions, sample-specific cell-type expression, and spatial MLE updates (Chu et al., *Nat Cancer* 2022). |
 | **[`bisque/`](bisque/README.md)** | `bisque` | MIT | **Bisque**: Reference-based bulk RNA-seq deconvolution learning gene-specific affine domain alignments from single-cell pseudobulks prior to NNLS, plus marker-gene PCA scoring on `AnnData` (Jew et al., *Nat Commun* 2020). |
-| **[`cibersortx/`](cibersortx/README.md)** | `cibersortx` | MIT | **CIBERSORT / CIBERSORTx** *(independent clean-room implementation)*: Signature matrix construction, linear $\nu$-SVR deconvolution, `B-mode`/`S-mode` Empirical Bayes batch alignment, Group-Mode NNLS cell-type GEP estimation, and High-Resolution sample-specific purification implemented from published mathematical formulations (Newman et al., *Nat Methods* 2015; *Nat Biotechnol* 2019). |
+| **[`cibersortx/`](cibersortx/README.md)** | `cibersortx` | MIT | **CIBERSORT / CIBERSORTx** *(independent clean-room implementation)*: Signature matrix construction, linear $\nu$-SVR deconvolution, `B-mode`/`S-mode` Empirical Bayes batch alignment, Group-Mode NNLS cell-type GEP estimation, and High-Resolution sample-specific purification (Newman et al., *Nat Methods* 2015; *Nat Biotechnol* 2019). |
+| **[`cside/`](cside/README.md)** | `cside` | MIT | **CSIDE (`spacexr`)**: Cell-type-specific differential expression in spatial transcriptomics via Gauss–Hermite Poisson–lognormal mixture GLMs and 2D thin-plate / B-spline spatial bases on `AnnData` (Cable et al., *Nat Methods* 2022). |
 
-### 2. Mendelian Randomization, Colocalization & Locus Mediation
+### 2. Mendelian Randomization, Causal TWAS, Colocalization, Genetic Correlation & Fine-Mapping
 | Directory | Import Name | License | Published Tool & Citation |
 |---|---|---|---|
 | **[`coloc/`](coloc/README.md)** | `coloc` | MIT | **coloc (`coloc.abf`)**: Log-space Approximate Bayes Factor two-trait colocalization (Wakefield, *Genet Epidemiol* 2009; Giambartolomei et al., *PLOS Genet* 2014). |
 | **[`hyprcoloc/`](hyprcoloc/README.md)** | `hyprcoloc` | MIT | **HyPrColoc**: Deterministic $O(MQ)$ multi-trait Bayesian colocalization and branch-and-bound trait clustering (Foley et al., *Nat Commun* 2021). |
+| **[`colocproptest/`](colocproptest/README.md)** | `colocproptest` | MIT | **colocPropTest**: LD-robust frequentist proportional colocalization testing across SNP tester pairs and LD principal components under multiple causal variants (Wallace, *AJHG* 2023). |
 | **[`smr-heidi/`](smr-heidi/README.md)** | `smr_heidi` | GPL-3.0+ | **SMR, SMR-multi & HEIDI**: cis-xQTL + GWAS Summary-data-based MR and LD-aware locus `HEIDI` heterogeneity testing (Zhu et al., *Nat Genet* 2016; Wu et al., *Nat Commun* 2018). |
+| **[`ctwas/`](ctwas/README.md)** | `ctwas` | MIT | **cTWAS**: Causal Transcriptome/Proteome-Wide Association Study separating causal molecular traits from LD hitchhiking and direct non-coding SNPs via Empirical Bayes EM + group-prior SuSiE-RSS (Zhao et al., *Nat Genet* 2024). |
+| **[`cismr/`](cismr/README.md)** | `cismr` | MIT | **PC-GMM, MV-PC-GMM, MR-SPI & MR-GENIUS**: Correlated drug-target cis-MR via LD principal-component GMM with Sargan $J$-tests (Burgess et al., 2020), pair-voting valid-IV clique selection (Yao et al., *Biometrics* 2024), and heteroskedastic G-estimation (Tchetgen Tchetgen et al., 2021). |
+| **[`hdl/`](hdl/README.md)** | `hdl` | MIT | **HDL, HDL-L & HDL.S**: High-Definition Likelihood global, local single-locus, and annotation-stratified heritability and genetic correlation over regularized LD eigenpanels (Ning et al., *Nat Genet* 2020). |
+| **[`fgwas/`](fgwas/README.md)** | `fgwas` | MIT | **fgwas**: Hierarchical functional annotation enrichment, cross-validated ridge regularization, stepwise model selection, and re-weighted Bayesian GWAS fine-mapping (Pickrell, *AJHG* 2014). |
 | **[`twosamplemr/`](twosamplemr/README.md)** | `twosamplemr` | MIT | **TwoSampleMR / MVMR**: `IVW` (Burgess et al., 2013), coding-invariant `MR-Egger` (Bowden et al., *IJE* 2015), `Weighted Median` (Bowden et al., 2016), `MVMR` with Sanderson–Windmeijer $F$ (Sanderson et al., 2019), allele harmonization & LD clumping. |
 | **[`mrpresso/`](mrpresso/README.md)** | `mrpresso` | GPL-3.0+ | **MR-PRESSO / MVMR-PRESSO**: Vectorized horizontal pleiotropy Global, Outlier, and Distortion tests (Verbanck et al., *Nat Genet* 2018). |
 | **[`mrraps/`](mrraps/README.md)** | `mrraps` | GPL-3.0+ | **mr.raps**: Robust Adjusted Profile Score two-sample MR with `l2`, `huber`, and `tukey` losses (Zhao et al., *Ann Stat* 2020). |
@@ -49,10 +55,11 @@ Each directory is an independent, self-contained package (`pyproject.toml` + `py
 | **[`colliderbias/`](colliderbias/README.md)** | `colliderbias` | MIT | **ColliderBias**: Instrumental-effect `CWLS` (`methodCB`) and bivariate `CWBLS` (Cai et al., *Genet Epidemiol* 2022; Cai & Dudbridge, 2024). |
 | **[`mtcojo/`](mtcojo/README.md)** | `mtcojo` | GPL-3.0+ | **GCTA-mtCOJO & GSMR**: Multi-trait conditional & joint GWAS summary analysis, two-step LDSC, `.bim` allele alignment, and `HEIDI-outlier` filtering (Zhu et al., *Nat Commun* 2018). |
 
-### 4. Differential Expression, Confounding, Mixed Models, Shrinkage & Survival Biostatistics
+### 4. Differential Expression, Isoform DTU, Mixed Models, Shrinkage & Clinical Survival Biostatistics
 | Directory | Import Name | License | Published Tool & Citation |
 |---|---|---|---|
 | **[`limma/`](limma/README.md)** | `limma` | MIT | **limma (`eBayes`)**: Empirical Bayes moderated linear models, contrasts, `limma-trend`, and `robust=True` outlier variance winsorization (Smyth, *SAGMB* 2004; Phipson et al., *NAR* 2016). |
+| **[`saturn/`](saturn/README.md)** | `saturn` | MIT | **satuRn & stageR**: Fast quasi-binomial Empirical Bayes differential transcript/exon usage (`DTU`), `locfdr` empirical-null recalibration, and two-stage OFDR screening on `AnnData` or bulk counts (Gilis et al., *F1000Res* 2022). |
 | **[`sva/`](sva/README.md)** | `sva` | MIT | **SVA / `svaseq`**: Buja–Eyuboglu and asymptotic `num_sv` rank estimation, Iteratively Reweighted SVA (`irwsva`), two-step/supervised SVA, moderated log-count `svaseq`, and vectorized nested `f_pvalue` F-tests (Leek & Storey, *PLOS Genet* 2007; Leek, *NAR* 2014). |
 | **[`variancepartition/`](variancepartition/README.md)** | `variancepartition` | MIT | **variancePartition & `dream`**: Batched REML linear mixed models, ICC variance decomposition across fixed and random covariates, Satterthwaite degrees of freedom, and Empirical Bayes (`squeeze_var`) repeated-measures differential expression (Hoffman & Schadt, *BMC Bioinformatics* 2016; Hoffman & Roussos, *Bioinformatics* 2021). |
 | **[`nebula/`](nebula/README.md)** | `nebula` | MIT | **NEBULA (`NEBULA-LN` / `NEBULA-HL`)**: Fast multi-subject Negative Binomial mixed models (`NBGMM`, `PMM`, `NBLMM`) for sparse `AnnData` scRNA-seq using analytical marginal moments and h-likelihood saddlepoint approximation (He et al., *Commun Biol* 2021). |
@@ -60,11 +67,17 @@ Each directory is an independent, self-contained package (`pyproject.toml` + `py
 | **[`logistf/`](logistf/README.md)** | `logistf` | MIT | **logistf**: Firth Jeffreys-prior penalized logistic regression with Profile Penalized Likelihood CIs and Penalized LRTs (Firth, *Biometrika* 1993; Heinze & Schemper, *Stat Med* 2002). |
 | **[`biostats/`](biostats/README.md)** | `pythonic_biostats` | MIT | **survival / cmprsk / sandwich / qvalue**: Efron-tie Cox PH (Efron, 1977), time-varying IPCW Fine–Gray competing risks with martingale sandwich SEs (Fine & Gray, *JASA* 1999), HC3 WLS (MacKinnon & White, 1985), pooled-null permutation FDR, and Storey cubic-spline `qvalue` (Storey & Tibshirani, *PNAS* 2003). |
 | **[`timeroc/`](timeroc/README.md)** | `timeroc` | GPL-2.0+ | **timeROC**: IPCW time-dependent ROC curves, competing-risks `AUC_1`/`AUC_2`, asymptotic IID influence-function SEs, simultaneous confidence bands, and paired biomarker comparisons (Blanche et al., *Stat Med* 2013). |
+| **[`survidinri/`](survidinri/README.md)** | `survidinri` | MIT | **survIDINRI**: Right-censored survival Integrated Discrimination Improvement (`IDI`), continuous/categorical Net Reclassification Improvement (`NRI`), and median risk improvement with multiplier perturbation resampling (Uno et al., *Stat Med* 2013). |
+| **[`buysetest/`](buysetest/README.md)** | `buysetest` | MIT | **BuyseTest & `WR::pwreg`**: Stratified Generalized Pairwise Comparisons (Win Ratio, Net Benefit, Win Odds) with Péron Kaplan–Meier survival-integral censoring correction and proportional win-fractions regression (Péron et al., *Stat Med* 2016; Mao & Wang, *JASA* 2020). |
 
-### 5. Cancer Somatic Genomics, Structural Variants, Epigenomics & Public Cohorts
+### 5. Cancer Somatic Genomics, Liquid Biopsy, Mutational Signatures, Epigenomics & Methylation
 | Directory | Import Name | License | Published Tool & Citation |
 |---|---|---|---|
 | **[`facets/`](facets/README.md)** | `facets` | MIT | **FACETS & ASCAT**: GC/depth LOWESS normalization, bivariate Hotelling-$T^2$ CBS on $\log R$ and $\log\text{OR}^2$, and Gaussian/folded-normal EM for allele-specific copy number, purity, ploidy, LOH, and CCF, paired with `ASCAT` equations (Shen & Seshan, *NAR* 2016; Van Loo et al., *PNAS* 2010). |
+| **[`purecn/`](purecn/README.md)** | `purecn` | MIT | **PureCN**: Tumor-only clinical panel GC/Tangent coverage normalization, 2D purity/ploidy optimization, Beta-Binomial somatic-vs-germline classification, LOH, CCF, and artifact-cleaned TMB/CIN (Riester et al., *Source Code Biol Med* 2016). |
+| **[`qdnaseq/`](qdnaseq/README.md)** | `qdnaseq` | MIT | **QDNAseq & ACE**: Shallow/low-pass WGS (`lpWGS`) & cfDNA 2D `(GC, mappability)` loess read-depth correction, CBS copy-number calling, and `ACE` reference-free cellularity/ploidy estimation (Scheinin et al., *Genome Res* 2014; Poell et al., *Bioinformatics* 2019). |
+| **[`chord/`](chord/README.md)** | `chord` | MIT | **CHORD & mutSigExtractor**: Pan-cancer HRD prediction and `BRCA1`-type vs. `BRCA2`-type subtyping from 96-trinucleotide SNV, microhomology indel (`bimh`), and SV length/type contexts (Nguyen et al., *Nat Commun* 2020). |
+| **[`tracksig/`](tracksig/README.md)** | `tracksig` | MIT | **TrackSig & TrackSigFreq**: CCF evolutionary pseudotime ordering, SQUAREM multinomial signature EM, and Pruned Exact Linear Time (`PELT`) changepoint segmentation of mutational signature trajectories (Rubanova et al., *Nat Commun* 2020). |
 | **[`dndscv/`](dndscv/README.md)** | `dndscv` | MIT | **dNdScv**: Coding-strand 192-context `RefCDS` builder, 192-parameter trinucleotide Poisson MLE, Negative Binomial covariate regression, and gene-level $w_{\text{mis}}, w_{\text{non}}, w_{\text{spl}}, w_{\text{ind}}$ LRTs (Martincorena et al., *Cell* 2017). |
 | **[`numbat/`](numbat/README.md)** | `numbat` | MIT | **Numbat**: Haplotype-aware Beta-Binomial + Poisson-LogNormal HMM (with optional `numba` acceleration and pure NumPy/SciPy fallback) for single-cell allele-specific CNVs, CN-neutral LOH, malignant cell scoring, and NJ + NNI ML tumor phylogenies on `AnnData` (Gao et al., *Nat Biotechnol* 2023). |
 | **[`discover/`](discover/README.md)** | `discover` | MIT | **DISCOVER**: Maximum-entropy background mutation burden modeling and exact DFT Poisson-Binomial pairwise/groupwise somatic mutual exclusivity & co-occurrence (Canisius et al., *Genome Biol* 2016). |
@@ -72,6 +85,8 @@ Each directory is an independent, self-contained package (`pyproject.toml` + `py
 | **[`shatterseek/`](shatterseek/README.md)** | `shatterseek` | MIT | **ShatterSeek**: Chromothripsis detection and PCAWG confidence classification from interleaved structural variants and oscillating copy-number chains (Cortés-Ciriano et al., *Nat Genet* 2020). |
 | **[`scarhrd/`](scarhrd/README.md)** | `scarhrd` | MIT | **scarHRD**: Homologous Recombination Deficiency genomic scar scoring (`HRD-LOH`, `TAI`, `LST`, and clinical `HRD-sum`) across `GRCh38`/`GRCh37` (Sztupinszki et al., *NPJ Breast Cancer* 2018). |
 | **[`evam/`](evam/README.md)** | `evam` | AGPL-3.0+ | **EvAM-Tools (`Oncotree`, `OncoBN`, `H-CBN`, `MHN`)**: Cross-sectional evolutionary accumulation models with BIC complexity control (Desper et al., 1999; Gerstung et al., 2009; Schill et al., 2020; Nicol et al., 2021; Diaz-Uriarte & Herrera-Nieto, *Bioinformatics* 2022). |
+| **[`dss/`](dss/README.md)** | `dss` | MIT | **DSS & DMRcate**: Bisulfite / EM-seq differential DNA methylation (`DML` & `DMR`) via BSmooth tricube smoothing, log-normal Empirical Bayes Beta-Binomial dispersion shrinkage, multifactor arcsine GLS (`DSS-general`), and Gaussian-kernel Satterthwaite `DMRcate` (Wu et al., *NAR* 2013; Park & Wu, *Bioinformatics* 2016; Peters et al., 2015). |
+| **[`csaw/`](csaw/README.md)** | `csaw` | MIT | **csaw**: Peak-free sliding-window differential ChIP-seq / ATAC-seq / CUT&RUN binding analysis with TMM/loess normalization, NB Quasi-Likelihood F-tests, and Simes region-level FDR control (Lun & Smyth, *NAR* 2016). |
 | **[`chromvar/`](chromvar/README.md)** | `chromvar` | MIT | **chromVAR**: Sparse-ready GC- and accessibility-corrected TF motif deviations & variability (Schep et al., *Nat Methods* 2017), plus GTF TSS & log-odds PWM scanning (Wasserman & Sandelin, 2004). |
 | **[`figr/`](figr/README.md)** | `figr` | MIT | **FigR**: Paired scATAC+scRNA cis peak-to-gene Spearman Z-tests against GC/accessibility-matched background peaks, DORC calling, kNN-smoothed DORC activity scoring, and TF-DORC gene regulatory networks (Kartha et al., *Cell Genomics* 2022). |
 | **[`rose/`](rose/README.md)** | `rose` | MIT | **ROSE**: Rank Ordering of Super-Enhancers with optional Input/IgG bigWig control subtraction (Whyte et al., *Cell* 2013; Lovén et al., *Cell* 2013). |
@@ -85,23 +100,26 @@ Each directory is an independent, self-contained package (`pyproject.toml` + `py
 
 ```text
 pythonic_biotools/
-├── bayesprism/  biostats/  bisque/  cause/  chromvar/  cibersortx/  cohort-curation/
-├── colliderbias/  coloc/  decoupler-ulm/  discover/  dndscv/  docs/  evam/  facets/
-├── figr/  fishhook/  hyprcoloc/  indexevent/  limma/  logistf/  mashr/  mrapss/
-├── mrbee/  mrclust/  mrhorse/  mrpresso/  mrraps/  mtcojo/  music/  mvcml/  nebula/
-├── numbat/  rose/  scarhrd/  shatterseek/  slopehunter/  smr-heidi/  sva/  timeroc/
-├── twosamplemr/  variancepartition/  wdl-workflows/  xenofilterR/
+├── bayesprism/  biostats/  bisque/  buysetest/  cause/  chord/  chromvar/
+├── cibersortx/  cismr/  cohort-curation/  colliderbias/  coloc/  colocproptest/
+├── csaw/  cside/  ctwas/  decoupler-ulm/  discover/  dndscv/  docs/  dss/
+├── evam/  facets/  fgwas/  figr/  fishhook/  hdl/  hyprcoloc/  indexevent/
+├── limma/  logistf/  mashr/  mrapss/  mrbee/  mrclust/  mrhorse/  mrpresso/
+├── mrraps/  mtcojo/  music/  mvcml/  nebula/  numbat/  purecn/  qdnaseq/
+├── rose/  saturn/  scarhrd/  shatterseek/  slopehunter/  smr-heidi/
+├── survidinri/  sva/  timeroc/  tracksig/  twosamplemr/  variancepartition/
+├── wdl-workflows/  xenofilterR/
 ```
 
 - **Core scientific Python stack**: `numpy`, `scipy`, `pandas` across all packages.
-- **Single-cell & ML extensions**: `anndata` (`music`, `bayesprism`, `bisque`, `cibersortx`, `numbat`, `nebula`, `figr`; optional in `sva`, `variancepartition`), `scikit-learn` (`cibersortx`, `numbat`, `figr`).
-- **Genomics & optional acceleration**: `pysam` (`xenofilterR`; optional FASTA support in `dndscv`), `requests` (`cohort-curation`), `joblib` (optional parallelization in `variancepartition`), and optional `numba` JIT acceleration in `numbat` (`pip install -e "./numbat[accel]"`) with a pure vectorized NumPy/SciPy fallback (`backend="auto"` / `"numpy"`).
+- **Single-cell, spatial & ML extensions**: `anndata` (`music`, `bayesprism`, `bisque`, `cibersortx`, `cside`, `saturn`, `numbat`, `nebula`, `figr`; optional in `sva`, `variancepartition`), `scikit-learn` (`cibersortx`, `chord`, `numbat`, `figr`).
+- **Genomics & optional acceleration**: `pysam` (`xenofilterR`, `qdnaseq`, `csaw`, `chord`; optional FASTA support in `dndscv`), `requests` (`cohort-curation`), `joblib` (optional parallelization in `variancepartition`), and optional `numba` JIT acceleration in `numbat` (`pip install -e "./numbat[accel]"`) with a pure vectorized NumPy/SciPy fallback (`backend="auto"` / `"numpy"`).
 
 ---
 
 ## Licensing Note
 
-Root repository scaffolding and MIT-designated packages are licensed under the [MIT License](LICENSE). Individual ports derived from copyleft upstream statistical packages carry their respective compatible copyleft SPDX licenses in their local `pyproject.toml` (`GPL-2.0-or-later` in `timeroc`; `GPL-3.0-or-later` in `cause`, `mrpresso`, `mrraps`, `mtcojo`, and `smr-heidi`; `AGPL-3.0-or-later` in `evam`).
+Root repository scaffolding and MIT-designated clean-room packages are licensed under the [MIT License](LICENSE). Individual ports derived from copyleft upstream statistical packages carry their respective compatible copyleft SPDX licenses in their local `pyproject.toml` (`GPL-2.0-or-later` in `timeroc`; `GPL-3.0-or-later` in `cause`, `mrpresso`, `mrraps`, `mtcojo`, and `smr-heidi`; `AGPL-3.0-or-later` in `evam`).
 
 ---
 
@@ -113,13 +131,17 @@ Every package supports `settings="default"` (statistically hardened, numerically
 from xenofilterR import Xenofilter
 from mrbee import fit_mrbee
 from facets import run_facets
+from purecn import run_purecn
+from buysetest import buyse_test, Endpoint
 
 xf = Xenofilter(mismatch_cutoff=4, settings="R_default")
 res_mrbee = fit_mrbee(bx, sx, by, sy, settings="R_default")
 res_facets = run_facets(pileup_df, settings="R_default")
+res_purecn = run_purecn(tumor_cov_df, variants_df, settings="R_default")
+res_wr = buyse_test(trial_df, "arm", [Endpoint("os_time", "tte", "os_event")], settings="R_default")
 ```
 
-See [`docs/UPSTREAM_PARITY_AND_SCORECARD.md`](docs/UPSTREAM_PARITY_AND_SCORECARD.md) for the full 42-package dual scorecard (`88.3%` mean parity under `default` vs. `97.8%` mean parity under `R_default`).
+See [`docs/UPSTREAM_PARITY_AND_SCORECARD.md`](docs/UPSTREAM_PARITY_AND_SCORECARD.md) for the full 57-package dual scorecard (`89.1%` mean parity under `default` vs. `98.0%` mean parity under `R_default`).
 
 ---
 
@@ -129,11 +151,11 @@ Install any standalone package directly:
 
 ```bash
 pip install -e ./mrpresso
-pip install -e ./hyprcoloc
-pip install -e ./discover
-pip install -e ./limma
-pip install -e ./facets
+pip install -e ./ctwas
+pip install -e ./purecn
+pip install -e ./dss
+pip install -e ./buysetest
 
 # Run unit tests for an individual package
-pytest mrpresso/tests -q
+pytest ctwas/tests -q
 ```
