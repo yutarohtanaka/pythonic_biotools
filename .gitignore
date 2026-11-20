@@ -20,3 +20,4 @@ htmlcov/
 *.vcf.gz
 *.h5ad
 .agents/
+site/

@@ -1,0 +1,51 @@
+site_name: pythonic_biotools
+site_description: 70 pure-Python implementations of published R, Bioconductor, CRAN, C++, and Fortran bioinformatics, oncology, clinical trial, and statistical genetics libraries.
+site_url: https://gillanilab.github.io/pythonic_biotools/
+repo_url: https://github.com/gillanilab/pythonic_biotools
+repo_name: gillanilab/pythonic_biotools
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Install, File Loaders & CLI: CLI_AND_IO_GUIDE.md
+  - R-to-Python Migration: R_TO_PYTHON_MIGRATION.md
+  - Use Cases by Problem: USE_CASES_BY_PROBLEM.md
+  - Tool Decision Matrix: TOOL_COMPARISON_AND_DECISION_MATRIX.md
+  - Plotting Gallery: PLOTTING_GALLERY.md
+  - Upstream Parity Scorecard: UPSTREAM_PARITY_AND_SCORECARD.md

@@ -1,17 +1,52 @@
 # Pythonic Biotools
 
-Pythonic implementations of published R, C++, Fortran, and command-line bioinformatics, cancer genomics, spatial/single-cell omics, quantitative proteomics, clinical trial biostatistics, and statistical genetics libraries.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Open Oncology Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/gillanilab/pythonic_biotools/blob/main/notebooks/01_cancer_evolution_hrd_and_ctdna.ipynb)
+[![Open StatGen Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/gillanilab/pythonic_biotools/blob/main/notebooks/02_causal_genetics_ctwas_cismr_and_sem.ipynb)
+[![Open Multi-Omics Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/gillanilab/pythonic_biotools/blob/main/notebooks/03_spatial_singlecell_epigenomics_and_proteomics.ipynb)
+[![Open Clinical Trials Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/gillanilab/pythonic_biotools/blob/main/notebooks/04_clinical_trials_winratio_rmst_and_joint_survival.ipynb)
 
-Each directory is an independent, self-contained package (`pyproject.toml` + PEP 561 `py.typed` + `pytest` suite), paired with a root workspace bundle manager ([`pyproject.toml`](pyproject.toml) + [`pythonic_biotools_cli.py`](pythonic_biotools_cli.py)), end-to-end cross-package integration tests ([`tests_integration/`](tests_integration/README.md)), runnable multi-tool demos ([`examples/`](examples/README.md)), and frozen upstream R parity benchmarks ([`benchmarks/r_parity/`](benchmarks/r_parity/README.md)). Any individual tool or domain bundle can be installed and used without `rpy2`, compiled Fortran toolchains, or external R sessions.
+Pure-Python, PEP 561-typed implementations of **70 published R, Bioconductor, CRAN, C++, and Fortran libraries** spanning cancer somatic genomics, ctDNA liquid biopsy, mutational signatures, Mendelian randomization, colocalization, causal TWAS, multivariate statistical genetics, bulk & spatial deconvolution, single-cell mixed models, quantitative proteomics, epigenomics, and clinical-trial survival biostatistics.
 
 ---
 
-## Documentation Guides
+## 30-Second Quickstart
 
+```bash
+# One-line install (bundles all 63 MIT libraries, file readers, plotting helpers, and the `pbt` CLI)
+pip install "pythonic-biotools[all] @ git+https://github.com/gillanilab/pythonic_biotools.git"
+```
+
+```python
+from pythonic_biotools import purecn, ichorcna, ctwas, cismr, deqms, survrm2, io
+
+# 1. Load standard bioinformatics formats directly (MAF, VCF, GATK, Bismark, MaxQuant, GWAS/PLINK)
+maf_df = io.read_maf("cohort_mutations.maf.gz", keep_silent=False)
+abundance_df, peptide_counts = io.read_maxquant_diann("proteinGroups.txt")
+
+# 2. Run with Pythonic defaults OR strict upstream R replication (`settings="R_default"`) + `.plot()`
+rmst_res = survrm2.rmst2(time, status, arm, tau=24.0, settings="R_default")
+fig = rmst_res.plot()
+```
+
+```bash
+# 3. Or run directly from Nextflow / Snakemake / WDL / Bash via the `pbt` CLI (or Docker container)
+pbt run scarhrd --segments sample.cns --genome GRCh38 --out sample.hrd.tsv --settings R_default
+pbt run deqms --input proteinGroups.txt --groups 0,0,0,1,1,1 --out deqms_results.tsv
+```
+
+---
+
+## Documentation Guides & Interactive Notebooks
+
+- **[Installation, File Loaders (`io`) & Pipeline CLI (`docs/CLI_AND_IO_GUIDE.md`)](docs/CLI_AND_IO_GUIDE.md)** — One-line install, `MAF`/`VCF`/`GATK`/`Bismark`/`MaxQuant`/`GWAS` loaders, `pbt run` CLI subcommands, [Dockerfile](Dockerfile), and [environment.yml](environment.yml).
+- **[R-to-Python Rosetta Stone (`docs/R_TO_PYTHON_MIGRATION.md`)](docs/R_TO_PYTHON_MIGRATION.md)** — Side-by-side translation of R/Bioconductor/CRAN function calls and parameters into Python.
+- **[Interactive Colab Tutorials (`notebooks/README.md`)](notebooks/README.md)** & **[Multi-Tool Demos (`examples/README.md`)](examples/README.md)** — Pre-executed Jupyter notebooks with 1-click Google Colab badges.
 - **[Use Cases by Biological & Statistical Problem (`docs/USE_CASES_BY_PROBLEM.md`)](docs/USE_CASES_BY_PROBLEM.md)** — Problem-driven guide mapping analysis tasks to all 70 standalone tools and multi-tool workflows.
-- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables across Mendelian Randomization, cis-MR/causal TWAS/local & structural genetics, conditional/collider GWAS, bulk & spatial deconvolution/DE, differential expression/proteomics/isoform DTU/mixed models, clinical survival & trial endpoints, somatic cancer genomics/evolution/ctDNA, and epigenomics/methylation/motif regulation.
-- **[Upstream Parity Guide & Dual Scorecard (`docs/UPSTREAM_PARITY_AND_SCORECARD.md`)](docs/UPSTREAM_PARITY_AND_SCORECARD.md)** — Complete 70-package source-to-source comparison against upstream R/C++/Fortran repositories and Bioconda, documenting `settings="default"` (`89.5%` mean parity) vs. `settings="R_default"` (`98.1%` mean parity, `95%–100%` across all 70 packages).
-- **[Cross-Package Integration Suite (`tests_integration/README.md`)](tests_integration/README.md)**, **[Multi-Tool Demos (`examples/README.md`)](examples/README.md)** & **[Golden `R_default` Benchmarks (`benchmarks/r_parity/README.md`)](benchmarks/r_parity/README.md)**.
+- **[Tool Comparison & Decision Matrix (`docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md`)](docs/TOOL_COMPARISON_AND_DECISION_MATRIX.md)** — Side-by-side comparison tables across all 8 domains.
+- **[Diagnostic Plotting Gallery (`docs/PLOTTING_GALLERY.md`)](docs/PLOTTING_GALLERY.md)** — Built-in `.plot()` figures (`FACETS`, `ichorCNA`, `TrackSig`, `ROSE`, `GRAPPLE`, `monaLisa`, `survRM2`, `BuyseTest`).
+- **[Upstream Parity Guide & Dual Scorecard (`docs/UPSTREAM_PARITY_AND_SCORECARD.md`)](docs/UPSTREAM_PARITY_AND_SCORECARD.md)** — Complete 70-package comparison documenting `settings="default"` (`89.5%` mean parity) vs. `settings="R_default"` (`98.1%` mean parity, `95%–100%` across all 70 packages), backed by [golden `R_default` benchmarks](benchmarks/r_parity/README.md) and [cross-package integration tests](tests_integration/README.md).
+- **[Contributing (`CONTRIBUTING.md`)](CONTRIBUTING.md)** & **[Academic Citation (`CITATION.cff`)](CITATION.cff)**.
 
 ---
 

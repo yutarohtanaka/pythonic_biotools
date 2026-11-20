@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+title: "pythonic_biotools: Standalone Python Implementations of Bioinformatics, Oncology, Clinical Trial, and Statistical Genetics Libraries"
+message: >-
+  If you use pythonic_biotools in your research, please cite both this software
+  repository and the original peer-reviewed methodology publications for every
+  specific algorithm or statistical model used in your analysis (citations are
+  provided in the root README.md and in each package's README.md).
+type: software
+authors:
+  - family-names: Tanaka
+    given-names: Yutaro
+repository-code: "https://github.com/gillanilab/pythonic_biotools"
+url: "https://gillanilab.github.io/pythonic_biotools/"
+version: "0.2.0"
+date-released: "2026-11-20"
+license: MIT
+abstract: >-
+  pythonic_biotools provides 70 standalone, PEP 561-typed Python implementations
+  of published R, Bioconductor, CRAN, C++, and Fortran methods across cancer
+  somatic genomics, ctDNA liquid biopsy, mutational signatures, Mendelian
+  randomization, colocalization, causal TWAS, multivariate statistical genetics,
+  bulk and spatial transcriptomics deconvolution, single-cell mixed models,
+  quantitative proteomics, epigenomics, and clinical trial survival biostatistics.
+  Every package supports both numerically hardened Pythonic defaults
+  (settings="default") and strict upstream replication (settings="R_default")
+  without requiring rpy2 or external R sessions. Please always cite the original
+  methodology papers alongside this software collection.
+keywords:
+  - bioinformatics
+  - computational-biology
+  - cancer-genomics
+  - liquid-biopsy
+  - statistical-genetics
+  - mendelian-randomization
+  - colocalization
+  - spatial-transcriptomics
+  - single-cell-omics
+  - proteomics
+  - epigenomics
+  - survival-analysis
+  - clinical-trials
+  - python
