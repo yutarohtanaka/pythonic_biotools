@@ -15,6 +15,7 @@ from .em import (
     normalize_signature_matrix,
 )
 from .pelt import SegmentScorer, run_pelt
+from .plotting import plot_tracksig
 
 __all__ = [
     "COSMIC_96_CONTEXTS",
@@ -30,6 +31,7 @@ __all__ = [
     "TrackSigResult",
     "TrackSig",
     "tracksig",
+    "plot_tracksig",
 ]
 
 __version__ = "0.1.0"

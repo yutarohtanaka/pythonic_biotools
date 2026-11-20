@@ -18,6 +18,7 @@ from .core import (
     rmst2,
     rmst2_curve,
 )
+from .plotting import plot_rmst1, plot_rmst2
 
 __version__ = "0.1.0"
 
@@ -37,4 +38,6 @@ __all__ = [
     "rmst2",
     "rmst2reg",
     "rmst2_curve",
+    "plot_rmst1",
+    "plot_rmst2",
 ]

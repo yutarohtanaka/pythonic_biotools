@@ -8,11 +8,15 @@ fractions (`cf_em`), with WGD disambiguation and pure-diploid null guarding.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .io import validate_settings
 from .segment import SegmentedResult
@@ -99,6 +103,18 @@ class FacetsResult:
             f"  Log-Likelihood:  {self.log_lik:.2f}\n"
             f"  BIC:             {self.bic:.2f}"
         )
+
+    def plot(
+        self,
+        figsize: tuple[float, float] = (11.0, 7.0),
+        *,
+        axes: Sequence[Axes] | None = None,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot classic 3-panel stacked FACETS genome-wide profile (`facets.plot_facets`)."""
+        from .plotting import plot_facets
+
+        return plot_facets(self, figsize=figsize, axes=axes, title=title)
 
 
 def _logcosh(x: np.ndarray) -> np.ndarray:

@@ -1052,4 +1052,56 @@ def test_r_default_run_ascat_gamma055_rho105_and_cascading_tiers() -> None:
     assert abs(ares_pure.ploidy - true_ploidy) < 0.15
 
 
+def test_facets_result_plot_creates_three_panel_figure() -> None:
+    specs = [
+        ("chr1", 1_000_000, 40_000_000, 120, 1, 1, 0.70),
+        ("chr2", 1_000_000, 35_000_000, 110, 2, 1, 0.70),
+        ("chr3", 1_000_000, 35_000_000, 110, 1, 0, 0.70),
+    ]
+    pileup = _simulate_pileup(specs, seed=717)
+    res = run_facets(pileup, snp_nbhd=1, settings="default")
+
+    fig = res.plot(figsize=(10, 6.5))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 3
+        assert "Purity" in fig.axes[0].get_title()
+        assert "Ploidy" in fig.axes[0].get_title()
+        for panel_ax in fig.axes:
+            assert len(panel_ax.collections) + len(panel_ax.lines) > 0
+    finally:
+        plt.close(fig)
+
+
+def test_plot_facets_with_custom_axes_and_without_snps() -> None:
+    from dataclasses import replace
+    from facets import plot_facets
+
+    specs = [
+        ("chr1", 1_000_000, 30_000_000, 90, 1, 1, 0.65),
+        ("chr2", 1_000_000, 30_000_000, 90, 3, 1, 0.65),
+    ]
+    pileup = _simulate_pileup(specs, seed=818)
+    res = run_facets(pileup, snp_nbhd=1, settings="default")
+    res_no_snps = replace(res, snps=None)
+
+    fig0 = res_no_snps.plot()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    fig_custom, axes_custom = plt.subplots(3, 1, figsize=(9, 6), sharex=True)
+    try:
+        out_fig = plot_facets(res_no_snps, axes=list(axes_custom), title="FACETS Segment-Only")
+        assert out_fig is fig_custom
+        assert axes_custom[0].get_title() == "FACETS Segment-Only"
+        assert len(axes_custom[2].collections) >= 2
+    finally:
+        plt.close(fig_custom)
+
+
+
 

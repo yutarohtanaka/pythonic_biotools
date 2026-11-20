@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import lasso_path
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from ._validation import SettingsMode, validate_settings
 from .composition import calc_sequence_composition
@@ -71,6 +75,25 @@ class StabilitySelectionResult:
             index=self.sel_prob.index,
         )
         return df.sort_values(by="sel_prob", ascending=False, kind="mergesort")
+
+    def plot(
+        self,
+        top_n: int = 10,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (8.0, 4.5),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot Randomized Lasso selection probability trajectories (`monalisa.plot_stability_selection`)."""
+        from .plotting import plot_stability_selection
+
+        return plot_stability_selection(
+            self,
+            top_n=top_n,
+            ax=ax,
+            figsize=figsize,
+            title=title,
+        )
 
 
 def rand_lasso_stab_sel(

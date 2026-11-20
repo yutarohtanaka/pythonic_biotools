@@ -45,6 +45,10 @@ print(res_r.marker_dataframe().head())
 # 3. Sample-overlap-aware Multivariable MR across P exposures
 mv_res = grapple_mvmr(Bx, Sx, by, sy, cor_mat=cor_mat_mv, settings="R_default")
 print(mv_res.to_dataframe())
+
+# 4. Multimodal profile log-likelihood curve with mode 95% CIs (`pip install "grapple[plot]"`)
+fig = res_r.plot(figsize=(8, 4.5))
+fig.savefig("grapple_profile.png", dpi=300)
 ```
 
 ## License

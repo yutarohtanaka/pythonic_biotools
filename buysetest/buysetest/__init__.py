@@ -2,6 +2,7 @@
 
 from .core import BuyseTest, BuyseTestResult, StatisticLayerInference, buyse_test
 from .endpoints import Endpoint, SettingsMode, validate_settings
+from .plotting import plot_buyse_test
 from .pwreg import PWRegResult, pwreg
 from .scoring import (
     KMAtomDistribution,
@@ -23,6 +24,7 @@ __all__ = [
     "StatisticLayerInference",
     "buyse_test",
     "fit_km_atoms",
+    "plot_buyse_test",
     "pwreg",
     "score_pairs_continuous_binary",
     "score_pairs_tte_gehan",

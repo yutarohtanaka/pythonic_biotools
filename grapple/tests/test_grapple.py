@@ -366,3 +366,58 @@ def test_input_and_hyperparameter_validation_errors() -> None:
             sx,
             cor_mat=bad_cor,
         )
+
+
+def test_grapple_result_plot_multimodal_profile() -> None:
+    rng = np.random.default_rng(77)
+    bx1 = rng.uniform(0.06, 0.14, size=25)
+    bx2 = rng.uniform(0.06, 0.14, size=25)
+    bx = np.concatenate([bx1, bx2])
+    sx = np.full(50, 0.012)
+    sy = np.full(50, 0.012)
+    by = np.concatenate(
+        [
+            -0.55 * bx1 + rng.normal(0.0, 0.01, size=25),
+            0.55 * bx2 + rng.normal(0.0, 0.01, size=25),
+        ]
+    )
+    res = grapple_robust_est(bx, sx, by, sy, settings="R_default")
+    assert res.is_multimodal
+
+    fig = res.plot(figsize=(8, 4.5))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.lines) >= 3
+        assert "Multimodal" in ax.get_title()
+    finally:
+        plt.close(fig)
+
+
+def test_plot_grapple_profile_accepts_custom_ax() -> None:
+    from grapple import plot_grapple_profile
+
+    rng = np.random.default_rng(88)
+    bx = rng.uniform(0.05, 0.15, size=30)
+    sx = np.full(30, 0.015)
+    by = 0.35 * bx + rng.normal(0.0, 0.015, size=30)
+    res = grapple_robust_est(bx, sx, by, sx, settings="default")
+
+    fig0 = res.plot()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(7.5, 4.0))
+    try:
+        out_fig = plot_grapple_profile(res, ax=ax_ext, title="Custom GRAPPLE Profile")
+        assert out_fig is fig_ext
+        assert ax_ext.get_title() == "Custom GRAPPLE Profile"
+        assert len(ax_ext.lines) >= 2
+    finally:
+        plt.close(fig_ext)
+

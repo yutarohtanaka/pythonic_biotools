@@ -213,3 +213,70 @@ def test_rose_r_default_chry_containment_unstitching_and_cutoff():
     c_r = call_rose_super_enhancers(cutoff_peaks, settings="R_default")
     assert len(c_def.super_enhancers) == 1
     assert len(c_r.super_enhancers) == 2
+
+
+def test_rose_result_plot_hockey_stick_returns_figure() -> None:
+    tss_df = pd.DataFrame(
+        [
+            {"chrom": "chr8", "tss": 127_736_000, "gene_name": "MYC"},
+            {"chrom": "chr1", "tss": 950_000, "gene_name": "CTRL1"},
+        ]
+    )
+    peaks = [
+        {"chrom": "chr8", "start": 127_800_000, "end": 127_804_000, "score": 360.0},
+        {"chrom": "chr8", "start": 127_810_000, "end": 127_815_000, "score": 420.0},
+    ] + [
+        {
+            "chrom": "chr1",
+            "start": 1_000_000 + i * 50_000,
+            "end": 1_000_500 + i * 50_000,
+            "score": 12.0 + (i % 4),
+        }
+        for i in range(30)
+    ]
+    res = call_rose_super_enhancers(pd.DataFrame(peaks), tss_df=tss_df)
+    fig = res.plot(top_n_labels=3, figsize=(7, 5))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.collections) == 2
+        assert len(ax.lines) >= 2
+        assert any("MYC" in txt.get_text() for txt in ax.texts)
+    finally:
+        plt.close(fig)
+
+
+def test_plot_rose_hockey_stick_accepts_dataframe_and_custom_ax() -> None:
+    from rose import plot_rose_hockey_stick
+
+    df_raw = pd.DataFrame(
+        {
+            "chrom": ["chr1"] * 20,
+            "start": [i * 50_000 for i in range(20)],
+            "end": [i * 50_000 + 1000 for i in range(20)],
+            "signal": [float(10 + i) for i in range(18)] + [180.0, 320.0],
+            "nearest_gene": [f"G{i}" for i in range(18)] + ["BCL2", "BRD4"],
+        }
+    )
+    fig0 = plot_rose_hockey_stick(df_raw, top_n_labels=2)
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(6.5, 4.5))
+    try:
+        fig_ret = plot_rose_hockey_stick(
+            df_raw, ax=ax_ext, top_n_labels=2, title="Custom Hockey Stick"
+        )
+        assert isinstance(fig_ret, Figure)
+        assert fig_ret is fig_ext
+        assert ax_ext.get_title() == "Custom Hockey Stick"
+        assert any("BRD4" in txt.get_text() for txt in ax_ext.texts)
+    finally:
+        plt.close(fig_ext)
+

@@ -327,3 +327,55 @@ def test_low_tf_diploid_regularization_prefers_diploid_at_5_percent_ctdna() -> N
     assert 1.65 <= res.ploidy <= 2.35
     assert abs(res.tumor_fraction - 0.05) < 0.015
 
+
+def test_ichorcna_result_plot_returns_non_empty_figure() -> None:
+    specs = [
+        ("chr1", 50, 2, 1.0),
+        ("chr2", 45, 3, 1.0),
+        ("chr3", 45, 1, 1.0),
+        ("chr4", 40, 5, 1.0),
+    ]
+    bins = _simulate_ulp_genome(specs, tumor_fraction=0.25, ploidy=2.0, noise_sd=0.025, seed=303)
+    res = run_ichorcna(bins, settings="default")
+
+    fig = res.plot(figsize=(10, 3.8))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.collections) >= 3
+        assert "Tumor Fraction (TFx)" in ax.get_title()
+        assert "Ploidy" in ax.get_title()
+        assert ax.get_xlabel() == "Chromosome"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_ichorcna_accepts_custom_ax_and_estimator_plot() -> None:
+    from ichorcna import plot_ichorcna
+
+    specs = [("chr1", 40, 2, 1.0), ("chr2", 40, 3, 1.0)]
+    bins = _simulate_ulp_genome(specs, tumor_fraction=0.22, ploidy=2.0, noise_sd=0.025, seed=404)
+    est = IchorCNA(settings="default")
+    with pytest.raises(RuntimeError, match="fit"):
+        est.plot()
+
+    res = est.fit(bins)
+    fig_init = res.plot()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig_init)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(9, 3.5))
+    try:
+        fig_ret = plot_ichorcna(res, ax=ax_ext, title="Custom ctDNA Profile")
+        assert fig_ret is fig_ext
+        assert ax_ext.get_title() == "Custom ctDNA Profile"
+        assert len(ax_ext.collections) >= 2
+    finally:
+        plt.close(fig_ext)
+
+

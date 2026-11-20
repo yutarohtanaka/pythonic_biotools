@@ -498,3 +498,82 @@ def test_rand_lasso_reproducibility_with_seed_and_motif_scan_input() -> None:
     pd.testing.assert_series_equal(r1.sel_prob, r2.sel_prob)
     pd.testing.assert_frame_equal(r1.prob_path_df, r2.prob_path_df)
     assert r1.selected_motifs == ["M_HIT"]
+
+
+def test_binned_motif_enrichment_plot_heatmap_metrics() -> None:
+    rng = np.random.default_rng(606)
+    seqs = _random_dna(rng, 90, 80, gc_prob=0.5)
+    vals = np.linspace(-1.0, 1.0, 90)
+    for i in range(60, 90):
+        seqs[i] = seqs[i][:10] + "TGAGTCA" + seqs[i][17:]
+    pwms = pfm_to_pwm(
+        {
+            "AP1": _consensus_to_pfm("TGAGTCA", 120.0),
+            "CTCF": _consensus_to_pfm("CCGCGAGG", 80.0),
+            "GATA": _consensus_to_pfm("GATAAG", 100.0),
+        }
+    )
+    bins = bin_genomic_changes(vals, n_bins=3, min_abs_val=0.2)
+    enr = calc_binned_motif_enrichment(seqs, bins=bins, pwms=pwms)
+
+    fig = enr.plot(metric="log2enr", top_n=3, figsize=(7.5, 4.5))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 2  # main heatmap + colorbar
+        assert len(fig.axes[0].images) == 1
+    finally:
+        plt.close(fig)
+
+    fig_padj = enr.plot(metric="-log10(padj)", top_n=2)
+    try:
+        assert isinstance(fig_padj, Figure)
+        assert len(fig_padj.axes) == 2
+    finally:
+        plt.close(fig_padj)
+
+    with pytest.raises(ValueError, match="Unknown metric"):
+        enr.plot(metric="invalid_metric")
+
+
+def test_stability_selection_plot_trajectories_and_cutoff() -> None:
+    from monalisa import plot_stability_selection
+
+    rng = np.random.default_rng(707)
+    seqs = _random_dna(rng, 70, 85, gc_prob=0.5)
+    y = rng.normal(0.0, 0.25, size=70)
+    for i in range(22):
+        seqs[i] = seqs[i][:12] + "CTAGTCAG" + seqs[i][20:]
+        y[i] += 1.5
+    pwms = pfm_to_pwm(
+        {
+            "DRIVER": _consensus_to_pfm("CTAGTCAG", 140.0),
+            "NOISE1": _consensus_to_pfm("AAACCCGG", 120.0),
+            "NOISE2": _consensus_to_pfm("TTTGGGAA", 120.0),
+        }
+    )
+    scan = scan_sequences_pwm(seqs, pwms, min_score="85%")
+    stab = rand_lasso_stab_sel(scan, y, sequences=seqs, n_subsamples=30, seed=17)
+
+    fig = stab.plot(top_n=4, figsize=(8, 4.5))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        assert len(fig.axes[0].lines) >= 4
+        assert "Stability Selection" in fig.axes[0].get_title()
+    finally:
+        plt.close(fig)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(7.5, 4.0))
+    try:
+        out_fig = plot_stability_selection(stab, top_n=2, ax=ax_ext, title="Custom Stability")
+        assert out_fig is fig_ext
+        assert ax_ext.get_title() == "Custom Stability"
+    finally:
+        plt.close(fig_ext)
+

@@ -47,6 +47,10 @@ print(res_adj.to_dataframe())
 # Truncation-horizon sensitivity curve and object-oriented estimator
 curve_df = rmst2_curve(time, status, arm, n_grid=10, settings="default")
 est = SurvRM2(tau=8.0, settings="R_default").fit(time, status, arm, covariates=cov_df)
+
+# Publication-ready two-arm KM step plot shaded over [0, tau] (`pip install "survrm2[plot]"`)
+fig = res.plot(figsize=(7.5, 4.8))
+fig.savefig("rmst2_km.png", dpi=300)
 ```
 
 ## License

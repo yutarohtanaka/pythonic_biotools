@@ -6,8 +6,14 @@ mutation bootstrap, OOP estimator wrapper, and result container.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .ccf import SettingsMode, compute_ccf_pseudotime, validate_settings
 from .em import (
@@ -72,6 +78,25 @@ class TrackSigResult:
     def to_dataframe(self) -> pd.DataFrame:
         """Return a copy of the per-bin evolutionary exposure trajectory DataFrame."""
         return self.bin_exposures_df.copy()
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (9.0, 4.5),
+        *,
+        show_raw: bool = True,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot evolutionary signature exposures and PELT changepoints (`tracksig.plot_tracksig`)."""
+        from .plotting import plot_tracksig
+
+        return plot_tracksig(
+            self,
+            ax=ax,
+            figsize=figsize,
+            show_raw=show_raw,
+            title=title,
+        )
 
 
 def _fit_single_trajectory(
@@ -447,3 +472,16 @@ class TrackSig:
             settings=self.settings,
         )
         return self.result_
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (9.0, 4.5),
+        *,
+        show_raw: bool = True,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot fitted evolutionary trajectory."""
+        if self.result_ is None:
+            raise RuntimeError("Call .fit(mutations_df, signature_matrix) before .plot().")
+        return self.result_.plot(ax=ax, figsize=figsize, show_raw=show_raw, title=title)

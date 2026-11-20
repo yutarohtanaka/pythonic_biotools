@@ -34,6 +34,10 @@ print(res.to_dataframe().head())
 res_r = run_facets(pileup_df, genome="GRCh38", settings="R_default")
 ascat_r = run_ascat(res_r, gamma_ascat=1.0, settings="R_default")
 print(compare_facets_ascat(res_r, ascat_r))
+
+# Classic 3-panel stacked FACETS genome-wide visualization (optional `pip install "facets[plot]"`)
+fig = res.plot(figsize=(11, 7))
+fig.savefig("facets_profile.png", dpi=300)
 ```
 
 ## License

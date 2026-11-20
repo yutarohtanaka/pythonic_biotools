@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import ArrayLike
 import pandas as pd
 from scipy import optimize, stats
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .loss import (
     LossName,
@@ -109,6 +115,18 @@ class GrappleResult:
                 f"llk={m.profile_llk:.2f}, inliers={m.n_inliers}, markers={m.marker_snps[:3]})"
             )
         return "\n".join(lines)
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (8.0, 4.5),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot GRAPPLE robust profile log-likelihood and detected modes (`grapple.plot_grapple_profile`)."""
+        from .plotting import plot_grapple_profile
+
+        return plot_grapple_profile(self, ax=ax, figsize=figsize, title=title)
 
 
 @dataclass(frozen=True)

@@ -55,6 +55,10 @@ stab = rand_lasso_stab_sel(
     settings="R_default",
 )
 print("Selected causal motifs:", stab.selected_motifs)
+
+# 4. Publication-ready binned enrichment heatmap & stability path plots (`pip install "monalisa[plot]"`)
+fig_enr = enr.plot(metric="log2enr", top_n=15)
+fig_stab = stab.plot(top_n=10)
 ```
 
 ## License

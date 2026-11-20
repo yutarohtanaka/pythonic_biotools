@@ -45,6 +45,10 @@ res_r = buyse_test(trial_df, treatment="arm", endpoints=endpoints, settings="R_d
 # Covariate-adjusted Proportional Win-Fractions Regression (Mao & Wang, JASA 2020)
 fit_wr = pwreg(trial_df, treatment_col="arm", covariates=["age", "ecog"], endpoints=endpoints[:2])
 print(fit_wr.summary())
+
+# Hierarchical stacked Win / Loss / Neutral / Uninformative bar plot (`pip install "buysetest[plot]"`)
+fig = res.plot(figsize=(8, 4))
+fig.savefig("buysetest_hierarchy.png", dpi=300)
 ```
 
 ## License

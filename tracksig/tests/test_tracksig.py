@@ -409,3 +409,62 @@ def test_direct_ccf_and_vaf_columns_input() -> None:
     )
     res_vaf = tracksig(df_vaf, sig_df, purity=1.0, bin_size=100, score_method="Signature")
     assert res_vaf.changepoints == [2]
+
+
+def test_tracksig_plot_with_bootstrap_cis_and_changepoints() -> None:
+    sig_df = _make_signature_panel()
+    mut_df = _simulate_cohort(
+        sig_df,
+        [(200, 1.0, {"SBS1": 0.85, "SBS5": 0.15}), (200, 0.35, {"SBS2": 0.85, "SBS5": 0.15})],
+        purity=0.85,
+        depth=100,
+        seed=808,
+    )
+    res = tracksig(
+        mut_df,
+        sig_df,
+        purity=0.85,
+        bin_size=100,
+        score_method="SigFreq",
+        bootstrap_iters=6,
+        seed=11,
+    )
+    fig = res.plot(figsize=(8.5, 4.2))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.lines) >= len(res.active_signatures) + len(res.changepoints)
+        assert len(ax.collections) >= len(res.active_signatures)
+        assert "TrackSig" in ax.get_title()
+    finally:
+        plt.close(fig)
+
+
+def test_plot_tracksig_custom_ax_and_estimator_plot() -> None:
+    from tracksig import plot_tracksig
+
+    sig_df = _make_signature_panel()
+    mut_df = _simulate_cohort(sig_df, [(200, 1.0, {"SBS1": 0.7, "SBS4": 0.3})], seed=909)
+    est = TrackSig(purity=0.85, bin_size=100)
+    with pytest.raises(RuntimeError, match="fit"):
+        est.plot()
+
+    res = est.fit(mut_df, sig_df)
+    fig0 = est.plot(show_raw=False)
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(8, 4))
+    try:
+        fig_ret = plot_tracksig(res, ax=ax_ext, show_raw=False, title="Clonal Trajectory")
+        assert fig_ret is fig_ext
+        assert ax_ext.get_title() == "Clonal Trajectory"
+        assert len(ax_ext.lines) >= len(res.active_signatures)
+    finally:
+        plt.close(fig_ext)
+

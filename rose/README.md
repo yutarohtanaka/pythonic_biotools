@@ -30,6 +30,10 @@ res = call_rose_super_enhancers(
 )
 print(f"Cutoff: {res.cutoff_signal:.2f} ({len(res.super_enhancers)} super-enhancers)")
 print(res.super_enhancers.head())
+
+# Plot classic ROSE hockey-stick curve with tangent cutoff & top super-enhancer labels
+fig = res.plot(top_n_labels=5, figsize=(7, 5))
+fig.savefig("rose_hockey_stick.png", dpi=300)
 ```
 
 ## `settings="default"` vs `settings="R_default"`

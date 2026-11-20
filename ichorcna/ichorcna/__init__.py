@@ -26,6 +26,7 @@ from .io import (
     validate_settings,
 )
 from .normalize import lowess_1d, normalize_ulp_bins
+from .plotting import plot_ichorcna
 
 __all__ = [
     "SettingsMode",
@@ -38,6 +39,7 @@ __all__ = [
     "normalize_ulp_bins",
     "lowess_1d",
     "run_ichorcna",
+    "plot_ichorcna",
     "build_hmm_states",
     "emission_means",
     "student_t_logpdf",

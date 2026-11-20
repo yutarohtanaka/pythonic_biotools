@@ -374,3 +374,76 @@ def test_input_validation_errors() -> None:
     with pytest.raises(ValueError, match="rows"):
         rmst2([1.0, 2.0, 3.0, 4.0], [1, 1, 1, 1], [0, 0, 1, 1], tau=2.0, covariates=np.ones(3))
     assert hasattr(survrm2, "__version__")
+
+
+def test_rmst2_and_rmst1_zero_arg_plot_returns_figure() -> None:
+    rng = np.random.default_rng(4242)
+    n_arm = 60
+    t0 = rng.exponential(scale=4.0, size=n_arm)
+    t1 = rng.exponential(scale=7.5, size=n_arm)
+    c = rng.uniform(5.0, 12.0, size=2 * n_arm)
+    time = np.minimum(np.concatenate([t0, t1]), c)
+    status = (np.concatenate([t0, t1]) <= c).astype(int)
+    arm = np.array([0] * n_arm + [1] * n_arm)
+
+    res = rmst2(time, status, arm, tau=6.0, settings="default")
+    assert res.arm1.km_step_time is not None
+    assert res.arm1.km_step_surv is not None
+
+    fig = res.plot(figsize=(7.5, 4.8))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.lines) >= 3
+        assert len(ax.collections) >= 1
+        assert "Two-Sample RMST" in ax.get_title()
+    finally:
+        plt.close(fig)
+
+    fig1 = res.arm1.plot()
+    try:
+        assert isinstance(fig1, Figure)
+        assert len(fig1.axes) == 1
+        assert len(fig1.axes[0].collections) >= 2
+    finally:
+        plt.close(fig1)
+
+
+def test_plot_rmst2_with_raw_arrays_adjusted_result_and_custom_ax() -> None:
+    from survrm2 import plot_rmst2
+
+    rng = np.random.default_rng(5150)
+    n = 100
+    arm = np.array([0] * 50 + [1] * 50)
+    cov = rng.normal(size=n)
+    t_true = rng.exponential(scale=np.exp(1.5 + 0.4 * arm - 0.2 * cov))
+    c = rng.uniform(4.0, 10.0, size=n)
+    time = np.minimum(t_true, c)
+    status = (t_true <= c).astype(int)
+
+    est = SurvRM2(tau=5.0)
+    with pytest.raises(RuntimeError, match="not fitted"):
+        est.plot()
+
+    est.fit(time, status, arm, covariates=cov)
+    fig0 = est.plot()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    assert est.result_ is not None
+    fig_ext, ax_ext = plt.subplots(figsize=(7, 4.5))
+    try:
+        out_fig = plot_rmst2(
+            est.result_, time=time, status=status, arm=arm, ax=ax_ext, title="Adjusted RMST KM"
+        )
+        assert out_fig is fig_ext
+        assert ax_ext.get_title() == "Adjusted RMST KM"
+        assert any("Adj. \u0394RMST" in txt.get_text() for txt in ax_ext.texts)
+    finally:
+        plt.close(fig_ext)
+

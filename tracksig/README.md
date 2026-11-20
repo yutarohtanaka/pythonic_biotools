@@ -57,6 +57,10 @@ print(res.to_dataframe().head())
 # Upstream morrislab/TrackSig R parity mode
 res_r = TrackSig(purity=0.8, bin_size=100, score_method="Signature", settings="R_default").fit(mut_df, sig_df)
 print(res_r.segment_exposures_df)
+
+# Evolutionary signature timeline plot with bootstrap CIs & PELT changepoints (`pip install "tracksig[plot]"`)
+fig = res.plot(figsize=(9, 4.5))
+fig.savefig("tracksig_timeline.png", dpi=300)
 ```
 
 ## License

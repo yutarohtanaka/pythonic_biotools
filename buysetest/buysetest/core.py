@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .endpoints import Endpoint, SettingsMode, validate_settings
 from .scoring import (
@@ -109,6 +113,25 @@ class BuyseTestResult:
             )
         lines.append("-" * 104)
         return "\n".join(lines)
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (8.0, 4.0),
+        *,
+        cumulative: bool = True,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot hierarchical stacked pairwise proportion bars (`buysetest.plot_buyse_test`)."""
+        from .plotting import plot_buyse_test
+
+        return plot_buyse_test(
+            self,
+            ax=ax,
+            figsize=figsize,
+            cumulative=cumulative,
+            title=title,
+        )
 
 
 def _infer_arm_levels(
@@ -712,3 +735,21 @@ class BuyseTest:
             settings=self.settings,
         )
         return self.result_
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (8.0, 4.0),
+        *,
+        cumulative: bool = True,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot hierarchical stacked pairwise proportion bars of fitted model."""
+        if self.result_ is None:
+            raise RuntimeError("Call .fit(...) before .plot().")
+        return self.result_.plot(
+            ax=ax,
+            figsize=figsize,
+            cumulative=cumulative,
+            title=title,
+        )

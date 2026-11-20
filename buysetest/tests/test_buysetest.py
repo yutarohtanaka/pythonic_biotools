@@ -337,3 +337,57 @@ def test_invalid_settings_raises_value_error() -> None:
         BuyseTest(settings="bad")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="settings"):
         pwreg(df, treatment_col="arm", endpoints=[ep], settings="wrong")  # type: ignore[arg-type]
+
+
+def test_buysetest_result_plot_stacked_bars_and_annotations() -> None:
+    df = _simulate_prioritized_trial(m=80, n=80, seed=313)
+    eps = [
+        Endpoint("os_time", kind="tte", status_col="os_ev", operator="higher", threshold=25.0),
+        Endpoint("pfs_time", kind="tte", status_col="pfs_ev", operator="higher", threshold=10.0),
+        Endpoint("tox", kind="binary", operator="lower"),
+    ]
+    res = buyse_test(df, treatment="arm", endpoints=eps, scoring_rule="Peron")
+
+    fig = res.plot(figsize=(8, 4))
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+
+    try:
+        assert isinstance(fig, Figure)
+        assert len(fig.axes) == 1
+        ax = fig.axes[0]
+        assert len(ax.patches) == 4 * len(eps)
+        assert any("WR=" in txt.get_text() and "NB=" in txt.get_text() for txt in ax.texts)
+    finally:
+        plt.close(fig)
+
+
+def test_plot_buyse_test_incremental_and_custom_ax() -> None:
+    from buysetest import plot_buyse_test
+
+    df = _simulate_prioritized_trial(m=60, n=60, seed=414)
+    eps = [
+        Endpoint("os_time", kind="tte", status_col="os_ev", operator="higher"),
+        Endpoint("tox", kind="binary", operator="lower"),
+    ]
+    est = BuyseTest(scoring_rule="Gehan")
+    with pytest.raises(RuntimeError, match="fit"):
+        est.plot()
+
+    res = est.fit(df, treatment="arm", endpoints=eps)
+    fig0 = est.plot()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig0)
+
+    fig_ext, ax_ext = plt.subplots(figsize=(7.5, 3.8))
+    try:
+        out_fig = plot_buyse_test(
+            res, ax=ax_ext, cumulative=False, title="Incremental GPC Breakdown"
+        )
+        assert out_fig is fig_ext
+        assert ax_ext.get_title() == "Incremental GPC Breakdown"
+        assert len(ax_ext.patches) == 4 * len(eps)
+    finally:
+        plt.close(fig_ext)
+

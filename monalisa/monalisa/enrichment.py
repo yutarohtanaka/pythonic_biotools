@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from ._validation import SettingsMode, validate_settings
 from .composition import DINUCLEOTIDES, calc_sequence_composition
@@ -298,6 +302,27 @@ class BinnedMotifEnrichmentResult:
             kind="mergesort",
         )
         return df.head(n).reset_index(drop=True)
+
+    def plot(
+        self,
+        metric: str = "log2enr",
+        top_n: int = 15,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (8.0, 5.0),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot binned motif enrichment heatmap (`monalisa.plot_binned_motif_enrichment`)."""
+        from .plotting import plot_binned_motif_enrichment
+
+        return plot_binned_motif_enrichment(
+            self,
+            metric=metric,
+            top_n=top_n,
+            ax=ax,
+            figsize=figsize,
+            title=title,
+        )
 
 
 def _is_sequence_collection(obj: Any) -> bool:

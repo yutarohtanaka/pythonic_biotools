@@ -46,6 +46,10 @@ print(res.solutions_df[["normal_init", "ploidy_init", "tumor_fraction", "ploidy"
 # 3. Upstream broadinstitute/ichorCNA v0.3.2 parity mode (including low-TF mode)
 res_r = IchorCNA(low_tf_mode=True, settings="R_default").fit(norm_bins)
 print(f"TFx={res_r.tumor_fraction:.4f}, Ploidy={res_r.ploidy:.2f}")
+
+# 4. Publication-ready genome-wide copy-number plot (optional `pip install "ichorcna[plot]"`)
+fig = res.plot(figsize=(11, 4))
+fig.savefig("ichorcna_profile.png", dpi=300)
 ```
 
 ## License

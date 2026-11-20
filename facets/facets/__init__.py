@@ -18,6 +18,7 @@ from .ascat import (
 from .core import run_facets
 from .em import FacetsResult, em_cncf
 from .io import FacetsConfig, validate_and_normalize_pileup
+from .plotting import plot_facets
 from .preprocess import (
     PreProcResult,
     compute_cnlr,
@@ -61,6 +62,7 @@ __all__ = [
     "proc_sample",
     "em_cncf",
     "run_facets",
+    "plot_facets",
     # Normalization & Segmentation Primitives
     "lowess_1d",
     "compute_cnlr",

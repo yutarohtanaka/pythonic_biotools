@@ -9,6 +9,7 @@ from .core import (
     grapple_robust_est,
 )
 from .loss import psi_deriv, psi_loss, resolve_loss_params, rho_loss, robust_inlier_weight
+from .plotting import plot_grapple_profile
 from .preprocessing import estimate_cor_mat, select_grapple_instruments
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "select_grapple_instruments",
     "grapple_robust_est",
     "grapple_mvmr",
+    "plot_grapple_profile",
     "rho_loss",
     "psi_loss",
     "psi_deriv",

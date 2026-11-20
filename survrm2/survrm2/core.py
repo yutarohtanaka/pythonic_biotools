@@ -8,11 +8,15 @@ doi:10.1093/biostatistics/kxt050).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .ancova import (
     RMST2AdjustedModelResult,
@@ -77,6 +81,9 @@ class RMST1Result:
     se_rmtl: float
     rmtl_ci: tuple[float, float]
     km_df: pd.DataFrame
+    km_step_time: np.ndarray | None = None
+    km_step_surv: np.ndarray | None = None
+    km_full_df: pd.DataFrame | None = None
 
     def to_dataframe(self) -> pd.DataFrame:
         """Return a 2-row DataFrame summarizing RMST and RMTL."""
@@ -112,6 +119,18 @@ class RMST1Result:
             f"  RMTL: {self.rmtl:.4f} (SE = {self.se_rmtl:.4f}, {pct}% CI: [{self.rmtl_ci[0]:.4f}, {self.rmtl_ci[1]:.4f}])",
         ]
         return "\n".join(lines)
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (7.0, 4.5),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot single-arm Kaplan-Meier curve shading RMST vs RMTL (`survrm2.plot_rmst1`)."""
+        from .plotting import plot_rmst1
+
+        return plot_rmst1(self, ax=ax, figsize=figsize, title=title)
 
 
 @dataclass(frozen=True)
@@ -159,6 +178,25 @@ class RMST2Result:
                 ]
             )
         return "\n".join(lines)
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (7.5, 4.8),
+        *,
+        arm_labels: tuple[str, str] = ("Control (Arm 0)", "Active (Arm 1)"),
+        title: str | None = None,
+    ) -> Figure:
+        """Plot two-arm Kaplan-Meier step curves shaded over `[0, tau]` (`survrm2.plot_rmst2`)."""
+        from .plotting import plot_rmst2
+
+        return plot_rmst2(
+            self,
+            ax=ax,
+            figsize=figsize,
+            arm_labels=arm_labels,
+            title=title,
+        )
 
 
 def _validate_time_status(
@@ -310,6 +348,27 @@ def rmst1(
         }
     )
 
+    # Store full-horizon KM step curve and [0, tau] step arrays for zero-arg `.plot()`
+    all_uniq = np.unique(t_arr)
+    all_surv = np.empty(all_uniq.size, dtype=np.float64)
+    cur_s_full = 1.0
+    for idx_f, tk_f in enumerate(all_uniq):
+        yk_f = float(np.sum(t_arr >= tk_f))
+        dk_f = float(np.sum((t_arr == tk_f) & (d_arr == 1)))
+        if yk_f > 0.0:
+            cur_s_full *= 1.0 - dk_f / yk_f
+        all_surv[idx_f] = cur_s_full
+    km_full_df = pd.DataFrame({"time": all_uniq, "surv": all_surv})
+
+    step_t_list: list[float] = [0.0]
+    step_s_list: list[float] = [1.0]
+    for tk_s, sk_s in zip(uniq_times, surv):
+        step_t_list.append(float(tk_s))
+        step_s_list.append(float(sk_s))
+    if m == 0 or float(uniq_times[-1]) < tau_val:
+        step_t_list.append(tau_val)
+        step_s_list.append(float(surv[-1]) if m > 0 else 1.0)
+
     return RMST1Result(
         tau=tau_val,
         alpha=alpha,
@@ -325,6 +384,9 @@ def rmst1(
         se_rmtl=se_rmtl,
         rmtl_ci=rmtl_ci,
         km_df=km_df,
+        km_step_time=np.asarray(step_t_list, dtype=np.float64),
+        km_step_surv=np.asarray(step_s_list, dtype=np.float64),
+        km_full_df=km_full_df,
     )
 
 
@@ -742,3 +804,21 @@ class SurvRM2:
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet; call .fit() first.")
         return self.result_.to_dataframe()
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (7.5, 4.8),
+        *,
+        arm_labels: tuple[str, str] = ("Control (Arm 0)", "Active (Arm 1)"),
+        title: str | None = None,
+    ) -> Figure:
+        """Plot two-sample RMST Kaplan-Meier curves of fitted model."""
+        if self.result_ is None:
+            raise RuntimeError("Model is not fitted yet; call .fit() first.")
+        return self.result_.plot(
+            ax=ax,
+            figsize=figsize,
+            arm_labels=arm_labels,
+            title=title,
+        )

@@ -14,10 +14,14 @@ import bisect
 from dataclasses import dataclass
 import gzip
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 SettingsMode = Literal["default", "R_default"]
 
@@ -39,6 +43,25 @@ class ROSEResult:
     cutoff_signal: float
     cutoff_rank_ascending: int
     signal_unit: str
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        top_n_labels: int = 5,
+        figsize: tuple[float, float] = (7.0, 5.0),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot ROSE ranked enhancer hockey-stick curve (`rose.plot_rose_hockey_stick`)."""
+        from .plotting import plot_rose_hockey_stick
+
+        return plot_rose_hockey_stick(
+            self,
+            ax=ax,
+            top_n_labels=top_n_labels,
+            figsize=figsize,
+            title=title,
+        )
 
 
 def _open_maybe_gz(path: Path):

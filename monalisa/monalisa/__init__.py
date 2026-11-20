@@ -12,6 +12,7 @@ from .binning import bin_genomic_changes
 from .composition import DINUCLEOTIDES, calc_sequence_composition
 from .enrichment import BinnedMotifEnrichmentResult, calc_binned_motif_enrichment
 from .motifs import MotifScanResult, pfm_to_pwm, scan_sequences_pwm
+from .plotting import plot_binned_motif_enrichment, plot_stability_selection
 from .stability_selection import StabilitySelectionResult, rand_lasso_stab_sel
 
 
@@ -137,6 +138,8 @@ __all__ = [
     "calc_binned_motif_enrichment",
     "calc_sequence_composition",
     "pfm_to_pwm",
+    "plot_binned_motif_enrichment",
+    "plot_stability_selection",
     "rand_lasso_stab_sel",
     "scan_sequences_pwm",
 ]

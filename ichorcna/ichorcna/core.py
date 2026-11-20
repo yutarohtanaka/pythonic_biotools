@@ -6,10 +6,14 @@ segment collapsing, and public `run_ichorcna` / `IchorCNA` API for `ichorcna`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 from .hmm import (
     EMRunResult,
@@ -129,6 +133,18 @@ class IchorCNAResult:
     def to_dataframe(self) -> pd.DataFrame:
         """Return copy of segmented copy-number calls (`segments_df`)."""
         return self.segments_df.copy()
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (11.0, 4.0),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot genome-wide `logR` copy-number profile (`ichorcna.plot_ichorcna`)."""
+        from .plotting import plot_ichorcna
+
+        return plot_ichorcna(self, ax=ax, figsize=figsize, title=title)
 
 
 def run_ichorcna(
@@ -479,3 +495,15 @@ class IchorCNA:
             panel_of_normals=panel_of_normals,
             centromeres_df=centromeres_df,
         )
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (11.0, 4.0),
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Plot genome-wide profile of the fitted `IchorCNA` model."""
+        if self.result_ is None:
+            raise RuntimeError("Call .fit(bins_df) before .plot().")
+        return self.result_.plot(ax=ax, figsize=figsize, title=title)
