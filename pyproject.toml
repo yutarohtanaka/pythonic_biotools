@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pythonic-biotools"
 version = "0.2.0"
-description = "Workspace meta-package and bundle manager for 70 standalone Python implementations of published R, C++, and Fortran bioinformatics, cancer genomics, clinical trial, and statistical genetics libraries"
+description = "Unified pure-Python bioinformatics, cancer genomics, clinical trial, and statistical genetics toolkit and CLI"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Yutaro Tanaka"}]
 dependencies = [
     "numpy>=1.24",
@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+plot = [
+    "matplotlib>=3.7",
+]
 oncology = [
     "pysam>=0.22",
     "scikit-learn>=1.3",
@@ -46,20 +49,158 @@ all = [
     "pysam>=0.22",
     "scikit-learn>=1.3",
     "requests>=2.31",
+    "matplotlib>=3.7",
 ]
 dev = [
     "anndata>=0.10",
     "pysam>=0.22",
     "scikit-learn>=1.3",
     "requests>=2.31",
+    "matplotlib>=3.7",
     "pytest>=7.4",
 ]
 
 [project.scripts]
-pythonic-biotools = "pythonic_biotools_cli:main"
+pythonic-biotools = "pythonic_biotools.cli:main"
+pbt = "pythonic_biotools.cli:main"
 
 [tool.setuptools]
 py-modules = ["pythonic_biotools_cli"]
+packages = [
+    "pythonic_biotools",
+    "pythonic_biotools.bayesprism",
+    "pythonic_biotools.biostats",
+    "pythonic_biotools.bisque",
+    "pythonic_biotools.buysetest",
+    "pythonic_biotools.chord",
+    "pythonic_biotools.chromvar",
+    "pythonic_biotools.cibersortx",
+    "pythonic_biotools.cismr",
+    "pythonic_biotools.cohort_curation",
+    "pythonic_biotools.colliderbias",
+    "pythonic_biotools.coloc",
+    "pythonic_biotools.colocproptest",
+    "pythonic_biotools.conipher",
+    "pythonic_biotools.csaw",
+    "pythonic_biotools.cside",
+    "pythonic_biotools.ctwas",
+    "pythonic_biotools.decoupler_ulm",
+    "pythonic_biotools.deqms",
+    "pythonic_biotools.discover",
+    "pythonic_biotools.dndscv",
+    "pythonic_biotools.dss",
+    "pythonic_biotools.facets",
+    "pythonic_biotools.fgwas",
+    "pythonic_biotools.figr",
+    "pythonic_biotools.fishhook",
+    "pythonic_biotools.genomicsem",
+    "pythonic_biotools.grapple",
+    "pythonic_biotools.hdl",
+    "pythonic_biotools.hyprcoloc",
+    "pythonic_biotools.ichorcna",
+    "pythonic_biotools.indexevent",
+    "pythonic_biotools.jmbayes2",
+    "pythonic_biotools.lava",
+    "pythonic_biotools.lhcmr",
+    "pythonic_biotools.limma",
+    "pythonic_biotools.logistf",
+    "pythonic_biotools.mashr",
+    "pythonic_biotools.mmsig",
+    "pythonic_biotools.monalisa",
+    "pythonic_biotools.mrapss",
+    "pythonic_biotools.mrbee",
+    "pythonic_biotools.mrclust",
+    "pythonic_biotools.mrhorse",
+    "pythonic_biotools.mrlap",
+    "pythonic_biotools.music",
+    "pythonic_biotools.mutationtimer",
+    "pythonic_biotools.mvcml",
+    "pythonic_biotools.nebula",
+    "pythonic_biotools.numbat",
+    "pythonic_biotools.purecn",
+    "pythonic_biotools.qdnaseq",
+    "pythonic_biotools.rose",
+    "pythonic_biotools.saturn",
+    "pythonic_biotools.scarhrd",
+    "pythonic_biotools.shatterseek",
+    "pythonic_biotools.slopehunter",
+    "pythonic_biotools.survidinri",
+    "pythonic_biotools.survrm2",
+    "pythonic_biotools.sva",
+    "pythonic_biotools.tracksig",
+    "pythonic_biotools.twosamplemr",
+    "pythonic_biotools.variancepartition",
+    "pythonic_biotools.xenofilterr",
+]
+
+[tool.setuptools.package-dir]
+"pythonic_biotools" = "pythonic_biotools"
+"pythonic_biotools.bayesprism" = "bayesprism/pythonic_bayesprism"
+"pythonic_biotools.biostats" = "biostats/pythonic_biostats"
+"pythonic_biotools.bisque" = "bisque/bisque"
+"pythonic_biotools.buysetest" = "buysetest/buysetest"
+"pythonic_biotools.chord" = "chord/chord"
+"pythonic_biotools.chromvar" = "chromvar/chromvar"
+"pythonic_biotools.cibersortx" = "cibersortx/cibersortx"
+"pythonic_biotools.cismr" = "cismr/cismr"
+"pythonic_biotools.cohort_curation" = "cohort-curation/cohort_curation"
+"pythonic_biotools.colliderbias" = "colliderbias/colliderbias"
+"pythonic_biotools.coloc" = "coloc/coloc"
+"pythonic_biotools.colocproptest" = "colocproptest/colocproptest"
+"pythonic_biotools.conipher" = "conipher/conipher"
+"pythonic_biotools.csaw" = "csaw/csaw"
+"pythonic_biotools.cside" = "cside/cside"
+"pythonic_biotools.ctwas" = "ctwas/ctwas"
+"pythonic_biotools.decoupler_ulm" = "decoupler-ulm/decoupler_ulm"
+"pythonic_biotools.deqms" = "deqms/deqms"
+"pythonic_biotools.discover" = "discover/discover"
+"pythonic_biotools.dndscv" = "dndscv/dndscv"
+"pythonic_biotools.dss" = "dss/dss"
+"pythonic_biotools.facets" = "facets/facets"
+"pythonic_biotools.fgwas" = "fgwas/fgwas"
+"pythonic_biotools.figr" = "figr/figr"
+"pythonic_biotools.fishhook" = "fishhook/fishhook"
+"pythonic_biotools.genomicsem" = "genomicsem/genomicsem"
+"pythonic_biotools.grapple" = "grapple/grapple"
+"pythonic_biotools.hdl" = "hdl/hdl"
+"pythonic_biotools.hyprcoloc" = "hyprcoloc/hyprcoloc"
+"pythonic_biotools.ichorcna" = "ichorcna/ichorcna"
+"pythonic_biotools.indexevent" = "indexevent/indexevent"
+"pythonic_biotools.jmbayes2" = "jmbayes2/jmbayes2"
+"pythonic_biotools.lava" = "lava/lava"
+"pythonic_biotools.lhcmr" = "lhcmr/lhcmr"
+"pythonic_biotools.limma" = "limma/limma"
+"pythonic_biotools.logistf" = "logistf/logistf"
+"pythonic_biotools.mashr" = "mashr/mashr"
+"pythonic_biotools.mmsig" = "mmsig/mmsig"
+"pythonic_biotools.monalisa" = "monalisa/monalisa"
+"pythonic_biotools.mrapss" = "mrapss/mrapss"
+"pythonic_biotools.mrbee" = "mrbee/mrbee"
+"pythonic_biotools.mrclust" = "mrclust/mrclust"
+"pythonic_biotools.mrhorse" = "mrhorse/mrhorse"
+"pythonic_biotools.mrlap" = "mrlap/mrlap"
+"pythonic_biotools.music" = "music/music"
+"pythonic_biotools.mutationtimer" = "mutationtimer/mutationtimer"
+"pythonic_biotools.mvcml" = "mvcml/mvcml"
+"pythonic_biotools.nebula" = "nebula/nebula"
+"pythonic_biotools.numbat" = "numbat/numbat"
+"pythonic_biotools.purecn" = "purecn/purecn"
+"pythonic_biotools.qdnaseq" = "qdnaseq/qdnaseq"
+"pythonic_biotools.rose" = "rose/rose"
+"pythonic_biotools.saturn" = "saturn/saturn"
+"pythonic_biotools.scarhrd" = "scarhrd/scarhrd"
+"pythonic_biotools.shatterseek" = "shatterseek/shatterseek"
+"pythonic_biotools.slopehunter" = "slopehunter/slopehunter"
+"pythonic_biotools.survidinri" = "survidinri/survidinri"
+"pythonic_biotools.survrm2" = "survrm2/survrm2"
+"pythonic_biotools.sva" = "sva/sva"
+"pythonic_biotools.tracksig" = "tracksig/tracksig"
+"pythonic_biotools.twosamplemr" = "twosamplemr/twosamplemr"
+"pythonic_biotools.variancepartition" = "variancepartition/variancepartition"
+"pythonic_biotools.xenofilterr" = "xenofilterR/xenofilterR"
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
 
 [tool.uv.workspace]
 members = [
